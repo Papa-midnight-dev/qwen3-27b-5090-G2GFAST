@@ -6,6 +6,7 @@
 #include <algorithm>
 
 #include "common.h"
+#include "fp4_epilogue.cuh"
 #include "kernels.h"
 #include "launch.cuh"
 #include "mma.cuh"
@@ -138,10 +139,10 @@ __global__ void __launch_bounds__(256) conv_norm_kernel(const float* qkv, int ld
 constexpr int kGnHeads = 8;
 __global__ void __launch_bounds__(kGnHeads * 32) gated_norm_kernel(const float* o, const float* z, int ldz,
                                                                    const bf16* w, float eps, float* out, uint8_t* q8,
-                                                                   float in_scale) {
+                                                                   float in_scale, uint8_t* sf4) {
   pdl_trigger();
   pdl_wait();
-  const int t = blockIdx.x, h = blockIdx.y * kGnHeads + threadIdx.x / 32, d = threadIdx.x % 32 * 4;
+  const int t = blockIdx.x, h = blockIdx.y * kGnHeads + threadIdx.x / 32, lane = threadIdx.x % 32, d = lane * 4;
   const int64_t base = (int64_t(t) * kVHeads + h) * kVDim + d;
   const float4 x = *reinterpret_cast<const float4*>(o + base);
   float ss = x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w;
@@ -150,14 +151,20 @@ __global__ void __launch_bounds__(kGnHeads * 32) gated_norm_kernel(const float* 
   const float4 zz = *reinterpret_cast<const float4*>(z + int64_t(t) * ldz + h * kVDim + d);
   const float xs[4] = {x.x, x.y, x.z, x.w}, zs[4] = {zz.x, zz.y, zz.z, zz.w};
   float y[4];
-  uint32_t packed = 0;
 #pragma unroll
   for (int i = 0; i < 4; i++) {
     y[i] = xs[i] * r * __bfloat162float(w[d + i]) * (zs[i] / (1.f + expf(-zs[i])));
-    packed |= uint32_t(__nv_cvt_float_to_fp8(y[i] / in_scale, __NV_SATFINITE, __NV_E4M3)) << (8 * i);
   }
   if (out) *reinterpret_cast<float4*>(out + base) = make_float4(y[0], y[1], y[2], y[3]);
-  if (q8) *reinterpret_cast<uint32_t*>(q8 + base) = packed;
+  if (sf4) {
+    store_fp4_quad(y, in_scale, t, (h * kVDim + (d & ~15)) / 16, kVHeads * kVDim, q8, sf4, lane);
+  } else if (q8) {
+    uint32_t packed = 0;
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+      packed |= uint32_t(__nv_cvt_float_to_fp8(y[i] / in_scale, __NV_SATFINITE, __NV_E4M3)) << (8 * i);
+    *reinterpret_cast<uint32_t*>(q8 + base) = packed;
+  }
 }
 
 
@@ -1098,7 +1105,8 @@ template <bool kVerify, bool kTree, bool kBatch = false>
 __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T, const bf16* A_log,
                                                                  const bf16* dt_bias, float* state, const float* z,
                                                                  int ldz, const bf16* norm_w, float eps, float* out,
-                                                                 uint8_t* q8, float in_scale, GdnSpec sp) {
+                                                                 uint8_t* q8, float in_scale, GdnSpec sp,
+                                                                 uint8_t* sf4) {
   pdl_trigger();
   GDN_PROBE(0);
   // Batched verify (P6-10): lane ln = blockIdx.y (clusters run along x), its rows from r0, the previous verify's
@@ -1109,8 +1117,9 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
   if constexpr (kBatch) {
     ln = blockIdx.y;
     r0 = sp.lr.first(ln), pr0 = sp.prow0[ln], cp0 = int64_t(kLaneSlot) * ln;
-    in.q += r0 * kQ, z += r0 * ldz, out += r0 * kVHeads * kVDim;
-    if (q8) q8 += r0 * kVHeads * kVDim;
+    in.q += r0 * kQ, z += r0 * ldz;
+    if (out) out += r0 * kVHeads * kVDim;
+    if (q8 && !sf4) q8 += r0 * kVHeads * kVDim;
   }
   namespace cg = cooperative_groups;
   cg::cluster_group cluster = cg::this_cluster();
@@ -1279,8 +1288,12 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
     const float zz = z[int64_t(row) * ldz + h * kVDim + c];
     const float y = o * rsqrtf(ss / kVDim + eps) * __bfloat162float(norm_w[c]) * (zz / (1.f + expf(-zz)));
     const int64_t oi = int64_t(row) * (kVHeads * kVDim) + h * kVDim + c;
-    out[oi] = y;
-    if (q8) q8[oi] = __nv_cvt_float_to_fp8(y / in_scale, __NV_SATFINITE, __NV_E4M3);
+    if (out) out[oi] = y;
+    if (sf4) {
+      store_fp4_halfwarp(y, in_scale, int(r0) + row, (h * kVDim + (c & ~15)) / 16, kVHeads * kVDim, q8, sf4, lane);
+    } else if (q8) {
+      q8[oi] = __nv_cvt_float_to_fp8(y / in_scale, __NV_SATFINITE, __NV_E4M3);
+    }
   }
   GDN_PROBE(6);
   cluster.sync();  // the other CTAs may still read s_part
@@ -1348,11 +1361,11 @@ void gdn_chunked(const float* q, const float* k, float* v, const float* g, const
 }
 
 void gdn_gated_norm(const float* o, const float* z, int ldz, const bf16* w, int T, float eps, float* out,
-                    cudaStream_t s, uint8_t* q8, float in_scale) {
+                    cudaStream_t s, uint8_t* q8, float in_scale, uint8_t* sf4) {
   if (T == 0) return;
   Q27_CHECK(ldz % 4 == 0, "gdn_gated_norm: z rows must be 16-byte aligned");
   launch_pdl(gated_norm_kernel, dim3(T, kVHeads / kGnHeads), dim3(kGnHeads * 32), 0, s, o, z, ldz, w, eps, out, q8,
-             in_scale);
+             in_scale, sf4);
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -1368,11 +1381,11 @@ void gdn_decode_prep(const float* qkv, float* conv_state, const bf16* conv_w, co
 
 void gdn_decode(const float* q, const float* k, const float* v, const float* a, const float* b, const bf16* A_log,
                 const bf16* dt_bias, float* state, const float* z, const bf16* norm_w, float eps, float* out,
-                uint8_t* q8, float in_scale, cudaStream_t s) {
+                uint8_t* q8, float in_scale, cudaStream_t s, uint8_t* sf4) {
   (void)b;
   launch_pdl_cluster(gdn_rec_kernel<false, false>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s, kRecSplit,
                      RecIn{k, q, v, a}, 1, A_log, dt_bias, state, z, kVHeads * kVDim, norm_w, eps, out, q8, in_scale,
-                     GdnSpec{});
+                     GdnSpec{}, sf4);
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -1397,21 +1410,21 @@ void gdn_verify_prep(const float* qkv, int ld, int T, float* conv_state, const b
 
 void gdn_verify(const float* q, int T, const bf16* A_log, const bf16* dt_bias, float* state, const float* z, int ldz,
                 const bf16* norm_w, float eps, float* out, uint8_t* q8, float in_scale, const GdnSpec& sp,
-                cudaStream_t s) {
+                cudaStream_t s, uint8_t* sf4) {
   Q27_CHECK(T <= kVerifyMaxT, "gdn_verify: T must be <= 32");
   if (sp.lanes > 0) {
     Q27_CHECK(sp.paths <= 1 && sp.lanes <= kMaxLanes && sp.lr.n == sp.lanes && sp.prow0, "gdn_verify: batched chains only");
     launch_pdl_cluster(gdn_rec_kernel<true, false, true>, dim3(kVHeads * kRecSplit, sp.lanes), dim3(kRecWarps * 32), 0,
                        s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w,
-                       eps, out, q8, in_scale, sp);
+                       eps, out, q8, in_scale, sp, sf4);
   } else if (sp.paths > 1)
     launch_pdl_cluster(gdn_rec_kernel<true, true>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s, kRecSplit,
                        RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w, eps, out, q8,
-                       in_scale, sp);
+                       in_scale, sp, sf4);
   else
     launch_pdl_cluster(gdn_rec_kernel<true, false>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s, kRecSplit,
                        RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w, eps, out, q8,
-                       in_scale, sp);
+                       in_scale, sp, sf4);
   Q27_CUDA(cudaGetLastError());
 }
 

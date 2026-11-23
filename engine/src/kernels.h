@@ -284,11 +284,11 @@ void gdn_decode_prep(const float* qkv, float* conv_state, const bf16* conv_w, co
                      const bf16* wb, float* q, float* k, float* v, float* a, float* b, cudaStream_t s);
 void gdn_decode(const float* q, const float* k, const float* v, const float* a, const float* b, const bf16* A_log,
                 const bf16* dt_bias, float* state, const float* z, const bf16* norm_w, float eps, float* out,
-                uint8_t* q8, float in_scale, cudaStream_t s);
+                uint8_t* q8, float in_scale, cudaStream_t s, uint8_t* sf4 = nullptr);
 // out[t][h*128 + j] = o / rms(o) * w * silu(z) per value head (o, out: [T][48][128]; z rows ldz apart).
-// q8 (optional): also e4m3(out / in_scale) for the out_proj GEMM.
+// q8 (optional): also e4m3(out / in_scale), or when sf4 != nullptr, packed NVFP4 + swizzled scales sf4.
 void gdn_gated_norm(const float* o, const float* z, int ldz, const bf16* w, int T, float eps, float* out,
-                    cudaStream_t s, uint8_t* q8 = nullptr, float in_scale = 1.f);
+                    cudaStream_t s, uint8_t* q8 = nullptr, float in_scale = 1.f, uint8_t* sf4 = nullptr);
 // Speculative verify of T <= 32 tree nodes (see gdn.cu): the decode kernels' arithmetic per token along
 // each node's path, without advancing the states; the tokens the previous verify committed are
 // replayed first. Per-row inputs of one layer live in two buffers selected by the step parity *par.
@@ -323,7 +323,7 @@ void gdn_verify_prep(const float* qkv, int ld, int T, float* conv_state, const b
                      const bf16* wa, const bf16* wb, float* q, const GdnSpec& sp, cudaStream_t s);
 void gdn_verify(const float* q, int T, const bf16* A_log, const bf16* dt_bias, float* state, const float* z, int ldz,
                 const bf16* norm_w, float eps, float* out, uint8_t* q8, float in_scale, const GdnSpec& sp,
-                cudaStream_t s);
+                cudaStream_t s, uint8_t* sf4 = nullptr);
 
 // ---------------------------------------------------------------- attention (attention.cu)
 
@@ -376,7 +376,8 @@ constexpr int kDecodeMaxSplits = 128;
 constexpr size_t kAttnDecodeWsBytes = size_t(kDecodeMaxT) * 24 * kDecodeMaxSplits * 258 * 4;
 void attention_decode(const float* q, const float* qg, int ldq, int T, const int32_t* pos_dev, KvLayer kv,
                       KvType kv_type, const int32_t* page_table, float* out, void* ws, size_t ws_bytes,
-                      cudaStream_t s, uint8_t* q8 = nullptr, float in_scale = 1.f, const SpecTree* tree = nullptr);
+                      cudaStream_t s, uint8_t* q8 = nullptr, float in_scale = 1.f, const SpecTree* tree = nullptr,
+                      uint8_t* sf4 = nullptr);
 // Batched chain verify (P6-10): lanes.n blocks (lane z: rows lanes.lr.first(z) .., its position, page table and
 // rotary delta), each computed exactly as attn_prep / attention_decode of that lane alone.
 void attn_prep_lanes(const float* qg, int ldq, const float* k, const float* v, int ldkv, const bf16* q_norm,
@@ -384,7 +385,7 @@ void attn_prep_lanes(const float* qg, int ldq, const float* k, const float* v, i
                      cudaStream_t s);
 void attention_decode_lanes(const float* q, const float* qg, int ldq, const SeqLanes& lanes, KvLayer kv,
                             KvType kv_type, float* out, void* ws, size_t ws_bytes, cudaStream_t s,
-                            uint8_t* q8 = nullptr, float in_scale = 1.f);
+                            uint8_t* q8 = nullptr, float in_scale = 1.f, uint8_t* sf4 = nullptr);
 // Whether the lanes of a batched verify may have different rows (the FP8-MMA verify of FP8 / NVFP4 KV; read per call,
 // Q27_ATTN_TC_F8). Otherwise every lane has 8.
 bool attention_lanes_vary(KvType kv_type);

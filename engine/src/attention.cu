@@ -7,6 +7,7 @@
 #include <cuda_fp8.h>
 
 #include "common.h"
+#include "fp4_epilogue.cuh"
 #include "kernels.h"
 #include "launch.cuh"
 #include "mma.cuh"
@@ -1824,7 +1825,7 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
 template <bool kBatch = false>
 __global__ void attention_combine_kernel(const float* qg, int ldq, const int32_t* pos_dev, int splits, int min_keys,
                                          int chunk, DecPartial part, float* out, uint8_t* q8, float in_scale,
-                                         const SpecTree* tree, SeqLanes lanes) {
+                                         const SpecTree* tree, SeqLanes lanes, uint8_t* sf4) {
   pdl_trigger();
   const int64_t row = blockIdx.x;  // t * 24 + h
   const int d = threadIdx.x, t = blockIdx.x / kHeads, h = blockIdx.x % kHeads;
@@ -1849,8 +1850,12 @@ __global__ void attention_combine_kernel(const float* qg, int ldq, const int32_t
   }
   float gate = qg[int64_t(t) * ldq + h * (2 * kHeadDim) + kHeadDim + d];
   float y = a / L * (1.f / (1.f + __expf(-gate)));
-  out[row * kHeadDim + d] = y;
-  if (q8) q8[row * kHeadDim + d] = to_kv<uint8_t>(y / in_scale);
+  if (out) out[row * kHeadDim + d] = y;
+  if (sf4) {
+    store_fp4_halfwarp(y, in_scale, t, (h * kHeadDim + (d & ~15)) / 16, kHeads * kHeadDim, q8, sf4, d & 31);
+  } else if (q8) {
+    q8[row * kHeadDim + d] = to_kv<uint8_t>(y / in_scale);
+  }
 }
 
 // Moves the KV of the accepted tree path (rows cpath[i], at slots pos + cpath[i]) to pos + i. Block
@@ -2051,7 +2056,7 @@ static bool tc_f8(KvType kv_type) {
 
 void attention_decode(const float* q, const float* qg, int ldq, int T, const int32_t* pos_dev, KvLayer kv,
                       KvType kv_type, const int32_t* page_table, float* out, void* ws, size_t ws_bytes,
-                      cudaStream_t s, uint8_t* q8, float in_scale, const SpecTree* tree) {
+                      cudaStream_t s, uint8_t* q8, float in_scale, const SpecTree* tree, uint8_t* sf4) {
   if (T == 0) return;
   Q27_CHECK(T <= kDecodeMaxT, "attention_decode: T must be <= 32");
   if (!g_attn_sms) Q27_CUDA(cudaDeviceGetAttribute(&g_attn_sms, cudaDevAttrMultiProcessorCount, 0));
@@ -2143,7 +2148,7 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
                prefetch, part, tree);
   Q27_CUDA(cudaGetLastError());
   launch_pdl(attention_combine_kernel<false>, dim3(unsigned(rows)), dim3(kHeadDim), 0, s, qg, ldq, pos_dev, splits,
-             min_keys, tc ? kTcChunk : 0, part, out, q8, in_scale, tree, SeqLanes{});
+             min_keys, tc ? kTcChunk : 0, part, out, q8, in_scale, tree, SeqLanes{}, sf4);
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -2175,7 +2180,7 @@ bool attention_lanes_vary(KvType kv_type) { return tc_f8(kv_type); }
 // FP8 MMAs only (attention_lanes_vary); otherwise every lane has the same rows (<= 8).
 void attention_decode_lanes(const float* q, const float* qg, int ldq, const SeqLanes& lanes, KvLayer kv,
                             KvType kv_type, float* out, void* ws, size_t ws_bytes, cudaStream_t s, uint8_t* q8,
-                            float in_scale) {
+                            float in_scale, uint8_t* sf4) {
   Q27_CHECK(lanes.n >= 1 && lanes.n <= kMaxLanes && lanes.lr.n == lanes.n, "attention_decode_lanes: 1..8 lanes");
   if (!g_attn_sms) Q27_CUDA(cudaDeviceGetAttribute(&g_attn_sms, cudaDevAttrMultiProcessorCount, 0));
   const int T = lanes.lr.max_rows();
@@ -2241,7 +2246,7 @@ void attention_decode_lanes(const float* q, const float* qg, int ldq, const SeqL
   }
   Q27_CUDA(cudaGetLastError());
   launch_pdl(attention_combine_kernel<true>, dim3(unsigned(rows)), dim3(kHeadDim), 0, s, qg, ldq, lanes.pos, splits, 0,
-             kTcChunk, part, out, q8, in_scale, static_cast<const SpecTree*>(nullptr), lanes);
+             kTcChunk, part, out, q8, in_scale, static_cast<const SpecTree*>(nullptr), lanes, sf4);
   Q27_CUDA(cudaGetLastError());
 }
 

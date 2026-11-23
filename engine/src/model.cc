@@ -953,10 +953,11 @@ void Model::gdn(int i, int T) {
     mark("gdn prep");
     if (!skip("gdn")) gdn_verify_prep(qkv, ld, Tv, conv, G.conv, h_, G.a, G.b, q_, sp, s_);
     mark("gdn recurrent+norm");
+    const bool f8 = G.out.static8(), f4 = G.out.fp4;
     if (!skip("gdn"))
-      gdn_verify(q_, Tv, G.A_log, G.dt_bias, ssm, z, ldz, G.norm, kEps, n_, G.out.static8() ? aq_ : nullptr,
-                 G.out.in_scale(), sp, s_);
-    quant_in(G.out, n_, T, kVHeads * kVDim);
+      gdn_verify(q_, Tv, G.A_log, G.dt_bias, ssm, z, ldz, G.norm, kEps, (f8 || f4) ? nullptr : n_,
+                 (f8 || f4) ? aq_ : nullptr, G.out.in_scale(), sp, s_, f4 ? asf_ : nullptr);
+    if (!f4) quant_in(G.out, n_, T, kVHeads * kVDim);
     gemm_q("gdn out", G.out, T, x_, true);
     return;
   }
@@ -964,10 +965,11 @@ void Model::gdn(int i, int T) {
     mark("gdn prep");
     if (!skip("gdn")) gdn_decode_prep(qkv, conv, G.conv, h_, G.a, G.b, q_, k_, v_, a_, b_, s_);
     mark("gdn recurrent+norm");
+    const bool f8 = G.out.static8(), f4 = G.out.fp4;
     if (!skip("gdn"))
-      gdn_decode(q_, k_, v_, a_, b_, G.A_log, G.dt_bias, ssm, z, G.norm, kEps, n_, G.out.static8() ? aq_ : nullptr,
-                 G.out.in_scale(), s_);
-    quant_in(G.out, n_, T, kVHeads * kVDim);
+      gdn_decode(q_, k_, v_, a_, b_, G.A_log, G.dt_bias, ssm, z, G.norm, kEps, (f8 || f4) ? nullptr : n_,
+                 (f8 || f4) ? aq_ : nullptr, G.out.in_scale(), s_, f4 ? asf_ : nullptr);
+    if (!f4) quant_in(G.out, n_, T, kVHeads * kVDim);
     gemm_q("gdn out", G.out, T, x_, true);
     return;
   }
@@ -986,11 +988,12 @@ void Model::gdn(int i, int T) {
   else
     gdn_recurrent(q_, k_, v_, g_, beta_, T, ssm, o_, s_);
   mark("gdn gated norm");
-  if (!G.out.static8()) {  // fp32 in place, then NVFP4 / FP8 per token
+  const bool f8 = G.out.static8(), f4 = G.out.fp4;
+  if (f8 || f4) {
+    gdn_gated_norm(o_, z, ldz, G.norm, T, kEps, nullptr, s_, aq_, G.out.in_scale(), f4 ? asf_ : nullptr);
+  } else {
     gdn_gated_norm(o_, z, ldz, G.norm, T, kEps, o_, s_);
     quant_in(G.out, o_, T, kVHeads * kVDim);
-  } else {
-    gdn_gated_norm(o_, z, ldz, G.norm, T, kEps, nullptr, s_, aq_, G.out.in_scale());  // (only the FP8 copy is used)
   }
   gemm_q("gdn out", G.out, T, x_, true);
 }
@@ -1019,10 +1022,12 @@ void Model::attn(int i, int T) {
     mark("attn prep");
     if (!skip("attn")) attn_prep_lanes(qg, ldq, k, v, ldkv, A.q_norm, A.k_norm, bsl_, kv, opt_.kv_type, v_, s_);
     mark("attn core");
+    const bool f8 = A.o.static8(), f4 = A.o.fp4;
     if (!skip("attn"))
-      attention_decode_lanes(v_, qg, ldq, bsl_, kv, opt_.kv_type, o_, attn_ws_, kAttnDecodeWsBytes, s_,
-                             A.o.static8() ? aq_ : nullptr, A.o.in_scale());
-    quant_in(A.o, o_, T, kHeads * kHeadDim);
+      attention_decode_lanes(v_, qg, ldq, bsl_, kv, opt_.kv_type, (f8 || f4) ? nullptr : o_, attn_ws_,
+                             kAttnDecodeWsBytes, s_, (f8 || f4) ? aq_ : nullptr, A.o.in_scale(),
+                             f4 ? asf_ : nullptr);
+    if (!f4) quant_in(A.o, o_, T, kHeads * kHeadDim);
     gemm_q("attn o", A.o, T, x_, true);
     return;
   }
@@ -1034,9 +1039,11 @@ void Model::attn(int i, int T) {
   mark("attn core");
   if (skip("attn")) {
   } else if (T <= kDecodeMaxT) {
-    attention_decode(v_, qg, ldq, T, pos_dev_, kv, opt_.kv_type, page_table_, o_, attn_ws_, kAttnDecodeWsBytes, s_,
-                     A.o.static8() ? aq_ : nullptr, A.o.in_scale(), tree);
-    quant_in(A.o, o_, T, kHeads * kHeadDim);
+    const bool f8 = A.o.static8(), f4 = A.o.fp4;
+    attention_decode(v_, qg, ldq, T, pos_dev_, kv, opt_.kv_type, page_table_, (f8 || f4) ? nullptr : o_, attn_ws_,
+                     kAttnDecodeWsBytes, s_, (f8 || f4) ? aq_ : nullptr, A.o.in_scale(), tree,
+                     f4 ? asf_ : nullptr);
+    if (!f4) quant_in(A.o, o_, T, kHeads * kHeadDim);
   } else {
     Q27_CHECK(ldq == kHeads * 2 * kHeadDim, "attention: unexpected q stride");
     // (big2_ is free in attention layers.)

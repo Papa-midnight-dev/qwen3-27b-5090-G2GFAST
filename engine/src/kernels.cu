@@ -149,6 +149,8 @@ __device__ __forceinline__ void store_fp8x16(const float* v, float s, uint8_t* q
 
 // One thread per 16-element block.
 __global__ void quant_fp4_kernel(const float* x, int M, int K, float input_scale, uint8_t* q, uint8_t* sf) {
+  pdl_trigger();
+  pdl_wait();
   int kblocks = K / 16;
   int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= int64_t(M) * kblocks) return;
@@ -663,7 +665,7 @@ void rmsnorm(const float* x, const bf16* w, int T, int D, float eps, bool zero_c
 void quant_fp4(const float* x, int M, int K, float input_scale, uint8_t* q, uint8_t* sf, cudaStream_t s) {
   Q27_CHECK(K % 64 == 0, "quant_fp4: K must be a multiple of 64");
   if (M == 0) return;
-  quant_fp4_kernel<<<blocks(int64_t(M) * (K / 16)), kThreads, 0, s>>>(x, M, K, input_scale, q, sf);
+  launch_pdl(quant_fp4_kernel, dim3(blocks(int64_t(M) * (K / 16))), dim3(kThreads), 0, s, x, M, K, input_scale, q, sf);
   Q27_CUDA(cudaGetLastError());
 }
 
