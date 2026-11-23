@@ -205,10 +205,14 @@ class Engine:
     def pos(self):
         return lib().q27_pos(self.h)
 
+    @staticmethod
+    def _i32(ids):
+        return ids if isinstance(ids, array.array) and ids.typecode == "i" else array.array("i", ids)
+
     def forward_topk(self, ids, k=20):
         """Runs ids; returns per position a list of (token, logprob) for the k most likely next tokens."""
         n = len(ids)
-        src = array.array("i", ids)
+        src = self._i32(ids)
         out_i, out_l = array.array("i", bytes(4 * n * k)), array.array("f", bytes(4 * n * k))
         self._check(lib().q27_forward_topk(self.h, src.buffer_info()[0], n, k, out_i.buffer_info()[0],
                                            out_l.buffer_info()[0]), "q27_forward_topk")
@@ -234,7 +238,7 @@ class Engine:
         OpenAI's penalties by the sequence's output counts (penalty_init). logprobs >= 0: the token's logprobs
         with that many top entries are kept for logprobs(). masked: only the tokens row 0 of the grammar masks
         allows (mask_row). biased: the sequence's logit bias (bias_set) is added to the logits first."""
-        src = array.array("i", ids)
+        src = self._i32(ids)
         out = ctypes.c_int32()
         self._check(lib().q27_forward_sample(self.h, src.buffer_info()[0], len(ids), temperature, top_k, top_p,
                                              uniform, min_p, presence, frequency, logprobs, ctypes.byref(out),
@@ -303,7 +307,7 @@ class Engine:
         until: a token that ends a step as its last one (the end of the reasoning, before a forced output or a
         grammar; spec_set_masked clears it). biased: the sequence's logit bias (bias_set) on every step. ignore_eos:
         an end-of-sequence id does not end a step (it is fed like any token)."""
-        src = array.array("i", ids)
+        src = self._i32(ids)
         out = ctypes.c_int32()
         self._check(lib().q27_spec_begin(self.h, src.buffer_info()[0], len(ids), temperature, top_k, top_p,
                                          seed & (2**64 - 1), uniform, max_new, min_p, presence, frequency,
@@ -367,7 +371,7 @@ class Engine:
     def prefill(self, ids, budget, spec=False):
         """Prompt chunks of ids (the rest of the prompt) while more than one prefill chunk is left, at least
         `budget` tokens; returns the tokens run. The rest goes to forward_sample / spec_begin (spec: the latter)."""
-        src = array.array("i", ids)
+        src = self._i32(ids)
         out = ctypes.c_int()
         self._check(lib().q27_prefill(self.h, src.buffer_info()[0], len(ids), budget, int(spec), ctypes.byref(out)),
                     "q27_prefill")
@@ -418,7 +422,7 @@ class Engine:
         """Prefix cache (STATE_HOST_CACHE > 0): resets the sequence and restores the deepest cached prefix of
         ids; returns its length. Run ids[cached:] next (forward_sample, or spec_begin when spec); that prefill
         saves checkpoints at the positions in `at` (and at CHECKPOINT_INTERVAL multiples)."""
-        src, pts = array.array("i", ids), array.array("i", sorted(at) or [0])
+        src, pts = self._i32(ids), array.array("i", sorted(at) or [0])
         out = ctypes.c_int()
         self._check(lib().q27_prefix_begin(self.h, src.buffer_info()[0], len(ids), pts.buffer_info()[0], len(at),
                                            int(spec), ctypes.byref(out)), "q27_prefix_begin")

@@ -18,7 +18,9 @@ Requests are cancelled when the client disconnects or a stop string matches.
 """
 
 import argparse
+import array
 import base64
+import codecs
 import json
 import math
 import multiprocessing as mp
@@ -28,12 +30,15 @@ import queue
 import select
 import signal
 import socket
+import socketserver
 import sys
 import threading
 import time
 import traceback
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+_json_compact = json.JSONEncoder(ensure_ascii=False, separators=(",", ":")).encode
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "frontend"))
@@ -521,20 +526,56 @@ def client_gone(sock):
 
 
 class Detokenizer:
-    """Incremental detokenization: text is released only at complete UTF-8 characters. marks: {token string:
-    character} of tokens written as that character (chat.MARKS, for the output parser)."""
+    """Lock-free O(1) incremental byte-level UTF-8 detokenization: text is released only at complete UTF-8
+    characters. marks: {token string: character} of tokens written as that character (chat.MARKS, for the output
+    parser). Falls back to tok.decode when given a mock tokenizer without token_bytes."""
 
     def __init__(self, tok, lock, marks=None):
         self.tok, self.lock = tok, lock
-        self.ids, self.prefix, self.read = [], 0, 0
+        self._fast = hasattr(tok, "token_bytes")
         self.marks = {tok.token_id(k): v for k, v in (marks or {}).items() if tok.token_id(k) is not None}
         self.literal = set(self.marks.values())
+        self._lit_trans = str.maketrans({c: "\ufffd" for c in self.literal}) if self.literal else None
+        if self._fast:
+            self._dec = codecs.getincrementaldecoder("utf-8")("replace")
+        else:
+            self.ids, self.prefix, self.read = [], 0, 0
 
     def _decode(self, ids):
         with self.lock:
             return self.tok.decode(ids)
 
+    def _sanitize(self, text):
+        if self._lit_trans and text:
+            return text.translate(self._lit_trans)
+        return text
+
     def add(self, ids, final=False):
+        if self._fast:
+            if not self.marks or not any(t in self.marks for t in ids):
+                if not ids and not final:
+                    return ""
+                raw = b"".join(self.tok.token_bytes(t) for t in ids) if ids else b""
+                return self._sanitize(self._dec.decode(raw, final=final))
+            out, run = [], []
+            for t in ids:
+                if t not in self.marks:
+                    run.append(t)
+                    continue
+                if run:
+                    raw = b"".join(self.tok.token_bytes(x) for x in run)
+                    out.append(self._sanitize(self._dec.decode(raw, final=True)))
+                    run = []
+                else:
+                    flushed = self._dec.decode(b"", final=True)
+                    if flushed:
+                        out.append(self._sanitize(flushed))
+                self._dec.reset()
+                out.append(self.marks[t])
+            if run or final:
+                raw = b"".join(self.tok.token_bytes(x) for x in run) if run else b""
+                out.append(self._sanitize(self._dec.decode(raw, final=final)))
+            return "".join(out)
         if not self.marks or not any(t in self.marks for t in ids):
             return self._add(ids, final)
         out, run = "", []
@@ -542,8 +583,6 @@ class Detokenizer:
             if t not in self.marks:
                 run.append(t)
                 continue
-            # (a marked token ends the text before it: bytes left incomplete there decode as U+FFFD, as in a
-            # decode of the whole)
             out += self._add(run, final=True) + self.marks[t]
             self.ids, self.prefix, self.read, run = [], 0, 0, []
         return out + self._add(run, final)
@@ -552,13 +591,9 @@ class Detokenizer:
         self.ids += ids
         prefix_text = self._decode(self.ids[self.prefix:self.read])
         new_text = self._decode(self.ids[self.prefix:])
-        if len(new_text) > len(prefix_text) and (final or not new_text.endswith("�")):
+        if len(new_text) > len(prefix_text) and (final or not new_text.endswith("\ufffd")):
             self.prefix, self.read = self.read, len(self.ids)
-            text = new_text[len(prefix_text):]
-            if self.marks and any(c in self.literal for c in text):
-                # (the mark characters themselves, plane-16 private use, as text: U+FFFD, so they never split)
-                text = "".join("\ufffd" if c in self.literal else c for c in text)
-            return text
+            return self._sanitize(new_text[len(prefix_text):])
         return ""
 
 
@@ -587,7 +622,8 @@ class Generation:
         # For _stopped_timings: the last "prefilled" info, (arrival time, tokens) of the prefill's "tok" and those after
         # it, and when the first token came.
         self.prefilled, self.toks, self.first_tok, self.drafts = None, [], None, None
-        req = dict(ids=ids, max_new=max_new, images=images, force=force, **(grammar or {}), **sampling)
+        ids_bytes = ids.tobytes() if isinstance(ids, array.array) and ids.typecode == "i" else array.array("i", ids).tobytes()
+        req = dict(ids_bytes=ids_bytes, max_new=max_new, images=images, force=force, **(grammar or {}), **sampling)
         self.sampling_logprobs = sampling.get("logprobs", -1)
         # (ignore_eos: the end-of-sequence tokens count and have logprobs, but their text is left out, as vLLM's
         # skip_special_tokens does)
@@ -770,8 +806,8 @@ class Server:
             return self._images
 
     def encode(self, text):
-        with self.tok_lock:
-            return self.tok.encode(text)
+        tok = self.tok
+        return tok.encode(text)
 
     def use_template_of(self, weights):
         """Renders prompts with the chat template of `weights` from here on (an engine start on them; their tokenizer
@@ -790,9 +826,9 @@ class Server:
         the client wrote stay text (Tokenizer.prompt_ids): only the template opens and ends turns, and places
         images and videos."""
         messages = with_video_parts(messages)
+        tok = self.tok
         try:
-            with self.tok_lock:
-                ids = self.tok.prompt_ids(messages, tools=tools or None, **kwargs)
+            ids = tok.prompt_ids(messages, tools=tools or None, **kwargs)
         except Exception as e:  # noqa: BLE001 - template errors (no user message, bad roles) are the client's
             raise ApiError(400, f"chat template: {e}") from e
         media, images = Images.collect(messages), None
@@ -1024,14 +1060,36 @@ def origin_allowed(headers):
 
 
 class HTTPServer(ThreadingHTTPServer):
-    # The default listen backlog of 5 refuses a burst of 6+ connections at once on Windows (llama-swap 502, issue #7).
-    request_queue_size = 128
+    # High listen backlog prevents SYN drops during concurrent request bursts.
+    request_queue_size = 1024
+    daemon_threads = True
+
+
+class UnixHTTPServer(socketserver.ThreadingUnixStreamServer):
+    request_queue_size = 1024
     daemon_threads = True
 
 
 class Handler(BaseHTTPRequestHandler):
     srv: Server = None
     protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True
+
+    def setup(self):
+        self._chunked_sse = False
+        # Guard TCP_NODELAY on AF_UNIX sockets (no-op / EOPNOTSUPP on Unix domain sockets).
+        orig = self.disable_nagle_algorithm
+        if getattr(self.connection, "family", None) == socket.AF_UNIX:
+            self.disable_nagle_algorithm = False
+        try:
+            super().setup()
+        finally:
+            self.disable_nagle_algorithm = orig
+
+    def address_string(self):
+        if isinstance(self.client_address, (str, bytes)) or not self.client_address:
+            return "unix"
+        return self.client_address[0]
 
     def log_message(self, fmt, *args):
         if self.command == "GET" and self.path.split("?")[0] in ("/health", "/metrics", "/ui/state"):
@@ -1041,12 +1099,15 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------ plumbing
 
     def _json(self, code, obj):
-        body = json.dumps(obj, ensure_ascii=False).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        body = _json_compact(obj).encode("utf-8")
+        reason = self.responses.get(code, ("",))[0]
+        conn = "close" if self.close_connection else "keep-alive"
+        head = (f"HTTP/1.1 {code} {reason}\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"Connection: {conn}\r\n\r\n").encode("ascii")
+        self.wfile.write(head + body)
+        self.wfile.flush()
 
     def _error(self, code, msg, kind="invalid_request_error"):
         if self.path.split("?")[0].startswith("/v1/messages"):
@@ -1058,18 +1119,34 @@ class Handler(BaseHTTPRequestHandler):
             self._json(code, {"error": {"message": msg, "type": kind, "code": code}, "object": "error",
                               "message": msg})
 
-    def _sse_start(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
+    def _sse_start(self, close=False):
+        chunked = (not close) and self.request_version >= "HTTP/1.1" and self.headers.get("Connection", "").lower() != "close"
+        self._chunked_sse = chunked
+        self.close_connection = not chunked
+        if chunked:
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
+                             b"Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n")
+        else:
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
+                             b"Connection: close\r\n\r\n")
+        self.wfile.flush()
+
+    def _sse_raw(self, payload: bytes):
+        if self._chunked_sse:
+            self.wfile.write(f"{len(payload):x}\r\n".encode("ascii") + payload + b"\r\n")
+        else:
+            self.wfile.write(payload)
+        self.wfile.flush()
 
     def _sse(self, data, event=None):
         head = f"event: {event}\n" if event else ""
-        self.wfile.write(f"{head}data: {json.dumps(data, ensure_ascii=False)}\n\n".encode())
-        self.wfile.flush()
+        self._sse_raw(f"{head}data: {_json_compact(data)}\n\n".encode("utf-8"))
+
+    def _sse_end(self):
+        if self._chunked_sse:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            self._chunked_sse = False
 
     def _model(self, body):
         m = body.get("model")
@@ -1128,7 +1205,7 @@ class Handler(BaseHTTPRequestHandler):
     def ui_stream(self):
         """Server-sent events of the stats UI: "init" (configuration, sample history, log), then "tick" (the
         requests, VRAM, last GPU sample) every second and "log" (new entries) as they come."""
-        self._sse_start()
+        self._sse_start(close=True)
         try:
             init = dict(HUB.init(), tick=HUB.tick())
             self._sse(init, "init")
@@ -1254,14 +1331,19 @@ class Handler(BaseHTTPRequestHandler):
                          "usage": gen.usage, **gen.timing_fields})
 
     def _keepalive_comment(self):
-        self.wfile.write(b": keep-alive\n\n")
-        self.wfile.flush()
+        self._sse_raw(b": keep-alive\n\n")
 
     def _chat_stream(self, gen, parser, rid, created, model, body, single_call):
         self._sse_start()
 
         want_lp = gen.sampling_logprobs >= 0
         pending = []  # logprobs of the text out of the generation the chunks have not carried yet
+        # Pre-format invariant SSE chunk envelope once per stream for minimal wire bytes & zero dict alloc per token.
+        env_prefix = f'data: {{"id":{_json_compact(rid)},"object":"chat.completion.chunk","created":{created},"model":{_json_compact(model)},"choices":[{{"index":0,"delta":'
+        env_content_pre = (env_prefix + '{"content":').encode("utf-8")
+        env_reason_pre = (env_prefix + '{"reasoning_content":').encode("utf-8")
+        env_reason_mid = b',"reasoning":'
+        env_suffix = b'},"finish_reason":null,"logprobs":null}]}\n\n'
 
         def chunk(delta, finish=None, **extra):
             lps = None
@@ -1280,9 +1362,16 @@ class Handler(BaseHTTPRequestHandler):
             sent = False
             for kind, v in events:
                 if kind == "reasoning":
-                    chunk({"reasoning_content": v, "reasoning": v})
+                    if not want_lp:
+                        jv = _json_compact(v).encode("utf-8")
+                        self._sse_raw(env_reason_pre + jv + env_reason_mid + jv + env_suffix)
+                    else:
+                        chunk({"reasoning_content": v, "reasoning": v})
                 elif kind == "content":
-                    chunk({"content": v})
+                    if not want_lp:
+                        self._sse_raw(env_content_pre + _json_compact(v).encode("utf-8") + env_suffix)
+                    else:
+                        chunk({"content": v})
                 elif not (single_call and ncalls):
                     chunk({"tool_calls": [openai_call(v, ncalls)]})
                     ncalls += 1
@@ -1300,15 +1389,16 @@ class Handler(BaseHTTPRequestHandler):
             send(parser.finish())
         except ApiError as e:
             self._sse({"error": {"message": str(e), "type": e.kind, "code": e.code}})
-            self.wfile.write(b"data: [DONE]\n\n")
+            self._sse_raw(b"data: [DONE]\n\n")
+            self._sse_end()
             return
         include_usage = (body.get("stream_options") or {}).get("include_usage")  # (timings go on the last chunk)
         chunk({}, "tool_calls" if ncalls else gen.finish, **({} if include_usage else gen.timing_fields))
         if include_usage:
             self._sse({"id": rid, "object": "chat.completion.chunk", "created": created, "model": model,
                        "choices": [], "usage": gen.usage, **gen.timing_fields})
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        self._sse_raw(b"data: [DONE]\n\n")
+        self._sse_end()
 
     # ------------------------------------------------------------ OpenAI completions
 
@@ -1343,8 +1433,8 @@ class Handler(BaseHTTPRequestHandler):
             if include_usage:
                 self._sse({"id": rid, "object": "text_completion", "created": created, "model": model,
                            "choices": [], "usage": gen.usage, **gen.timing_fields})
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+            self._sse_raw(b"data: [DONE]\n\n")
+            self._sse_end()
             return
         text = "".join(gen)
         self._json(200, {"id": rid, "object": "text_completion", "created": created, "model": model,
@@ -1472,12 +1562,14 @@ class Handler(BaseHTTPRequestHandler):
         except ApiError as e:
             self._sse({"type": "error", "error": {"type": "overloaded_error" if e.code == 503 else "api_error",
                                                   "message": str(e)}}, "error")
+            self._sse_end()
             return
         close_block()
         self._sse({"type": "message_delta", "delta": {"stop_reason": stop_reason(state["calls"]),
                                                       "stop_sequence": gen.stop_sequence},
                    "usage": usage(True)}, "message_delta")
         self._sse({"type": "message_stop"}, "message_stop")
+        self._sse_end()
 
     # ------------------------------------------------------------ OpenAI Responses API (Codex)
 
@@ -1521,6 +1613,7 @@ class Handler(BaseHTTPRequestHandler):
             if not stream:
                 raise
             out.ev("response.failed", response=dict(resp, status="failed", error={"code": "server_error", "message": str(e)}))
+            self._sse_end()
             return
         out.close()
         done = gen.finish == "length" and not out.ncalls
@@ -1531,7 +1624,7 @@ class Handler(BaseHTTPRequestHandler):
                            "total_tokens": len(ids) + gen.tokens})
         if stream:
             out.ev("response.incomplete" if done else "response.completed", response=resp)
-            self.wfile.flush()
+            self._sse_end()
         else:
             text = "".join(c.get("text", "") for it in out.items if it["type"] == "message" for c in it["content"])
             self._json(200, dict(resp, output_text=text))
@@ -1765,6 +1858,8 @@ def main():
     env = os.environ.get
     ap.add_argument("--host", default=env("HOST", "0.0.0.0"))
     ap.add_argument("--port", type=int, default=int(env("PORT", 8000)))
+    ap.add_argument("--unix", default=env("LISTEN_UNIX", ""),
+                    help="listen on a Unix domain socket path instead of TCP (for zero-TCP container proxy)")
     ap.add_argument("--max-tokens", type=int, default=int(env("MAX_TOKENS", 262144)))
     ap.add_argument("--prefill-chunk", type=int, default=int(env("PREFILL_CHUNK", 2048)))
     ap.add_argument("--kv-dtype", default=env("KV_DTYPE", "nvfp4"), choices=["bf16", "fp8", "nvfp4"])
@@ -1815,7 +1910,17 @@ def main():
                           idle_unload=max(0.0, args.idle_unload))
     HUB.engine_idle = engine.idle_state
     Handler.srv = Server(engine, tok, args.max_tokens, launch)
-    server = HTTPServer((args.host, args.port), Handler)
+    if args.unix:
+        try:
+            os.unlink(args.unix)
+        except FileNotFoundError:
+            pass
+        server = UnixHTTPServer(args.unix, Handler)
+        os.chmod(args.unix, 0o660)
+        listen_desc = f"unix:{args.unix}"
+    else:
+        server = HTTPServer((args.host, args.port), Handler)
+        listen_desc = f"{args.host}:{args.port}"
 
     def stop(*_):
         log("stopping")
@@ -1824,7 +1929,7 @@ def main():
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    log(f"serving {MODEL_NAME} on {args.host}:{args.port} (the engine {'is loading' if engine.wanted else 'is not loaded'})")
+    log(f"serving {MODEL_NAME} on {listen_desc} (the engine {'is loading' if engine.wanted else 'is not loaded'})")
     server.serve_forever()
     engine.stop()
 

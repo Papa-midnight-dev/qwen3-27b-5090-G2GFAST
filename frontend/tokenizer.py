@@ -7,6 +7,7 @@ import hashlib
 import json
 import pathlib
 import re
+import threading
 from datetime import datetime
 
 import jinja2
@@ -124,6 +125,17 @@ class Tokenizer:
         self._unmark[ESC] = ESC
         self._added_re = re.compile("|".join(map(re.escape, strings)) or "(?!)")
         self._marked_re = re.compile(ESC + "(.)", re.S)
+        # Fast O(1) per-token raw UTF-8 bytes table for lock-free incremental detokenization,
+        # plus thread-safe segment/escape caches for 100% bit-identical warm-turn prompt tokenization.
+        self._vocab_size = self.tok.get_vocab_size(with_added_tokens=True)
+        self._bytes_cache = [None] * self._vocab_size
+        self._bytes_extra = {}
+        self._cache_lock = threading.Lock()
+        self._seg_cache = {}
+        self._esc_cache = {}
+        self._seg_cache_ok = bool(strings) and not any(
+            t.lstrip or t.rstrip or t.single_word or t.normalized for t in added.values()
+        )
 
     def encode(self, text):
         return self.tok.encode(text, add_special_tokens=False).ids
@@ -146,16 +158,32 @@ class Tokenizer:
     def token_id(self, token):
         return self.tok.token_to_id(token)
 
-    def piece(self, i):
-        """(text, UTF-8 bytes) of token i alone (logprobs): its bytes in the byte-level vocabulary, which may end inside a
-        character (the text then has U+FFFD for it, as a decode of the token alone does); an added token's own text."""
-        got = self._pieces.get(i)
-        if got is None:
+    def token_bytes(self, i):
+        """Raw UTF-8 bytes of token id i (cached O(1) list lookup, thread-safe)."""
+        if 0 <= i < self._vocab_size:
+            b = self._bytes_cache[i]
+            if b is not None:
+                return b
             t = self.tok.id_to_token(i) or ""
             if i in self.added or any(c not in BYTE_DECODER for c in t):
                 b = t.encode("utf-8")
             else:
                 b = bytes(BYTE_DECODER[c] for c in t)
+            self._bytes_cache[i] = b
+            return b
+        b = self._bytes_extra.get(i)
+        if b is None:
+            t = self.tok.id_to_token(i) or ""
+            b = t.encode("utf-8")
+            self._bytes_extra[i] = b
+        return b
+
+    def piece(self, i):
+        """(text, UTF-8 bytes) of token i alone (logprobs): its bytes in the byte-level vocabulary, which may end inside a
+        character (the text then has U+FFFD for it, as a decode of the token alone does); an added token's own text."""
+        got = self._pieces.get(i)
+        if got is None:
+            b = self.token_bytes(i)
             got = self._pieces[i] = (b.decode("utf-8", errors="replace"), b)
         return got
 
@@ -178,9 +206,21 @@ class Tokenizer:
     def _escape(self, x):
         """x (strings, lists and mappings of them, keys too) with the added tokens' strings marked."""
         if isinstance(x, str):
+            if len(x) >= 64:
+                cached = self._esc_cache.get(x)
+                if cached is not None:
+                    return cached
+            orig = x
             if ESC in x:
                 x = x.replace(ESC, ESC + ESC)
-            return self._added_re.sub(lambda m: self._mark[m.group()], x)
+            if self._added_re.search(x):
+                x = self._added_re.sub(lambda m: self._mark[m.group()], x)
+            if len(orig) >= 64:
+                with self._cache_lock:
+                    if len(self._esc_cache) >= 1024:
+                        self._esc_cache.clear()
+                    self._esc_cache[orig] = x
+            return x
         if isinstance(x, list):
             return [self._escape(v) for v in x]
         if isinstance(x, dict):
@@ -225,18 +265,58 @@ class Tokenizer:
 
     def encode_marked(self, text):
         """Ids of a rendered prompt whose client text was marked (_escape): the added tokens the template wrote are
-        tokens, the text between them is encoded without added tokens, with the marked strings put back."""
-        if ESC not in text:
+        tokens, the text between them is encoded without added tokens, with the marked strings put back.
+        Splits on added tokens and caches per-segment BPE results (bit-identical to uncached encode)."""
+        has_esc = ESC in text
+        if not has_esc and not self._seg_cache_ok:
             return self.encode(text)
-        out, parts, at = [], [], 0
+        # Split on added tokens; each segment between added tokens is BPE-independent.
+        added_ids = []
+        raw_segs = []
+        at = 0
         for m in self._added_re.finditer(text):
-            parts.append((len(out), text[at:m.start()]))
-            out.append(self._added_id[m.group()])
+            raw_segs.append(text[at:m.start()])
+            added_ids.append(self._added_id[m.group()])
             at = m.end()
-        parts.append((len(out), text[at:]))
-        unmark = lambda m: self._unmark[m.group(1)]  # noqa: E731
-        segs = [self._marked_re.sub(unmark, s) for _, s in parts]
-        encs = self.plain.encode_batch(segs, add_special_tokens=False)
-        for (pos, _), e in reversed(list(zip(parts, encs))):
-            out[pos:pos] = e.ids
+        raw_segs.append(text[at:])
+        if has_esc:
+            unmark = lambda m: self._unmark[m.group(1)]  # noqa: E731
+            segs = [self._marked_re.sub(unmark, s) if ESC in s else s for s in raw_segs]
+        else:
+            segs = raw_segs
+        # Look up cached segments; batch-encode only misses in Rust.
+        seg_cache = self._seg_cache
+        resolved = [None] * len(segs)
+        miss_idx = []
+        miss_txt = []
+        for idx, s in enumerate(segs):
+            if not s:
+                resolved[idx] = ()
+                continue
+            hit = seg_cache.get(s) if len(s) >= 24 else None
+            if hit is not None:
+                resolved[idx] = hit
+            else:
+                miss_idx.append(idx)
+                miss_txt.append(s)
+        if miss_txt:
+            encs = self.plain.encode_batch(miss_txt, add_special_tokens=False)
+            to_store = []
+            for idx, s, e in zip(miss_idx, miss_txt, encs):
+                ids_t = tuple(e.ids)
+                resolved[idx] = ids_t
+                if len(s) >= 24:
+                    to_store.append((s, ids_t))
+            if to_store:
+                with self._cache_lock:
+                    if len(seg_cache) + len(to_store) > 4096:
+                        seg_cache.clear()
+                    for s, ids_t in to_store:
+                        seg_cache[s] = ids_t
+        out = []
+        for idx, seg_ids in enumerate(resolved):
+            if seg_ids:
+                out.extend(seg_ids)
+            if idx < len(added_ids):
+                out.append(added_ids[idx])
         return out
