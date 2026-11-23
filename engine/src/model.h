@@ -220,6 +220,7 @@ class Model {
   void ensure_pages_of(std::vector<int32_t>& pages, int32_t* table, int tokens);
   // Writes physical pages to a device page table (as the kernels read it: page * kKvSlices, P7-13).
   void upload_pages(int32_t* table, const int32_t* pages, size_t n);
+  void reset_impl(bool zero_state, bool zero_ring);
   void release_seq();                // returns the running sequence's pages
   void save_checkpoint(bool ring);   // at pos_ (nothing pending)
   // A checkpoint of tokens ids (pages: their KV pages) whose state is in a parking area (null: the running sequence's).
@@ -327,6 +328,7 @@ class Model {
   std::vector<char*> slot_mem_;      // pinned [ckpt_bytes_] per slot, allocated as needed (grow_state_cache)
   std::vector<bool> slot_used_;
   char* stage_ = nullptr;            // device copy of one checkpoint on its way to the host
+  int stage_slot_ = -1;              // checkpoint slot currently mirrored in stage_ (0-PCIe GPU hot hit)
   cudaEvent_t stage_ev_ = nullptr, stage_in_ev_ = nullptr;  // staging free again / filled
   cudaStream_t cs_ = nullptr;        // device -> host copies of checkpoints
   std::vector<int32_t> plan_;        // checkpoint positions of the running prefill (ascending)

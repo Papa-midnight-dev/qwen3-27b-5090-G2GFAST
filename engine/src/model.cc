@@ -513,15 +513,19 @@ void Model::set_sbuf(int b) {
   ssm_ = ssm_buf_[b];
 }
 
-void Model::reset() {
+void Model::reset() { reset_impl(true, true); }
+
+void Model::reset_impl(bool zero_state, bool zero_ring) {
   batch_exit();
   Q27_CUDA(cudaStreamSynchronize(s_));  // (drops a speculative step in flight)
   spec_inflight_ = false;
   par_host_ = 0;
   pos_ = 0;
   set_sbuf(0);
-  Q27_CUDA(cudaMemsetAsync(conv_, 0, conv_bytes_, s_));
-  Q27_CUDA(cudaMemsetAsync(ssm_, 0, ssm_bytes_, s_));
+  if (zero_state) {
+    Q27_CUDA(cudaMemsetAsync(conv_, 0, conv_bytes_, s_));
+    Q27_CUDA(cudaMemsetAsync(ssm_, 0, ssm_bytes_, s_));
+  }
   Q27_CUDA(cudaMemsetAsync(pos_dev_, 0, sizeof(int32_t), s_));
   Q27_CUDA(cudaMemsetAsync(rope_delta_, 0, sizeof(int32_t), s_));
   mm_spans_.clear();
@@ -530,14 +534,14 @@ void Model::reset() {
     Q27_CUDA(cudaMemsetAsync(par_, 0, 4, s_));
     Q27_CUDA(cudaMemsetAsync(ncommit_, 0, 4, s_));
     Q27_CUDA(cudaMemsetAsync(sbuf_, 0, 4, s_));
-    draft_->reset(s_);
+    if (zero_ring) draft_->reset(s_);
   }
   spec_pending_ = false;
   release_seq();
   plan_.clear();
   ring_valid_ = false;
   spec_last_ = -1;
-  Q27_CUDA(cudaStreamSynchronize(s_));
+  if (zero_state) Q27_CUDA(cudaStreamSynchronize(s_));
 }
 
 // ---------------------------------------------------------------- KV pages and the prefix cache
@@ -585,6 +589,7 @@ bool Model::evict_checkpoint() {
   auto it = std::min_element(ckpts_.begin(), ckpts_.end(),
                              [](const Checkpoint& a, const Checkpoint& b) { return a.last_use < b.last_use; });
   for (int32_t p : it->pages) pool_.unref(p);
+  if (it->slot == stage_slot_) stage_slot_ = -1;
   slot_used_[it->slot] = false;
   ckpts_.erase(it);
   cstats_.evicted++;
@@ -643,35 +648,50 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
   Q27_CUDA(cudaStreamWaitEvent(cs_, stage_in_ev_));
   Q27_CUDA(cudaMemcpyAsync(slot_mem_[slot], stage_, ckpt_bytes_, cudaMemcpyDeviceToHost, cs_));
   Q27_CUDA(cudaEventRecord(stage_ev_, cs_));
+  stage_slot_ = slot;
   ckpts_.push_back(std::move(ck));
   cstats_.saved++;
 }
 
 int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, bool spec) {
-  reset();
   cstats_.lookups++;
   cstats_.prompt_tokens += n;
-  if (!cache_on_) return 0;
   const Checkpoint* best = nullptr;
-  for (auto& c : ckpts_)
-    if (c.pos() < n && (!spec || c.ring) && (!best || c.pos() > best->pos()) &&
-        std::equal(c.ids.begin(), c.ids.end(), ids))
-      best = &c;
+  if (cache_on_) {
+    for (auto& c : ckpts_)
+      if (c.pos() < n && (!spec || c.ring) && (!best || c.pos() > best->pos()) &&
+          std::equal(c.ids.begin(), c.ids.end(), ids))
+        best = &c;
+  }
+  reset_impl(best == nullptr, best == nullptr || !best->ring);
+  if (!cache_on_) return 0;
   int cached = 0;
   if (best) {
     cached = best->pos();
     const_cast<Checkpoint*>(best)->last_use = ++use_clock_;
-    // The state from its host slot (after its device -> host copy), before anything can evict it.
-    Q27_CUDA(cudaStreamSynchronize(cs_));
-    const char* src = slot_mem_[best->slot];
-    Q27_CUDA(cudaMemcpyAsync(ssm_, src, ssm_bytes_, cudaMemcpyHostToDevice, s_));
-    Q27_CUDA(cudaMemcpyAsync(conv_, src + ssm_bytes_, conv_bytes_, cudaMemcpyHostToDevice, s_));
-    if (draft_) {
-      const size_t rb = draft_->ring_layers_bytes();
-      Q27_CUDA(cudaMemcpyAsync(draft_->ring_k(), src + ssm_bytes_ + conv_bytes_, rb, cudaMemcpyHostToDevice, s_));
-      Q27_CUDA(cudaMemcpyAsync(draft_->ring_v(), src + ssm_bytes_ + conv_bytes_ + rb, rb, cudaMemcpyHostToDevice, s_));
+    const bool gpu_hit = (stage_slot_ == best->slot);
+    if (gpu_hit) {
+      // Zero-PCIe GPU hot hit: restore directly from device staging buffer (0.13 ms D2D vs 7.2 ms PCIe H2D).
+      const char* src = stage_;
+      Q27_CUDA(cudaMemcpyAsync(ssm_, src, ssm_bytes_, cudaMemcpyDeviceToDevice, s_));
+      Q27_CUDA(cudaMemcpyAsync(conv_, src + ssm_bytes_, conv_bytes_, cudaMemcpyDeviceToDevice, s_));
+      if (draft_ && best->ring) {
+        const size_t rb = draft_->ring_layers_bytes();
+        Q27_CUDA(cudaMemcpyAsync(draft_->ring_k(), src + ssm_bytes_ + conv_bytes_, rb, cudaMemcpyDeviceToDevice, s_));
+        Q27_CUDA(cudaMemcpyAsync(draft_->ring_v(), src + ssm_bytes_ + conv_bytes_ + rb, rb, cudaMemcpyDeviceToDevice, s_));
+      }
+    } else {
+      // Host RAM hit: wait for any in-flight D2H on cs_, then copy H2D on s_.
+      Q27_CUDA(cudaStreamSynchronize(cs_));
+      const char* src = slot_mem_[best->slot];
+      Q27_CUDA(cudaMemcpyAsync(ssm_, src, ssm_bytes_, cudaMemcpyHostToDevice, s_));
+      Q27_CUDA(cudaMemcpyAsync(conv_, src + ssm_bytes_, conv_bytes_, cudaMemcpyHostToDevice, s_));
+      if (draft_ && best->ring) {
+        const size_t rb = draft_->ring_layers_bytes();
+        Q27_CUDA(cudaMemcpyAsync(draft_->ring_k(), src + ssm_bytes_ + conv_bytes_, rb, cudaMemcpyHostToDevice, s_));
+        Q27_CUDA(cudaMemcpyAsync(draft_->ring_v(), src + ssm_bytes_ + conv_bytes_ + rb, rb, cudaMemcpyHostToDevice, s_));
+      }
     }
-    Q27_CUDA(cudaStreamSynchronize(s_));
     // Full pages are shared; the partial last page is copied (the sequence writes its later rows).
     const int full = cached / kPageTokens;
     std::vector<int32_t> pages = best->pages;
@@ -695,8 +715,8 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
     upload_pages(page_table_, seq_pages_.data(), seq_pages_.size());
     pos_ = cached;
     Q27_CUDA(cudaMemcpyAsync(pos_dev_, &pos_, 4, cudaMemcpyHostToDevice, s_));
-    if (hist_) copy_hist(hist_, ids, cached);
-    Q27_CUDA(cudaStreamSynchronize(s_));
+    if (hist_ && lookup_.on) copy_hist(hist_, ids, cached);
+    if (!gpu_hit) Q27_CUDA(cudaStreamSynchronize(s_));
     cstats_.hits++;
     cstats_.cached_tokens += cached;
   }
@@ -1357,8 +1377,8 @@ int Model::prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, 
     // Chunks stop at the planned checkpoints (prefix_begin).
     const int T = prefill_cut(std::min(opt_.prefill_chunk, n - c0), opt_.prefill_chunk >= n - c0);
     // Decode-path kernels read per-layer state (GDN / conv state, the position) before their PDL wait,
-    // which is only safe once the previous chunk has finished (decode steps end with a sync anyway).
-    Q27_CUDA(cudaStreamSynchronize(s_));
+    // which is only safe once the previous chunk has finished (prefill chunks wait on PDL / stream order).
+    if (T <= kDecodeMaxT) Q27_CUDA(cudaStreamSynchronize(s_));
     ensure_pages(pos_ + T);
     upload_ids(ids + c0, T);
     chunk(ids_, T);
