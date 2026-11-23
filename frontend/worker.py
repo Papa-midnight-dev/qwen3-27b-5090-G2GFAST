@@ -203,9 +203,9 @@ class Scheduler:
 
     def poll(self, block):
         self.unlend()
-        # Idle: pre-allocate pinned prefix-cache state slots smoothly (2 per idle tick, never stalling a live request).
-        if block and not self.cache_full:
-            self.cache_full = self.engine.cache_grow(2) == 0
+        # Idle: pre-allocate pinned prefix-cache state slots only after idle >= 3s so live bursts never stall.
+        if block and not self.cache_full and time.time() - getattr(self, "last_work", 0.0) >= 3.0:
+            self.cache_full = self.engine.cache_grow(1) == 0
             block = self.cache_full
         if block:
             self.conn.poll(STATS_IDLE)
@@ -225,8 +225,8 @@ class Scheduler:
         # (the server checks the request; a malformed one that gets past it fails alone, not the engine)
         try:
             s = Seq(rid, req, time.time())
-            # (an image's positions hold ids above the vocabulary: image_tokens.image_token_ids)
-            if s.prompt and (min(s.prompt) < 0 or (max(s.prompt) >= VOCAB and not s.images)):
+            # (ids_bytes from server.py is already validated by Tokenizer / token_ids_of and re-checked in C++ upload_ids)
+            if "ids_bytes" not in req and s.prompt and (min(s.prompt) < 0 or (max(s.prompt) >= VOCAB and not s.images)):
                 raise ValueError(f"a prompt token id is out of the vocabulary (0..{VOCAB - 1})")
         except (TypeError, ValueError, KeyError, OverflowError) as e:
             self.send("error", rid, f"bad request: {e}", 400)
@@ -492,6 +492,10 @@ class Scheduler:
     # ------------------------------------------------------------ scheduling
 
     def run(self):
+        # Pre-allocate 8 pinned host state-cache slots at startup (~0.16s) so live turns never hit cudaHostAlloc stalls.
+        if self.engine.cache_grow(8) == 0:
+            self.cache_full = True
+        self.last_work = time.time()
         self.send("ready", {"max_tokens": self.engine.max_tokens, "max_seqs": self.engine_seqs, "spec": self.spec,
                             "vision": self.engine.has_vision})
         self.send("memory", self.engine.memory_report())
@@ -937,11 +941,7 @@ class Scheduler:
         self.m[f'q27:requests_finished_total{{reason="{reason}"}}'] += 1
         if notify:
             self.send("done", s.rid, reason, dict(info, metrics=self.metrics()))
-        # Keep >= 2 spare pre-allocated pinned cache slots AFTER notifying client so the next turn never stalls.
-        if not self.cache_full and not self.alive and not self.waiting:
-            st = self.engine.cache_stats()
-            if st["slots_allocated"] - st["checkpoints"] < 2:
-                self.cache_full = self.engine.cache_grow(2) == 0
+        self.last_work = time.time()
         if s.first_token and len(s.out) > 1:
             rate = (len(s.out) - 1) / max(now - s.first_token, 1e-6)
             log(f"{s.rid}: {reason}, {len(s.out)} tokens, ttft {info['ttft']:.2f} s, {rate:.1f} tok/s"

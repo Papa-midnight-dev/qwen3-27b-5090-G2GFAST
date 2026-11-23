@@ -724,9 +724,10 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
   // more than 64 tokens away from the others and from both ends (a chunk of <= 64 tokens takes the
   // decode GEMMs, so a resumed prefill would no longer match an uncut one bit for bit).
   // Positions are rounded down to multiples of 64 (the GDN chunks): a prefill resumed there matches
-  // one that ran through.
+  // one that ran through. Never split a short tail (<= 64 tokens from cached or n) into two skinny passes.
   for (int i = 0; i < nat; i++)
-    if (const int32_t p = at[i] / kGdnChunk * kGdnChunk; p > cached && p < n) plan_.push_back(p);
+    if (const int32_t p = at[i] / kGdnChunk * kGdnChunk; p - cached > kSkinnyMaxM && n - p > kSkinnyMaxM)
+      plan_.push_back(p);
   std::sort(plan_.begin(), plan_.end());
   plan_.erase(std::unique(plan_.begin(), plan_.end()), plan_.end());
   if (const int iv = opt_.checkpoint_interval; iv > 0) {

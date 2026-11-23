@@ -697,9 +697,12 @@ class Generation:
                         for t, (lp, top) in zip(msg[2], msg[3]):
                             self.lps.append((len(self.text), t, lp, top))
                             self.text += self.detok.add([] if t in self.hide else [t])
+                        piece = self._release()
+                    elif self.stops:
+                        self.text += self.detok.add([t for t in msg[2] if t not in self.hide] if self.hide else msg[2])
+                        piece = self._release()
                     else:
-                        self.text += self.detok.add([t for t in msg[2] if t not in self.hide])
-                    piece = self._release()
+                        piece = self.detok.add([t for t in msg[2] if t not in self.hide] if self.hide else msg[2])
                     if piece:
                         last = time.time()
                         yield piece
@@ -707,9 +710,13 @@ class Generation:
                     info = msg[3]
                     self.cached = info.get("cached_tokens", self.cached)
                     self.timings = info
-                    self.text += self.detok.add([], final=True)
+                    tail = self.detok.add([], final=True)
                     self.finish = self.finish or ("stop" if msg[2] in ("stop", "cancelled") else msg[2])
-                    piece = self._release(final=True)
+                    if self.stops or self.sampling_logprobs >= 0:
+                        self.text += tail
+                        piece = self._release(final=True)
+                    else:
+                        piece = tail
                     if piece:
                         yield piece
                 elif kind == "error":
@@ -1079,7 +1086,7 @@ class Handler(BaseHTTPRequestHandler):
         self._chunked_sse = False
         # Guard TCP_NODELAY on AF_UNIX sockets (no-op / EOPNOTSUPP on Unix domain sockets).
         orig = self.disable_nagle_algorithm
-        if getattr(self.connection, "family", None) == socket.AF_UNIX:
+        if getattr(self.request, "family", None) == socket.AF_UNIX:
             self.disable_nagle_algorithm = False
         try:
             super().setup()
@@ -1343,16 +1350,16 @@ class Handler(BaseHTTPRequestHandler):
         env_content_pre = (env_prefix + '{"content":').encode("utf-8")
         env_reason_pre = (env_prefix + '{"reasoning_content":').encode("utf-8")
         env_reason_mid = b',"reasoning":'
-        env_suffix = b'},"finish_reason":null,"logprobs":null}]}\n\n'
+        env_suffix = b'},"finish_reason":null}]}\n\n'
 
         def chunk(delta, finish=None, **extra):
-            lps = None
+            ch = {"index": 0, "delta": delta, "finish_reason": finish}
             if want_lp:
                 pending.extend(gen.take_logprobs())
-                lps = {"content": chat_logprobs(self.srv.tok, pending)} if pending else None
+                ch["logprobs"] = {"content": chat_logprobs(self.srv.tok, pending)} if pending else None
                 pending.clear()
             self._sse({"id": rid, "object": "chat.completion.chunk", "created": created, "model": model,
-                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish, "logprobs": lps}], **extra})
+                       "choices": [ch], **extra})
 
         chunk({"role": "assistant", "content": ""})
         ncalls = 0
