@@ -2058,19 +2058,19 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
                       KvType kv_type, const int32_t* page_table, float* out, void* ws, size_t ws_bytes,
                       cudaStream_t s, uint8_t* q8, float in_scale, const SpecTree* tree, uint8_t* sf4) {
   if (T == 0) return;
-  Q27_CHECK(T <= kDecodeMaxT, "attention_decode: T must be <= 32");
+  Q27_CHECK(T <= kMaxBatchRows, "attention_decode: T must be <= 64");
   if (!g_attn_sms) Q27_CUDA(cudaDeviceGetAttribute(&g_attn_sms, cudaDevAttrMultiProcessorCount, 0));
   // About 2 CTAs per SM; short contexts leave most splits empty (they exit at once).
   const int waves = getenv("Q27_ATTN_WAVES") ? atoi(getenv("Q27_ATTN_WAVES")) : 2;  // read per launch (configure)
   const int min_keys = getenv("Q27_ATTN_MIN_KEYS") ? atoi(getenv("Q27_ATTN_MIN_KEYS")) : 64;
   const int prefetch = getenv("Q27_ATTN_PREFETCH") ? atoi(getenv("Q27_ATTN_PREFETCH")) : kDecPrefetchKeys;
   // The split count of a single token for every T (bit-identical rows); short contexts leave most empty.
-  // Chains of up to 16 tokens (decode, the chain verify): tensor cores, every chunk read once per 8 tokens.
+  // Chains of up to 64 tokens (decode, verify, short warm follow-ups): tensor cores in <=16-row launches.
   // Q27_ATTN_TC=0: the CUDA-core kernel. The split count is fixed per process (bit-identical rows).
   const bool tc_on = !getenv("Q27_ATTN_TC") || atoi(getenv("Q27_ATTN_TC")) != 0;
-  // (FP8 MMAs with FP8 / NVFP4 KV, tc_f8: chains of up to 32 rows, split into <=16-row launches)
+  // (FP8 MMAs with FP8 / NVFP4 KV, tc_f8: chains of up to 64 rows, split into <=16-row launches)
   // (BF16 KV, or FP8 KV with Q27_ATTN_TC_F8=0: up to 16 rows in 8-row launches of attention_tc_kernel)
-  const bool tc = tc_on && !tree && (tc_f8(kv_type) ? T <= kDecodeMaxT : T <= kT8MaxT);
+  const bool tc = tc_on && !tree && (tc_f8(kv_type) ? T <= kMaxBatchRows : T <= kT8MaxT);
   const int tc_splits = getenv("Q27_ATTN_TC_SPLITS") ? atoi(getenv("Q27_ATTN_TC_SPLITS"))
                                                      : std::max(1, g_attn_sms / kKvHeads);
   const int splits = std::min(kDecodeMaxSplits,

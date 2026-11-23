@@ -1058,7 +1058,7 @@ void Model::attn(int i, int T) {
               {rope_delta_, mpos_on_ && !verify_ ? mpos_ : nullptr});
   mark("attn core");
   if (skip("attn")) {
-  } else if (T <= kDecodeMaxT) {
+  } else if (T <= kDecodeMaxT || (T <= kSkinnyMaxM && !tree && attention_lanes_vary(opt_.kv_type))) {
     const bool f8 = A.o.static8(), f4 = A.o.fp4;
     attention_decode(v_, qg, ldq, T, pos_dev_, kv, opt_.kv_type, page_table_, (f8 || f4) ? nullptr : o_, attn_ws_,
                      kAttnDecodeWsBytes, s_, (f8 || f4) ? aq_ : nullptr, A.o.in_scale(), tree,
@@ -1378,7 +1378,7 @@ int Model::prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, 
     const int T = prefill_cut(std::min(opt_.prefill_chunk, n - c0), opt_.prefill_chunk >= n - c0);
     // Decode-path kernels read per-layer state (GDN / conv state, the position) before their PDL wait,
     // which is only safe once the previous chunk has finished (prefill chunks wait on PDL / stream order).
-    if (T <= kDecodeMaxT) Q27_CUDA(cudaStreamSynchronize(s_));
+    if (T <= kSkinnyMaxM) Q27_CUDA(cudaStreamSynchronize(s_));
     ensure_pages(pos_ + T);
     upload_ids(ids + c0, T);
     chunk(ids_, T);
@@ -1565,7 +1565,7 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
   Q27_CUDA(cudaMemcpyAsync(sbuf_, &sbuf_host_, 4, cudaMemcpyHostToDevice, s_));
   // The token history for lookup: the whole sequence so far (this call may follow earlier tokens).
   Q27_CHECK(pos_ >= n, "spec_begin: inconsistent position");
-  copy_hist(hist_ + (pos_ - n), ids, n);
+  if (hist_ && lookup_.on) copy_hist(hist_ + (pos_ - n), ids, n);
   int32_t blk[kSpecBlock];
   for (int i = 0; i < kSpecBlock; i++) blk[i] = i == 0 ? first : ddims::kMaskId;
   Q27_CUDA(cudaMemcpyAsync(block_ids_, blk, sizeof blk, cudaMemcpyHostToDevice, s_));
