@@ -117,14 +117,20 @@ static void update_interests(Conn *c) {
         close_conn(c);
         return;
     }
-    uint32_t ea = EPOLLRDHUP, eb = EPOLLRDHUP;
-    if (!a->eof_in && a->len < BUF_SIZE) ea |= EPOLLIN;
+    uint32_t ea = 0, eb = 0;
+    if (!a->eof_in) {
+        ea |= EPOLLRDHUP;
+        if (a->len < BUF_SIZE) ea |= EPOLLIN;
+    }
     if (b->len > 0 && !a->shut_out) ea |= EPOLLOUT;
 
     if (b->connecting) {
         eb |= EPOLLOUT;
     } else {
-        if (!b->eof_in && b->len < BUF_SIZE) eb |= EPOLLIN;
+        if (!b->eof_in) {
+            eb |= EPOLLRDHUP;
+            if (b->len < BUF_SIZE) eb |= EPOLLIN;
+        }
         if (a->len > 0 && !b->shut_out) eb |= EPOLLOUT;
     }
     ep_mod(a, ea);

@@ -1118,6 +1118,7 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------ plumbing
 
     def _json(self, code, obj):
+        self._response_started = True
         body = _json_compact(obj).encode("utf-8")
         reason = self.responses.get(code, ("",))[0]
         conn = "close" if self.close_connection else "keep-alive"
@@ -1129,6 +1130,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _error(self, code, msg, kind="invalid_request_error"):
+        if getattr(self, "_response_started", False):
+            self.close_connection = True
+            return
         if self.path.split("?")[0].startswith("/v1/messages"):
             kind = {"invalid_request_error": "invalid_request_error", "not_found": "not_found_error"}.get(kind, kind)
             if code == 503:
@@ -1139,6 +1143,7 @@ class Handler(BaseHTTPRequestHandler):
                               "message": msg})
 
     def _sse_start(self, close=False):
+        self._response_started = True
         chunked = (not close) and self.request_version >= "HTTP/1.1" and self.headers.get("Connection", "").lower() != "close"
         self._chunked_sse = chunked
         self.close_connection = not chunked
@@ -1282,6 +1287,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(403, "engine admin mutations are locked (ADMIN_LOCK=1); change settings on the host instead.")
         if fn is None:
             return self._error(404, "not found", "not_found")
+        self._response_started = False
         HUB.local.meta = request_meta(path, self.headers, body) if path in GENERATE else None
         try:
             fn(body)

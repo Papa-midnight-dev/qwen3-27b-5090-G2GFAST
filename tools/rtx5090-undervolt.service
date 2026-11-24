@@ -1,7 +1,7 @@
 [Unit]
 Description=RTX 5090 True NVML Undervolt & 450W Longevity Profile
+After=systemd-modules-load.service
 Before=q27-engine.service
-After=multi-user.target
 
 [Service]
 Type=oneshot

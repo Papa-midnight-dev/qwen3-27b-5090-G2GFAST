@@ -1,14 +1,18 @@
 # Qwen3.8-27B on one RTX 5090 *(Moonshot Community Fork)*
 
-> **Attribution:** This is a community optimization fork of Masahiro Kiyota's [**`mkyt/qwen3-27b-5090`**](https://github.com/mkyt/qwen3-27b-5090) (MIT License). All core engine architecture and original work belong to Masahiro Kiyota.
+> **What this repo is:** A full, build-and-run community optimization fork of Masahiro Kiyota's [**`mkyt/qwen3-27b-5090`**](https://github.com/mkyt/qwen3-27b-5090) C++/CUDA inference engine + Python OpenAI/Anthropic API server (MIT License; all core engine architecture and original work belong to Masahiro Kiyota). Model and draft weights are **not** included — download Qwen3.8-27B NVFP4 + DSpine weights from Hugging Face as usual.
 >
-> **What's new in this fork** (see [`docs/moonshot-fork.md`](docs/moonshot-fork.md) for full details & upstream-base benchmarks):
+> **Fork base & build note:** Forked from upstream `v0.6.2` (`fe41696`, 17 commits behind upstream `v0.8.1`). **Build from source** (`docker build` or `cmake + ninja` — see [`docs/moonshot-fork.md`](docs/moonshot-fork.md)). Do **not** use the upstream `docker compose pull` or `update.cmd` commands further down in the original README, as those fetch upstream images without this fork's changes.
+>
+> **What's new in this fork** (see [`docs/moonshot-fork.md`](docs/moonshot-fork.md) for full details, changed defaults & honest benchmarks):
 > - Fused SM120 NVFP4 epilogues (`skinny_fp4_glu`, `gdn_rec`, `gated_norm`, `attention_combine`)
-> - Sarathi chunked-prefill interleaving (`PREFILL_DECODE_CHUNK=512`, **9.7x lower** C=4 32K worst-case ITL stall vs upstream `0.5.0`: `545 ms -> 56 ms`, mean stream `+85%`)
-> - CUDA 13.4 Graph conditional prompt-lookup (`Q27_LOOKUP=1`) + adaptive 2-path DSpine trees on FP8 Tensor Cores (`attention_tc8_kernel` ancestor bitmask)
-> - Low-rank DSpine refinement (precomputed Gram $G = W_4^T W_4$ + $U_{\text{head}}$, 16x less NVFP4 head traffic; C=8 engine `1,646 -> 1,710 tok/s`)
-> - Zero-PCIe GPU prefix cache + async `POST /v1/prefetch` (`7.21 ms -> 0.23 ms`) + zero-lag UDS/HTTP/1.1 serving stack (warm 60K TTFT `92.9 ms -> 25.1 ms`, HTTP keep-alive `41.0 ms -> 0.13 ms`)
-> - Standalone Linux tools in [`tools/`](tools/): [`rtx5090-undervolt.py`](tools/rtx5090-undervolt.py) (true NVML V/F curve undervolt) & [`q27-fwd.c`](tools/q27-fwd.c) (`--network none` UDS forwarder)
+> - Sarathi chunked-prefill interleaving (`PREFILL_DECODE_CHUNK=512`, cutting C=4 32K worst-case ITL stalls `545 ms -> 56 ms`, **9.7x smoother**)
+> - CUDA Graph conditional prompt-lookup (`Q27_LOOKUP=1` default) + adaptive 2-path DSpine trees on FP8 Tensor Cores (`attention_tc8_kernel` ancestor bitmask)
+> - Low-rank DSpine refinement (precomputed Gram $G = W_4^T W_4$ + $U_{\text{head}}$); combined `iter1..iter11` stack lifts C=8 engine decode `1,646 -> 1,710 tok/s`
+> - Zero-PCIe GPU prefix cache + async `POST /v1/prefetch` (warm 20K engine TTFT `34.0 -> 19.4 ms` on `+18` tok) + HTTP/1.1 keep-alive / Unix domain socket serving stack
+> - Standalone Linux tools in [`tools/`](tools/): [`rtx5090-undervolt.py`](tools/rtx5090-undervolt.py) (NVML V/F curve undervolt + GDDR7 OC) & [`q27-fwd.c`](tools/q27-fwd.c) (`--network none` UDS forwarder)
+>
+> *(Note: the original upstream README below reports upstream `v0.6.x` benchmarks on `juzbox/Qwen3.8-27B-NVFP4-GDN` with `NVFP4 KV` at `400 W`; see [`docs/moonshot-fork.md`](docs/moonshot-fork.md) for this fork's own FP8 KV benchmarks and full workload breakdown.)*
 
 ---
 
