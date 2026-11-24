@@ -1178,6 +1178,11 @@ class Handler(BaseHTTPRequestHandler):
                   "/admin/engine": self.engine_control, "/admin/engine/plan": self.engine_plan,
                   "/admin/engine/idle": self.engine_idle}
         fn = routes.get(path)
+        # With ADMIN_LOCK=1, mutating engine/concurrency settings over the API is disabled so autonomous
+        # agents cannot restart or reconfigure the server without operator approval. Read-only GET /admin/*
+        # and POST /admin/engine/plan remain open.
+        if os.environ.get("ADMIN_LOCK") == "1" and path in ("/admin/engine", "/admin/concurrency", "/admin/engine/idle"):
+            return self._error(403, "engine admin mutations are locked (ADMIN_LOCK=1); change settings on the host instead.")
         if fn is None:
             return self._error(404, "not found", "not_found")
         HUB.local.meta = request_meta(path, self.headers, body) if path in GENERATE else None

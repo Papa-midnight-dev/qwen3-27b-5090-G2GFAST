@@ -203,7 +203,17 @@ class OutputParser:
             if self.mode == "reasoning":
                 i = self.buf.find(self.think_end)
                 if i < 0:
-                    self._text("reasoning", len(self.buf) - _partial_suffix(self.buf, self.think_end), events)
+                    # Guard against tool calls emitted inside <think> without a closing </think> tag. The model sometimes writes its tool call inside its
+                    # thinking and stops, with no `</think>`. Text from a tool-call marker on is held back here, not
+                    # sent as reasoning: if `</think>` follows, it was only drafted and stays reasoning (the normal
+                    # path below); if the output ends right after complete calls, finish() returns them as calls.
+                    j = self.buf.find(self.tool_start) if self.tools else -1
+                    if j >= 0:
+                        self._text("reasoning", j, events)
+                        return events
+                    hold = max(_partial_suffix(self.buf, self.think_end),
+                               _partial_suffix(self.buf, self.tool_start) if self.tools else 0)
+                    self._text("reasoning", len(self.buf) - hold, events)
                     return events
                 self._text("reasoning", i, events)
                 self.buf = self.buf.lstrip()[len(self.think_end):] if self.buf.lstrip().startswith(self.think_end) else ""
@@ -244,7 +254,33 @@ class OutputParser:
         """Events for what is left at the end of the generation."""
         events = []
         if self.mode == "reasoning":
-            self._text("reasoning", len(self.buf), events)
+            # Local patch v2: the output ended inside the reasoning. If it ends with nothing but complete tool calls,
+            # they are the model's answer (vLLM's parsers return them too). Anything else stays reasoning: a cut-off
+            # call, a stray marker, or text after the calls.
+            j = self.buf.find(self.tool_start) if self.tools else -1
+            calls, rest = [], (self.buf[j:] if j >= 0 else "")
+            while rest.lstrip().startswith(self.tool_start):
+                rest = rest.lstrip()
+                k = rest.find(self.tool_end)
+                got = parse_call_block(self.out(rest[:k + len(self.tool_end)]), self.schemas) if k >= 0 else []
+                if not got:
+                    calls = []
+                    break
+                calls += got
+                rest = rest[k + len(self.tool_end):]
+            if calls and not rest.strip():
+                self.buf = self.buf[:j]
+                self._text("reasoning", len(self.buf), events, hold_ws=False)
+                if events and events[-1][0] == "reasoning":
+                    events[-1] = ("reasoning", events[-1][1].rstrip())
+                for c in calls:
+                    self.ncalls += 1
+                    events.append(("tool_call", c))
+                import sys
+                print(f"[chat] local patch: {len(calls)} tool call(s) written inside the reasoning were returned as calls",
+                      file=sys.stderr, flush=True)
+            else:
+                self._text("reasoning", len(self.buf), events)
         elif self.mode == "content":
             self._text("content", len(self.buf), events, hold_ws=False)
         elif self.mode == "tool":
