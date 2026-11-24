@@ -235,7 +235,9 @@ class Model {
   void spec_flush();  // replays the last verify's commits into the GDN / conv states
   void set_sbuf(int b);  // host side of the GDN state buffer switch
   int spec_block_of(const SpecSampling& smp) const { return smp.block > 0 ? smp.block : draft_->block(); }
-  int spec_rows(const SpecSampling& smp) const { return 1 + (spec_block_of(smp) - 1) * std::max(1, smp.paths); }
+  int spec_rows(const SpecSampling& smp) const {
+    return std::min(kTreeMax, 1 + (spec_block_of(smp) - 1) * std::max(1, smp.paths));
+  }
   GdnSpec gdn_spec(int gdn_layer) const;
   bool fused(int T) const;
   bf16* cap_for(int layer) const;
@@ -550,6 +552,7 @@ class Model {
   bool adapt_on_ = false;
   int last_block_ = 0;
   int adapt_low_ = 8;
+  int adapt_paths_ = 1;       // Q27_SPEC_ADAPT_PATHS: tree paths used when adaptive width drops to adapt_low_
   float adapt_up_ = 4.5f, adapt_down_ = 4.0f, adapt_alpha_ = 0.125f;
   void spec_adapt(SpecSampling& smp, int n) const;
   bool spec_pending_ = false;  // a verify ran since the last flush / reset

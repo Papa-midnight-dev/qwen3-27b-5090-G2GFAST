@@ -115,9 +115,9 @@ struct SpecOut {
 };
 
 // Counter-based uniform numbers in [0, 1): rng[0] = seed, rng[1] = step counter (advanced on the device).
-// Index ranges per step: walk k, position e: 8 k + e; accept test of draw j at node n: 32 + 4 n + j;
-// residual / bonus draw at node n: 160 + n.
-constexpr uint32_t kRngWalk = 0, kRngAccept = 32, kRngResidual = 160;
+// Index ranges per step: walk k, position e: kSpecBlock*k + e (0..63); accept test of draw j at node n:
+// 64 + 4*n + j (64..191); residual / bonus draw at node n: 192 + n (192..223). All < 256.
+constexpr uint32_t kRngWalk = 0, kRngAccept = 64, kRngResidual = 192;
 __device__ __forceinline__ float rng_uniform(const uint64_t* rng, uint32_t idx) {
   uint64_t z = rng[0] + (rng[1] * 256 + idx + 1) * 0x9E3779B97F4A7C15ull;
   z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
@@ -191,6 +191,10 @@ void lane_blocks(const LaneRows& lr, const int32_t* anchor, int mask_id, int32_t
                  cudaStream_t s);
 // The lookup match for the next draft block (see Lookup); `anchor` is the uncommitted last token.
 void spec_lookup(const Lookup& lk, const int32_t* anchor, cudaStream_t s);
+// Decide whether the lookup hit short-circuits the draft model (populates choice.tree, choice.cand, ids_out,
+// sets *choice.src = 1, and clears cond_handle when hit; else sets *choice.src = 0 and sets cond_handle = 1).
+void spec_lookup_decide(const Lookup& lk, const int32_t* anchor, int nd, DraftChoice choice, int32_t* ids_out,
+                        cudaStream_t s, cudaGraphConditionalHandle cond_handle = 0);
 // End of a step: *pos += *ncommit, *par ^= 1, *sbuf ^= 1 (the GDN state buffer), rng[1] += 1, and
 // *budget -= *ncommit (if given).
 void spec_advance(int32_t* pos, const int32_t* ncommit, int32_t* par, int32_t* sbuf, uint64_t* rng, cudaStream_t s,

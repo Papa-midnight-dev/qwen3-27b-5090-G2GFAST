@@ -386,13 +386,10 @@ void Model::configure() {
     const char* e = getenv(name);
     return e && *e ? atoi(e) : dflt;
   };
-  lookup_.on = env_int("Q27_LOOKUP", 0);  // off: with an 8-row chain the draft copies as well (measured)
+  lookup_.on = env_int("Q27_LOOKUP", 1);  // Hybrid lossless GPU prompt-lookup short-circuit (skips DSpine on n-gram hits)
   lookup_.min_len = env_int("Q27_LOOKUP_MIN", 8);
   lookup_.agree = env_int("Q27_LOOKUP_AGREE", 2);
   spec_paths_ = std::clamp(env_int("Q27_SPEC_PATHS", 1), 1, kTreePaths);
-  // (trees: blocks of up to 8 rows; their walks' random numbers and rows are laid out for that)
-  if (draft_ && draft_->block() > ddims::kBlock) spec_paths_ = 1;
-  if (draft_ && draft_->dspine()) lookup_.on = 0;  // (the selector's lookup chains are DFlash2's 7 rows)
   // Adaptive verify width: on by default when the draft's block is longer than 8 (DSpine). A sequence verifies
   // Q27_SPEC_ADAPT_LOW rows while the moving average of its tokens per step is below Q27_SPEC_ADAPT_DOWN, the full block
   // again once it reaches Q27_SPEC_ADAPT_UP (16 rows cost about 1.1 ms more per step than 8).
@@ -402,6 +399,7 @@ void Model::configure() {
   };
   adapt_on_ = draft_ && draft_->block() > ddims::kBlock && env_int("Q27_SPEC_ADAPT", 1) != 0;
   adapt_low_ = draft_ ? std::clamp(env_int("Q27_SPEC_ADAPT_LOW", ddims::kBlock), 2, draft_->block()) : ddims::kBlock;
+  adapt_paths_ = std::clamp(env_int("Q27_SPEC_ADAPT_PATHS", 2), 1, kTreePaths);
   adapt_up_ = env_f("Q27_SPEC_ADAPT_UP", 4.5f);
   adapt_down_ = env_f("Q27_SPEC_ADAPT_DOWN", 4.0f);
   adapt_alpha_ = std::clamp(env_f("Q27_SPEC_ADAPT_ALPHA", 0.125f), 0.f, 1.f);
@@ -1293,6 +1291,7 @@ void Model::forward_topk(const int32_t* ids, int n, int k,
     ensure_pages(pos_ + T);
     upload_ids(ids + c0, T);
     chunk(ids_, T);
+    if (hist_ && lookup_.on) copy_hist(hist_ + pos_, ids + c0, T);
     pos_ += T;
     seq_ids_.insert(seq_ids_.end(), ids + c0, ids + c0 + T);
     ring_valid_ = false;
@@ -1423,6 +1422,7 @@ int Model::prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, 
       draft_->append_ctx(cap_ + size_t(skip) * ddims::kCtxFeatures * kHidden, T - skip, pos_dev_, skip - T, nullptr,
                          skinny_ws_, kSkinnyWsBytes, big1_, size_t(opt_.prefill_chunk) * kInter * 4, s_);
     }
+    if (hist_ && lookup_.on) copy_hist(hist_ + pos_, ids + c0, T);
     pos_ += T;
     seq_ids_.insert(seq_ids_.end(), ids + c0, ids + c0 + T);
     ring_valid_ = cap_ != nullptr;
@@ -1602,7 +1602,6 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
   spec_smp_ = smp;
   if (!smp.ignore_eos) std::copy(stop_, stop_ + 2, spec_smp_.stop);
   if (spec_smp_.paths <= 0) spec_smp_.paths = spec_paths_;
-  if (draft_->block() > ddims::kBlock) spec_smp_.paths = 1;  // (see configure)
   if (spec_smp_.masked) spec_smp_.paths = 1;  // (the host masks a chain's rows)
   // The full block first; the average starts between the thresholds.
   spec_smp_.block = spec_smp_.block_next = spec_smp_.block_due = draft_->block();
@@ -1679,7 +1678,11 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   batch_exit();
   // A step not launched ahead takes the width decided after the step before the last (block_due): a step launched
   // ahead could only use that one, and the widths must not depend on it (SpecSampling).
-  if (!spec_inflight_) spec_smp_.block = spec_smp_.block_due;
+  if (!spec_inflight_) {
+    spec_smp_.block = spec_smp_.block_due;
+    if (adapt_on_ && !spec_smp_.masked && !spec_smp_.pinned && spec_paths_ == 1)
+      spec_smp_.paths = spec_smp_.block < draft_->block() ? adapt_paths_ : 1;
+  }
   const SpecSampling smp = spec_smp_;
   Q27_CHECK(pos_ + spec_rows(smp) <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
   // Pages for this step's rows and for the one launched ahead (the position advances by <= 8).
@@ -1712,15 +1715,68 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
     if (!spec_graph_) {
       cudaGraph_t graph;
       trace_clear_launches();
-      Q27_CUDA(cudaStreamBeginCapture(s_, cudaStreamCaptureModeThreadLocal));
-      prof_.capturing = true;
-      prof_.graph.used = 0;
-      spec_body(smp);
-      mark(nullptr);
-      prof_.capturing = false;
-      Q27_CUDA(cudaStreamEndCapture(s_, &graph));
-      Q27_CUDA(cudaGraphInstantiate(&spec_graph_, graph, 0));
-      Q27_CUDA(cudaGraphDestroy(graph));
+      const bool use_lookup_cond = lookup_.on && !smp.masked && smp.paths == 1 && !prof_.on && !skip("draft");
+      if (use_lookup_cond) {
+        // Hybrid DSpine + lossless GPU prompt-lookup using CUDA 13.4 conditional graph node:
+        // on n-gram match >= min_len, skips the entire DSpine forward pass (~1.2-1.5 ms saved per hit!).
+        Q27_CUDA(cudaGraphCreate(&graph, 0));
+        cudaGraphConditionalHandle cond_h = 0;
+        Q27_CUDA(cudaGraphConditionalHandleCreate(&cond_h, graph, 1, cudaGraphCondAssignDefault));
+
+        cudaGraph_t g_pre = nullptr, g_draft = nullptr, g_post = nullptr;
+        Lookup lk = lookup_;
+        lk.hist = hist_, lk.pos = pos_dev_, lk.best = lk_best_;
+        const int nd = spec_block_of(smp) - 1;
+
+        Q27_CUDA(cudaStreamBeginCapture(s_, cudaStreamCaptureModeThreadLocal));
+        spec_lookup(lk, ids_ver_, s_);
+        spec_lookup_decide(lk, ids_ver_, nd, draft_->choice, ids_ver_, s_, cond_h);
+        Q27_CUDA(cudaStreamEndCapture(s_, &g_pre));
+
+        cudaGraphNode_t n_pre = nullptr, n_cond = nullptr, n_post = nullptr;
+        Q27_CUDA(cudaGraphAddChildGraphNode(&n_pre, graph, nullptr, 0, g_pre));
+
+        cudaGraphNodeParams cparams = {};
+        cparams.type = cudaGraphNodeTypeConditional;
+        cparams.conditional.handle = cond_h;
+        cparams.conditional.type = cudaGraphCondTypeIf;
+        cparams.conditional.size = 1;
+        Q27_CUDA(cudaGraphAddNode(&n_cond, graph, &n_pre, nullptr, 1, &cparams));
+        cudaGraph_t cond_body = cparams.conditional.phGraph_out[0];
+
+        const auto& lm = w_.lm_head;
+        SpecSampling dsmp = smp;
+        dsmp.pen.counts = dsmp.penalized() ? pen_ : nullptr;
+        dsmp.bias = dsmp.biased ? bias_list() : nullptr;
+        Lookup lk_off{};
+        Q27_CUDA(cudaStreamBeginCapture(s_, cudaStreamCaptureModeThreadLocal));
+        draft_->propose(block_ids_, pos_dev_, w_.embed, lm.w, lm.sf, lm.in_scale, lm.alpha.alpha[0], dsmp, rng_,
+                        ids_ver_, aq_, asf_, logits_, skinny_ws_, kSkinnyWsBytes, lk_off, s_, spec_block_of(smp));
+        Q27_CUDA(cudaStreamEndCapture(s_, &g_draft));
+        cudaGraphNode_t n_draft_child = nullptr;
+        Q27_CUDA(cudaGraphAddChildGraphNode(&n_draft_child, cond_body, nullptr, 0, g_draft));
+
+        Q27_CUDA(cudaStreamBeginCapture(s_, cudaStreamCaptureModeThreadLocal));
+        spec_body(smp, 2);
+        Q27_CUDA(cudaStreamEndCapture(s_, &g_post));
+        Q27_CUDA(cudaGraphAddChildGraphNode(&n_post, graph, &n_cond, 1, g_post));
+
+        Q27_CUDA(cudaGraphInstantiate(&spec_graph_, graph, 0));
+        Q27_CUDA(cudaGraphDestroy(g_pre));
+        Q27_CUDA(cudaGraphDestroy(g_draft));
+        Q27_CUDA(cudaGraphDestroy(g_post));
+        Q27_CUDA(cudaGraphDestroy(graph));
+      } else {
+        Q27_CUDA(cudaStreamBeginCapture(s_, cudaStreamCaptureModeThreadLocal));
+        prof_.capturing = true;
+        prof_.graph.used = 0;
+        spec_body(smp);
+        mark(nullptr);
+        prof_.capturing = false;
+        Q27_CUDA(cudaStreamEndCapture(s_, &graph));
+        Q27_CUDA(cudaGraphInstantiate(&spec_graph_, graph, 0));
+        Q27_CUDA(cudaGraphDestroy(graph));
+      }
       spec_key_ = smp;
       if (sgraphs_.size() >= size_t(kGraphCache)) {
         auto lru = std::min_element(sgraphs_.begin(), sgraphs_.end(), [](auto& a, auto& b) { return a.used < b.used; });
@@ -2201,7 +2257,7 @@ void Model::batch_enter(const int32_t* lanes, int n) {
   batch_exit();
   spec_flush();  // the running sequence: nothing pending, no step in flight
   Q27_CHECK(n >= 1 && n <= max_lanes(), "spec_step_lanes: more lanes than MAX_SEQS");
-  Q27_CHECK(spec_paths_ == 1, "spec_step_lanes: chains only (Q27_SPEC_PATHS=1)");
+  // Batched steps always run chain verification (smp.paths = 1 below) even when single-stream trees are enabled.
   for (int z = 0; z < n; z++) {
     const int a = lanes[z];
     Q27_CHECK(a == -1 || (a >= 0 && a < int(parked_.size()) && parked_[a].used), "spec_step_lanes: no such sequence");

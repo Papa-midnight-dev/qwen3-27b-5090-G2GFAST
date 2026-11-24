@@ -853,6 +853,8 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
       int node = 0, prev = 0;
       int32_t ptok[kMaxDraft];
       for (int e = 0; e < nd; e++) {
+        // Stop walk before drawing if trie is full (decision depends only on prior draws, preserving exact rejection sampling).
+        if (__shfl_sync(0xffffffffu, n_nodes, 0) >= kTreeMax) break;
         const float sc = row(e, prev) - penalty(e, ptok);
         int idx;
         float prob;
@@ -875,7 +877,7 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
             const float y = __shfl_up_sync(0xffffffffu, cum, o);
             if (lane >= o) cum += y;
           }
-          const float u = rng_uniform(rng, kRngWalk + 8 * k + e);
+          const float u = rng_uniform(rng, kRngWalk + kSpecBlock * k + e);
           const unsigned below = __ballot_sync(0xffffffffu, lane < kSelK && u >= cum);
           idx = min(__popc(below), kSelK - 1);
         }
@@ -945,6 +947,7 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
         for (int e = 0; e < nd; e++) {
           const int idx = b_seq[bk][e];
           const bool fresh = child[node][idx] < 0;
+          if (fresh && n_nodes >= kTreeMax) break;
           const int c = node_of(node, idx, e, 0.f);
           if (fresh) tr->draws[node][tr->ndraws[node]++] = int8_t(c);
           node = c;

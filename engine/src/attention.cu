@@ -1526,7 +1526,8 @@ template <class KV, bool kBatch = false, bool kWide = false>
 __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod<kWide>, 1) attention_tc8_kernel(const float* q, const int32_t* pos_dev, int T,
                                                                           const KV* kc, const KV* vc,
                                                                           const int32_t* page_table, int splits,
-                                                                          DecPartial part, SeqLanes lanes, int t0 = 0) {
+                                                                          DecPartial part, SeqLanes lanes, int t0 = 0,
+                                                                          const SpecTree* tree = nullptr) {
   static_assert(kKvFp8<KV> || kKvFp4<KV>, "FP8 or NVFP4 KV");
   pdl_trigger();
   if constexpr (kBatch) {
@@ -1650,7 +1651,20 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
     const int kta = row_kt(ra), ktb = row_kt(rb);
     // (a batched lane with fewer rows than the launch's: its tiles past them compute nothing)
     const int ktile = tile * kT8Rows < nrows ? row_kt(min(tile * kT8Rows + kT8Rows - 1, nrows - 1)) : 0;
-    const int kmin = row_kt(tile * kT8Rows);  // chunks below it need no mask
+    const int kmin = tree ? pos0 : row_kt(tile * kT8Rows);  // chunks below it need no mask
+    uint32_t anc_a = 0u, anc_b = 0u;
+    if (tree) {
+      auto build_anc = [&](int r) -> uint32_t {
+        if (r >= nrows) return 0u;
+        const int tok = t0 + r / kGqa;
+        const int dep = tree->depth[tok];
+        uint32_t mask = 0u;
+        for (int d = 0; d <= dep; d++) mask |= (1u << int(tree->path[tok][d]));
+        return mask;
+      };
+      anc_a = build_anc(ra);
+      anc_b = build_anc(rb);
+    }
     uint32_t qa[kHeadDim / 32][4];
     float sq[2];
     {
@@ -1723,7 +1737,12 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
           for (int e = 0; e < 4; e++) {
             sc[n][e] *= sq[e / 2];
             const int key = c * kTcChunk + (kGrp ? gw : n) * 8 + c2 + (e & 1);
-            if (diag && key >= (e < 2 ? kta : ktb)) sc[n][e] = -INFINITY;
+            if (diag) {
+              const bool masked = tree
+                  ? (key >= pos0 && (key >= pos0 + kTreeMax || !(((e < 2 ? anc_a : anc_b) >> (key - pos0)) & 1u)))
+                  : (key >= (e < 2 ? kta : ktb));
+              if (masked) sc[n][e] = -INFINITY;
+            }
             mx[e / 2] = fmaxf(mx[e / 2], sc[n][e]);
           }
 #pragma unroll
@@ -1836,7 +1855,9 @@ __global__ void attention_combine_kernel(const float* qg, int ldq, const int32_t
   }
   const int pos0 = *pos_dev;
   pdl_wait();
-  const int keys = pos0 + (tree ? tree->depth[t] : tl) + 1;
+  // Tensor-core kernels (chunk > 0) place tree node t at physical slot pos0 + t (and mask non-ancestors),
+  // whereas CUDA-core attention_decode_kernel (chunk == 0) packs the path into 0..depth[t].
+  const int keys = pos0 + (tree && chunk == 0 ? tree->depth[t] : tl) + 1;
   const int per = chunk > 0 ? chunk : keys_per_split(keys, splits, min_keys);
   const int used = min(splits, (keys + per - 1) / per);
   float M = -INFINITY;
@@ -2068,9 +2089,9 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
   // Chains of up to 64 tokens (decode, verify, short warm follow-ups): tensor cores in <=16-row launches.
   // Q27_ATTN_TC=0: the CUDA-core kernel. The split count is fixed per process (bit-identical rows).
   const bool tc_on = !getenv("Q27_ATTN_TC") || atoi(getenv("Q27_ATTN_TC")) != 0;
-  // (FP8 MMAs with FP8 / NVFP4 KV, tc_f8: chains of up to 64 rows, split into <=16-row launches)
-  // (BF16 KV, or FP8 KV with Q27_ATTN_TC_F8=0: up to 16 rows in 8-row launches of attention_tc_kernel)
-  const bool tc = tc_on && !tree && (tc_f8(kv_type) ? T <= kMaxBatchRows : T <= kT8MaxT);
+  // (FP8 MMAs with FP8 / NVFP4 KV, tc_f8: chains or SpecTrees up to 64 rows, split into <=16-row launches)
+  // (BF16 KV, or FP8 KV with Q27_ATTN_TC_F8=0: up to 16 rows in 8-row launches of attention_tc_kernel, chains only)
+  const bool tc = tc_on && (tc_f8(kv_type) ? T <= kMaxBatchRows : (!tree && T <= kT8MaxT));
   const int tc_splits = getenv("Q27_ATTN_TC_SPLITS") ? atoi(getenv("Q27_ATTN_TC_SPLITS"))
                                                      : std::max(1, g_attn_sms / kKvHeads);
   const int splits = std::min(kDecodeMaxSplits,
@@ -2099,19 +2120,19 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
         if (kv_type == KvType::NVFP4 && tc8_warps(n) > kT8Grp)
           launch_pdl(attention_tc8_kernel<Fp4Kv, false, true>, grid, block8, kT8Smem<Fp4Kv>, s, q, pos_dev, n,
                      static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), page_table, splits, part,
-                     SeqLanes{}, t0);
+                     SeqLanes{}, t0, tree);
         else if (kv_type == KvType::FP8 && tc8_warps(n) > kT8Grp)
           launch_pdl(attention_tc8_kernel<uint8_t, false, true>, grid, block8, kT8Smem<uint8_t>, s, q, pos_dev, n,
                      static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), page_table, splits, part,
-                     SeqLanes{}, t0);
+                     SeqLanes{}, t0, tree);
         else if (kv_type == KvType::NVFP4)
           launch_pdl(attention_tc8_kernel<Fp4Kv>, grid, block8, kT8Smem<Fp4Kv>, s, q, pos_dev, n,
                      static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), page_table, splits, part,
-                     SeqLanes{}, t0);
+                     SeqLanes{}, t0, tree);
         else
           launch_pdl(attention_tc8_kernel<uint8_t>, grid, block8, kT8Smem<uint8_t>, s, q, pos_dev, n,
                      static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), page_table, splits, part,
-                     SeqLanes{}, t0);
+                     SeqLanes{}, t0, tree);
       }
     } else {
     // Rows t0 .. t0 + n - 1 (at most 8: the launch bounds); more rows take two launches.
@@ -2216,19 +2237,19 @@ void attention_decode_lanes(const float* q, const float* qg, int ldq, const SeqL
     if (wide && kv_type == KvType::NVFP4)
       launch_pdl(attention_tc8_kernel<Fp4Kv, true, true>, grid, block8, kT8Smem<Fp4Kv>, s, q, lanes.pos, T,
                  static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), lanes.page_table[0], splits, part,
-                 lanes, 0);
+                 lanes, 0, static_cast<const SpecTree*>(nullptr));
     else if (wide)
       launch_pdl(attention_tc8_kernel<uint8_t, true, true>, grid, block8, kT8Smem<uint8_t>, s, q, lanes.pos, T,
                  static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), lanes.page_table[0], splits,
-                 part, lanes, 0);
+                 part, lanes, 0, static_cast<const SpecTree*>(nullptr));
     else if (kv_type == KvType::NVFP4)
       launch_pdl(attention_tc8_kernel<Fp4Kv, true>, grid, block8, kT8Smem<Fp4Kv>, s, q, lanes.pos, T,
                  static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), lanes.page_table[0], splits, part,
-                 lanes, 0);
+                 lanes, 0, static_cast<const SpecTree*>(nullptr));
     else
       launch_pdl(attention_tc8_kernel<uint8_t, true>, grid, block8, kT8Smem<uint8_t>, s, q, lanes.pos, T,
                  static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), lanes.page_table[0], splits,
-                 part, lanes, 0);
+                 part, lanes, 0, static_cast<const SpecTree*>(nullptr));
   } else {
     for (int z = 0; z < lanes.n; z++)
       Q27_CHECK(lanes.lr.rows(z) == T && T <= kTcMaxT, "attention_decode_lanes: lanes of different rows need FP8 MMAs");

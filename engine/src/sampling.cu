@@ -444,9 +444,9 @@ __global__ void lane_blocks_kernel(LaneRows lr, const int32_t* anchor, int mask_
 // to those ending at the anchor, up to kLookupMax); the maximum of (m << 20) | j goes to *best.
 __global__ void __launch_bounds__(256) lookup_kernel(Lookup lk, const int32_t* anchor) {
   pdl_trigger();
+  pdl_wait();  // must wait for previous pipelined step's spec_accept/spec_advance to update *pos, *anchor, hist
   __shared__ int key[kLookupMax];
   const int tid = threadIdx.x, lane = tid % 32;
-  // Everything read here was written by earlier steps (host-synchronized): before the PDL wait.
   const int L = *lk.pos;
   if (tid < kLookupMax) key[tid] = tid == 0 ? *anchor : (L - tid >= 0 ? lk.hist[L - tid] : -1);
   __syncthreads();
@@ -458,8 +458,76 @@ __global__ void __launch_bounds__(256) lookup_kernel(Lookup lk, const int32_t* a
     mine = max(mine, (uint32_t(m) << 20) | uint32_t(j));
   }
   for (int o = 16; o > 0; o >>= 1) mine = max(mine, __shfl_xor_sync(0xffffffffu, mine, o));
-  pdl_wait();  // (*best is reset by the previous step's selector)
   if (lane == 0 && mine) atomicMax(lk.best, mine);
+}
+
+// Single-warp decision kernel: if lookup found an n-gram match >= min_len with continuation tokens,
+// write a lossless point-mass chain into choice.tree / choice.cand / ids_out and clear cond_handle (skipping draft).
+__global__ void __launch_bounds__(32) lookup_decide_kernel(Lookup lk, const int32_t* anchor, int nd, DraftChoice ch,
+                                                           int32_t* ids_out, cudaGraphConditionalHandle cond_handle,
+                                                           int use_cond) {
+  pdl_trigger();
+  pdl_wait();
+  const int lane = threadIdx.x;
+  const uint32_t best = *lk.best;
+  if (lane == 0) *lk.best = 0;
+  const int m = int(best >> 20);
+  const int j = int(best & 0xfffffu);
+  const int L = *lk.pos;
+  const bool hit = (m >= lk.min_len) && (j + 1 < L);
+  if (!hit) {
+    if (lane == 0) {
+      *ch.src = 0;
+      if (use_cond) cudaGraphSetConditional(cond_handle, 1);
+    }
+    return;
+  }
+  const int clen = min(nd, L - 1 - j);
+  SpecTree* tr = ch.tree;
+  if (lane == 0) {
+    const int32_t anc = *anchor;
+    tr->n = clen + 1;
+    tr->npaths = 1;
+    tr->tok[0] = anc;
+    tr->depth[0] = 0;
+    tr->path[0][0] = 0;
+    tr->owner[0] = 0;
+    tr->cidx[0] = 0;
+    for (int e = 0; e < clen; e++) {
+      const int32_t tok = lk.hist[j + 1 + e];
+      const int t = e + 1;
+      tr->tok[t] = tok;
+      tr->depth[t] = int8_t(t);
+      for (int d = 0; d <= t; d++) tr->path[t][d] = int8_t(d);
+      tr->owner[t] = 0;
+      tr->cidx[t] = 0;
+      tr->ndraws[e] = 1;
+      tr->draws[e][0] = int8_t(t);
+      ids_out[t] = tok;
+    }
+    tr->ndraws[clen] = 0;
+    tr->leaf[0] = int8_t(clen);
+    for (int t = clen + 1; t < kTreeMax; t++) {
+      tr->tok[t] = anc;
+      tr->depth[t] = 0;
+      tr->path[t][0] = int8_t(t);
+      tr->owner[t] = -1;
+      tr->cidx[t] = 0;
+      tr->ndraws[t] = 0;
+      if (t <= nd) ids_out[t] = anc;
+    }
+    *ch.src = 1;
+    if (use_cond) cudaGraphSetConditional(cond_handle, 0);
+  }
+  __syncwarp();
+  for (int i = lane; i < kTreeMax * kSpecSelK; i += 32) {
+    const int r = i / kSpecSelK, c = i % kSpecSelK;
+    tr->q[r][c] = (r < clen && c == 0) ? 1.f : 0.f;
+  }
+  for (int i = lane; i < nd * kSpecSelK; i += 32) {
+    const int e = i / kSpecSelK, c = i % kSpecSelK;
+    ch.cand[i] = (e < clen && c == 0) ? tr->tok[e + 1] : -1;
+  }
 }
 
 __global__ void spec_advance_kernel(int32_t* pos, const int32_t* ncommit, int32_t* par, int32_t* sbuf, uint64_t* rng,
@@ -708,6 +776,13 @@ void lane_blocks(const LaneRows& lr, const int32_t* anchor, int mask_id, int32_t
 
 void spec_lookup(const Lookup& lk, const int32_t* anchor, cudaStream_t s) {
   launch_pdl(lookup_kernel, dim3(64), dim3(256), 0, s, lk, anchor);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void spec_lookup_decide(const Lookup& lk, const int32_t* anchor, int nd, DraftChoice choice, int32_t* ids_out,
+                        cudaStream_t s, cudaGraphConditionalHandle cond_handle) {
+  launch_pdl(lookup_decide_kernel, dim3(1), dim3(32), 0, s, lk, anchor, nd, choice, ids_out, cond_handle,
+             cond_handle != 0 ? 1 : 0);
   Q27_CUDA(cudaGetLastError());
 }
 
