@@ -368,15 +368,16 @@ __global__ void __launch_bounds__(kWarps * 32) skinny_kernel(Params p) {
         store_fp4_halfwarp(y, p.down_in_scale, tok, 4 * tile + blk, I, p.q_out, p.sf_out, lane);
       }
       return;
+    } else {
+#pragma unroll
+      for (int gi = 0; gi < kG; gi++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          int row = row0 + (j / 2) * 8, tok = 8 * gi + 2 * t + j % 2;
+          if (tok < p.M) epilogue(row, tok, acc[gi][j]);
+        }
+      return;
     }
-#pragma unroll
-    for (int gi = 0; gi < kG; gi++)
-#pragma unroll
-      for (int j = 0; j < 4; j++) {
-        int row = row0 + (j / 2) * 8, tok = 8 * gi + 2 * t + j % 2;
-        if (tok < p.M) epilogue(row, tok, acc[gi][j]);
-      }
-    return;
   }
 #pragma unroll
   for (int gi = 0; gi < kG; gi++)
