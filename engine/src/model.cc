@@ -400,8 +400,8 @@ void Model::configure() {
   adapt_on_ = draft_ && draft_->block() > ddims::kBlock && env_int("Q27_SPEC_ADAPT", 1) != 0;
   adapt_low_ = draft_ ? std::clamp(env_int("Q27_SPEC_ADAPT_LOW", ddims::kBlock), 2, draft_->block()) : ddims::kBlock;
   adapt_paths_ = std::clamp(env_int("Q27_SPEC_ADAPT_PATHS", 2), 1, kTreePaths);
-  adapt_up_ = env_f("Q27_SPEC_ADAPT_UP", 6.5f);
-  adapt_down_ = env_f("Q27_SPEC_ADAPT_DOWN", 5.5f);
+  adapt_up_ = env_f("Q27_SPEC_ADAPT_UP", 4.5f);
+  adapt_down_ = env_f("Q27_SPEC_ADAPT_DOWN", 4.0f);
   adapt_alpha_ = std::clamp(env_f("Q27_SPEC_ADAPT_ALPHA", 0.125f), 0.f, 1.f);
   batch_adapt_ = adapt_on_ && env_int("Q27_SPEC_ADAPT_BATCH", 1) != 0;
   batch_hyst_ = std::max(0.f, env_f("Q27_SPEC_ADAPT_HYST", 0.01f));
