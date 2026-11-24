@@ -11,6 +11,7 @@
 #include <cstdlib>
 
 #include "common.h"
+#include "fp4_epilogue.cuh"
 #include "kernels.h"
 #include "launch.cuh"
 
@@ -45,6 +46,11 @@ struct Params {
   int ext_reduce;       // split-K partials summed by skinny_reduce_kernel (the next launch), not the last CTA
   float* part;          // [splits][8][N]
   int* counters;        // [N / 128], zero between calls
+  float alpha_gate;     // fused GLU epilogue (skinny_fp4_glu)
+  float alpha_up;
+  float down_in_scale;
+  uint8_t* q_out;
+  uint8_t* sf_out;
 };
 
 __device__ __forceinline__ uint32_t ld_cached(const uint8_t* p) {
@@ -151,7 +157,7 @@ constexpr int kL2ChunksDefault = 8;
 // (170-225 registers), so the extra 24 KiB of shared memory are free; the 8 warps no longer load and
 // transpose the same activations each. The MMA inputs are the same.
 constexpr int kActChunkBytes = kMaxTokens * 128;  // one chunk of the activations (kG = 8)
-template <Fmt kFmt, int kStages, int kG, bool kWideB = false>
+template <Fmt kFmt, int kStages, int kG, bool kWideB = false, bool kGlu = false>
 __global__ void __launch_bounds__(kWarps * 32) skinny_kernel(Params p) {
   constexpr bool kFp4 = kFmt == Fmt::kFp4;
   constexpr bool kSmemB = kG == 8;
@@ -336,6 +342,33 @@ __global__ void __launch_bounds__(kWarps * 32) skinny_kernel(Params p) {
     p.d[i] = out;
   };
   if (p.splits == 1) {
+    if constexpr (kGlu) {
+      // Fused silu(alpha_gate * gate) * (alpha_up * up) -> NVFP4 block-16 quantize directly in SMEM!
+      // Warps 0..3 computed 64 gate rows and warps 4..7 computed the matching 64 up rows of this tile.
+      __syncthreads();
+      float* s_gu = reinterpret_cast<float*>(smem);
+#pragma unroll
+      for (int gi = 0; gi < kG; gi++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          const int local_row = warp * 16 + g + (j / 2) * 8;
+          const int tok = 8 * gi + 2 * t + j % 2;
+          if (tok < p.M) s_gu[tok * 128 + local_row] = acc[gi][j];
+        }
+      __syncthreads();
+      const int hw = threadIdx.x / 16;
+      const int hl = threadIdx.x & 15;
+      const int I = p.N / 2;
+      const int total_pairs = p.M * 4;  // always a multiple of 4 (both half-warps of any warp agree)
+      for (int pair = hw; pair < total_pairs; pair += 16) {
+        const int tok = pair / 4, blk = pair % 4;
+        const float gv = s_gu[tok * 128 + blk * 16 + hl] * p.alpha_gate;
+        const float uv = s_gu[tok * 128 + 64 + blk * 16 + hl] * p.alpha_up;
+        const float y = gv / (1.f + expf(-gv)) * uv;
+        store_fp4_halfwarp(y, p.down_in_scale, tok, 4 * tile + blk, I, p.q_out, p.sf_out, lane);
+      }
+      return;
+    }
 #pragma unroll
     for (int gi = 0; gi < kG; gi++)
 #pragma unroll
@@ -459,10 +492,46 @@ __global__ void __launch_bounds__(256) skinny_reduce_kernel(Params p) {
   }
 }
 
-template <Fmt kFmt>
+// Fused split-K reduction + silu(alpha_gate * gate) * (alpha_up * up) + NVFP4 quantize (used when splits > 1).
+__global__ void __launch_bounds__(256) skinny_reduce_silu_fp4_kernel(Params p) {
+  pdl_trigger();
+  const int hw_global = (int(blockIdx.x) * blockDim.x + threadIdx.x) / 16;
+  const int hl = threadIdx.x & 15;
+  const int lane = threadIdx.x & 31;
+  const int I = p.N / 2;
+  const int kblocks = I / 16;
+  pdl_wait();
+  if (hw_global >= p.M * kblocks) return;
+  const int tok = hw_global / kblocks, kb = hw_global % kblocks;
+  const int64_t c_gate = gate_glu_offset(kb * 16) + hl;
+  const int64_t o_gate = int64_t(tok) * p.N + c_gate;
+  const int64_t o_up = o_gate + 64;
+  const int64_t stride = int64_t(p.M) * p.N;
+  float gv = 0.f, uv = 0.f;
+  for (int sp0 = 0; sp0 < p.splits; sp0 += 8) {
+    float gx[8], ux[8];
+#pragma unroll
+    for (int u = 0; u < 8; u++) {
+      gx[u] = sp0 + u < p.splits ? __ldcg(p.part + (sp0 + u) * stride + o_gate) : 0.f;
+      ux[u] = sp0 + u < p.splits ? __ldcg(p.part + (sp0 + u) * stride + o_up) : 0.f;
+    }
+#pragma unroll
+    for (int u = 0; u < 8; u++) {
+      if (sp0 + u < p.splits) gv += gx[u], uv += ux[u];
+    }
+  }
+  gv *= p.alpha_gate;
+  uv *= p.alpha_up;
+  const float y = gv / (1.f + expf(-gv)) * uv;
+  store_fp4_halfwarp(y, p.down_in_scale, tok, kb, I, p.q_out, p.sf_out, lane);
+}
+
+template <Fmt kFmt, bool kGlu = false>
 void launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
             const AlphaSegments& alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes,
-            cudaStream_t s, const float* wscale = nullptr, const float* ascale = nullptr) {
+            cudaStream_t s, const float* wscale = nullptr, const float* ascale = nullptr,
+            float alpha_gate = 1.f, float alpha_up = 1.f, float down_in_scale = 1.f,
+            uint8_t* q_out = nullptr, uint8_t* sf_out = nullptr) {
   Q27_CHECK(M >= 1 && M <= kMaxTokens, "skinny gemm: M must be 1..64");
   Q27_CHECK(N % kRowsPerCta == 0, "skinny gemm: N must be a multiple of 128");
   constexpr bool kFp4 = kFmt == Fmt::kFp4;
@@ -474,11 +543,11 @@ void launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const ui
   constexpr int kSmem8 = kSmem + kStages * kActChunkBytes;  // kG = 8: the activations' ring as well
   static bool attr = false;
   if (!attr) {
-    Q27_CUDA(cudaFuncSetAttribute(skinny_kernel<kFmt, kStages, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
-    Q27_CUDA(cudaFuncSetAttribute(skinny_kernel<kFmt, kStages, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
-    Q27_CUDA(cudaFuncSetAttribute(skinny_kernel<kFmt, kStages, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
-    Q27_CUDA(cudaFuncSetAttribute(skinny_kernel<kFmt, kStages, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem8));
-    Q27_CUDA(cudaFuncSetAttribute(skinny_kernel<kFmt, kStages, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+    Q27_CUDA(cudaFuncSetAttribute(skinny_kernel<kFmt, kStages, 1, false, kGlu>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+    Q27_CUDA(cudaFuncSetAttribute(skinny_kernel<kFmt, kStages, 2, false, kGlu>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+    Q27_CUDA(cudaFuncSetAttribute(skinny_kernel<kFmt, kStages, 4, false, kGlu>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+    Q27_CUDA(cudaFuncSetAttribute(skinny_kernel<kFmt, kStages, 8, false, kGlu>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem8));
+    Q27_CUDA(cudaFuncSetAttribute(skinny_kernel<kFmt, kStages, 4, true, kGlu>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
     attr = true;
   }
   Params p{};
@@ -515,10 +584,12 @@ void launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const ui
     Q27_CHECK(cnt_bytes + size_t(splits) * M * N * 4 <= ws_bytes, "skinny gemm: workspace too small");
   p.a = a, p.a_sf = a_sf, p.w = w, p.w_sf = w_sf, p.alpha = alpha, p.c = c, p.beta = beta, p.d = d;
   p.wscale = wscale, p.ascale = ascale;
+  p.alpha_gate = alpha_gate, p.alpha_up = alpha_up, p.down_in_scale = down_in_scale;
+  p.q_out = q_out, p.sf_out = sf_out;
   // Split-K sums in their own kernel above Q27_SKINNY_EXT_REDUCE_M rows (default 1: every verify and batched
   // step; P7-4. At M = 1 the last CTA is faster: decode 11.47 vs 11.74 ms).
   const char* e_ext = getenv("Q27_SKINNY_EXT_REDUCE_M");
-  p.ext_reduce = splits > 1 && M > (e_ext ? atoi(e_ext) : 1);
+  p.ext_reduce = kGlu ? (splits > 1) : (splits > 1 && M > (e_ext ? atoi(e_ext) : 1));
   p.counters = static_cast<int*>(ws);
   p.part = reinterpret_cast<float*>(static_cast<uint8_t*>(ws) + cnt_bytes);
   const dim3 grid(tiles, splits), block(kWarps * 32);
@@ -526,17 +597,23 @@ void launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const ui
   // at M = 32 with them; the other shapes 3-8% faster; P6-11).
   const bool wide = tiles < kWideMaxTiles;
   if (M <= 8)
-    launch_pdl(skinny_kernel<kFmt, kStages, 1>, grid, block, kSmem, s, p);
+    launch_pdl(skinny_kernel<kFmt, kStages, 1, false, kGlu>, grid, block, kSmem, s, p);
   else if (M <= 16)
-    launch_pdl(skinny_kernel<kFmt, kStages, 2>, grid, block, kSmem, s, p);
+    launch_pdl(skinny_kernel<kFmt, kStages, 2, false, kGlu>, grid, block, kSmem, s, p);
   else if (M <= 32 && wide)
-    launch_pdl(skinny_kernel<kFmt, kStages, 4, true>, grid, block, kSmem, s, p);
+    launch_pdl(skinny_kernel<kFmt, kStages, 4, true, kGlu>, grid, block, kSmem, s, p);
   else if (M <= 32)
-    launch_pdl(skinny_kernel<kFmt, kStages, 4>, grid, block, kSmem, s, p);
+    launch_pdl(skinny_kernel<kFmt, kStages, 4, false, kGlu>, grid, block, kSmem, s, p);
   else  // (kG = 8 reads the activations from shared memory: kWideB is not used)
-    launch_pdl(skinny_kernel<kFmt, kStages, 8>, grid, block, kSmem8, s, p);
-  if (p.ext_reduce)
-    launch_pdl(skinny_reduce_kernel, dim3(unsigned(ceil_div(int64_t(M) * N / 4, 256))), dim3(256), 0, s, p);
+    launch_pdl(skinny_kernel<kFmt, kStages, 8, false, kGlu>, grid, block, kSmem8, s, p);
+  if (p.ext_reduce) {
+    if constexpr (kGlu) {
+      const int64_t pairs = int64_t(M) * (N / 32);
+      launch_pdl(skinny_reduce_silu_fp4_kernel, dim3(unsigned(ceil_div(pairs * 16, 256))), dim3(256), 0, s, p);
+    } else {
+      launch_pdl(skinny_reduce_kernel, dim3(unsigned(ceil_div(int64_t(M) * N / 4, 256))), dim3(256), 0, s, p);
+    }
+  }
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -545,7 +622,14 @@ void launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const ui
 void skinny_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
                 const AlphaSegments& alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes,
                 cudaStream_t s) {
-  launch<Fmt::kFp4>(M, N, K, a, a_sf, w, w_sf, alpha, c, beta, d, ws, ws_bytes, s);
+  launch<Fmt::kFp4, false>(M, N, K, a, a_sf, w, w_sf, alpha, c, beta, d, ws, ws_bytes, s);
+}
+
+void skinny_fp4_glu(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
+                    float alpha_gate, float alpha_up, float down_in_scale, uint8_t* q_out, uint8_t* sf_out,
+                    void* ws, size_t ws_bytes, cudaStream_t s) {
+  launch<Fmt::kFp4, true>(M, N, K, a, a_sf, w, w_sf, AlphaSegments::one(1.f), nullptr, 0.f, nullptr, ws, ws_bytes, s,
+                          nullptr, nullptr, alpha_gate, alpha_up, down_in_scale, q_out, sf_out);
 }
 
 void skinny_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* w, const AlphaSegments& alpha, const float* c,

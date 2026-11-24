@@ -174,6 +174,8 @@ class Scheduler:
         self.held_until = (None, 0.0)  # (request, time): skip checking it again until then
         self.batch = self.spec and cfg.get("batch_decode", True) and self.engine.max_lanes > 1
         self.chunk = cfg["prefill_chunk"]
+        self.decode_chunk = max(128, min(self.chunk, int(os.environ.get("PREFILL_DECODE_CHUNK") or 512)))
+        self.decode_chunk = (self.decode_chunk // 64) * 64 or 128
         self.share = cfg["decode_share"]
         self.quantum = cfg["quantum_ms"] / 1000.0
         self.eos = set(cfg["eos"])
@@ -695,8 +697,10 @@ class Scheduler:
         self.load(s)
         t0, fed0 = time.time(), s.fed
         rest = s.eng_ids[s.fed:]
-        if len(rest) > self.chunk:
-            s.fed += self.engine.prefill(rest, self.chunk, spec=self.spec)
+        has_decode = any(o.phase == DECODE for o in self.alive if o is not s)
+        chunk_cap = self.decode_chunk if has_decode else self.chunk
+        if len(rest) > chunk_cap:
+            s.fed += self.engine.prefill(rest, chunk_cap, spec=self.spec)
         else:
             left = s.max_new - len(s.out)
             seed = s.rng.getrandbits(63)
@@ -737,7 +741,8 @@ class Scheduler:
                                            "draft_accepted": s.draft_accepted, "draft_block": self.draft_block if self.spec else 0})
         self.m["q27:prefill_tokens_total"] += fed - fed0
         if any(o.phase == DECODE for o in self.alive if o is not s):
-            self.credit += self.share * dt
+            # Sarathi-style interleaving: guarantee active decoders advance right after each chunked prefill slice
+            self.credit = max(self.credit + self.share * dt, 0.025)
 
     def decode_turn(self, s):
         self.load(s)

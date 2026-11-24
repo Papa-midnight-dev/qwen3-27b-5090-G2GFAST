@@ -1104,6 +1104,21 @@ void Model::mlp(int i, int T) {
       gemm_fp4(T, kHidden, kInter, q, qsf, L.down.w, L.down.sf, L.down.alpha.alpha[0], x_, 1.f, x_, s_);
     return;
   }
+  if (mlp_fused_ && T <= kSkinnyMaxM && skinny_ && !skinny_check_) {
+    // Decode / verify / batched: fused gate|up + silu * up + NVFP4 quantize directly into big1_/big2_
+    // (eliminates 64 silu+quant launches and 285 MB..1.14 GB/step of big1_ FP32 traffic).
+    auto* q = reinterpret_cast<uint8_t*>(big1_);
+    auto* qsf = reinterpret_cast<uint8_t*>(big2_);
+    mark("mlp gate_up+silu");
+    if (!skip("gemm") && !skip("gemm4"))
+      skinny_fp4_glu(T, L.gate_up.out, L.gate_up.in, aq_, asf_, L.gate_up.w, L.gate_up.sf, ag, au, L.down.in_scale, q,
+                     qsf, skinny_ws_, kSkinnyWsBytes, s_);
+    mark("mlp down");
+    if (!skip("gemm") && !skip("gemm4"))
+      skinny_fp4(T, L.down.out, L.down.in, q, qsf, L.down.w, L.down.sf, L.down.alpha, x_, 1.f, x_, skinny_ws_,
+                 kSkinnyWsBytes, s_);
+    return;
+  }
   if (mlp_bf16_ && T > kSkinnyMaxM && !fused(T)) {
     // Prefill: gate | up in BF16 (it only feeds silu * up and its FP4 quantization; [T][2 I] in big1_).
     bf16* gu = reinterpret_cast<bf16*>(big1_);
@@ -1373,10 +1388,22 @@ int Model::prefill(const int32_t* ids, int n, int budget, bool spec) {
 // *last: the row of the last token in the activations.
 int Model::prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, int* last) {
   const int end = pos_ + n;
+  const int tail_limit = std::min(opt_.prefill_chunk, std::max(kGdnChunk, budget));
   int c0 = 0;
-  while (c0 < n && c0 < budget && !(keep_tail && n - c0 <= opt_.prefill_chunk)) {
-    // Chunks stop at the planned checkpoints (prefix_begin).
-    const int T = prefill_cut(std::min(opt_.prefill_chunk, n - c0), opt_.prefill_chunk >= n - c0);
+  while (c0 < n && c0 < budget && !(keep_tail && n - c0 <= tail_limit)) {
+    // Chunks stop at the planned checkpoints (prefix_begin) and strictly respect `budget`
+    // (aligned to kGdnChunk=64 so Sarathi-interleaved prefills stay bit-identical to uncut prefills).
+    int rem_budget = budget - c0;
+    if (c0 > 0 && rem_budget < 128) break;  // never run an extra tiny skinny chunk at the end of a budget slice
+    int cap = std::min({opt_.prefill_chunk, n - c0, rem_budget});
+    if (keep_tail && cap == n - c0) {
+      // Leave at least 1 token for spec_begin/forward_sample when keep_tail is true
+      cap = std::max(kGdnChunk, (n - c0 - 1) / kGdnChunk * kGdnChunk);
+      if (cap >= n - c0) break;
+    } else if (cap > kGdnChunk && cap < n - c0) {
+      cap = cap / kGdnChunk * kGdnChunk;
+    }
+    const int T = prefill_cut(cap, cap >= n - c0);
     // Decode-path kernels read per-layer state (GDN / conv state, the position) before their PDL wait,
     // which is only safe once the previous chunk has finished (prefill chunks wait on PDL / stream order).
     if (T <= kSkinnyMaxM) Q27_CUDA(cudaStreamSynchronize(s_));

@@ -243,6 +243,11 @@ struct AlphaSegments {
 void skinny_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
                 const AlphaSegments& alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes,
                 cudaStream_t s);
+// Fused NVFP4 gate|up skinny GEMM + silu(alpha_gate * gate) * (alpha_up * up) + NVFP4 block-16 quantize
+// directly into (q_out, sf_out) for mlp down (N = 2 * I, tile-interleaved gate/up layout).
+void skinny_fp4_glu(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
+                    float alpha_gate, float alpha_up, float down_in_scale, uint8_t* q_out, uint8_t* sf_out,
+                    void* ws, size_t ws_bytes, cudaStream_t s);
 void skinny_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* w, const AlphaSegments& alpha, const float* c,
                 float beta, float* d, void* ws, size_t ws_bytes, cudaStream_t s);
 // Draft model weights quantized at load: d[t][n] = acc * wscale[n] * ascale[t] (per-output-channel weight
