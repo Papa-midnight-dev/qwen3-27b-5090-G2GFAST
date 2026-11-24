@@ -1423,7 +1423,7 @@ int Model::prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, 
     // Chunks stop at the planned checkpoints (prefix_begin) and strictly respect `budget`
     // (aligned to kGdnChunk=64 so Sarathi-interleaved prefills stay bit-identical to uncut prefills).
     int rem_budget = budget - c0;
-    if (c0 > 0 && rem_budget < 128) break;  // never run an extra tiny skinny chunk at the end of a budget slice
+    if (keep_tail && c0 > 0 && rem_budget < 128) break;  // never run an extra tiny skinny chunk at the end of a prefill() budget slice
     int cap = std::min({opt_.prefill_chunk, n - c0, rem_budget});
     if (keep_tail && cap == n - c0) {
       // Leave at least 1 token for spec_begin/forward_sample when keep_tail is true
