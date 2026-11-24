@@ -220,6 +220,16 @@ class Scheduler:
             elif msg[0] == "config":
                 self.configure(msg[1])
                 self.send("config", self.settings(), msg[2])
+            elif msg[0] == "prefetch":
+                if not self.alive:
+                    ids_b = msg[1]
+                    ids = array.array("i")
+                    if ids_b:
+                        ids.frombytes(ids_b)
+                    try:
+                        self.engine.prefix_stage(ids, spec=self.spec)
+                    except Exception:
+                        pass
             elif msg[0] == "stop":
                 raise SystemExit(0)
 

@@ -181,6 +181,11 @@ class Draft {
   // built at load; the refinement's candidate senders read it instead of the codebook (PCIe) and a GEMM.
   size_t tsv_off_ = 0;
   bf16* tsv_ = nullptr;
+  // Low-rank DSpine refinement (Q27_DSPINE_LR=1): precomputed W_4^T [512][5120], Gram G = W_4^T W_4 [512][512],
+  // and U_head = (head * norm_w) @ W_4 [n][512] in BF16 (eliminates 5120-dim refinement GEMMs & 16x head dequants).
+  size_t write4_t_off_ = 0, gram4_off_ = 0, u_head_off_ = 0;
+  bf16 *write4_t_ = nullptr, *gram4_ = nullptr, *u_head_ = nullptr;
+  bool dspine_lr_ = true;
   void propose_dspine(const LaneRows& lr, const DraftLanes& lanes, const int32_t* block_ids, const bf16* embed,
                       const uint8_t* lm_w, const uint8_t* lm_sf, float lm_in_scale, float lm_alpha,
                       const SpecSampling* smp, const SelectLanes* sl, const uint64_t* rng, int32_t* ids_out,
@@ -223,6 +228,7 @@ class Draft {
     size_t x, h, hb, coef, act_q, act_sf, act_scale, qkv, q, kb, vb, part, o32, y, gu, ring_k, ring_v, ctx, ctxb, kv,
         hp, cand_v, cand_i, choice_q, choice_path, choice_src, lattice, sel_cnt, src_lanes;
     size_t code, codeb, pk, msg, delta, raw, rms, cand_c, sid, ecode, egv, emsg, refined, rnorm;  // DSpine
+    size_t rawb, raw_norm2, base_dot, raw_proj, g_emsg;                                           // DSpine low-rank
   } off_{};
   int max_ctx_rows_;
   int lanes_ = 1;
@@ -238,7 +244,8 @@ class Draft {
   // messages, refined: the rewritten rows).
   float *code_ = nullptr, *pk_ = nullptr, *delta_ = nullptr, *raw_ = nullptr, *rms_ = nullptr;
   float *egv_ = nullptr, *refined_ = nullptr;
-  bf16 *codeb_ = nullptr, *msg_ = nullptr, *ecode_ = nullptr, *emsg_ = nullptr;
+  float *raw_norm2_ = nullptr, *base_dot_ = nullptr, *raw_proj_ = nullptr, *g_emsg_ = nullptr;
+  bf16 *codeb_ = nullptr, *msg_ = nullptr, *ecode_ = nullptr, *emsg_ = nullptr, *rawb_ = nullptr;
   int32_t *cand_c_ = nullptr, *sid_ = nullptr;
   void* act_q_ = nullptr;
   uint8_t* act_sf_ = nullptr;
@@ -321,6 +328,15 @@ void dspine_emsg(const LaneRows& lr, bool lanes, const float* egv, const float* 
 void dspine_table(const LaneRows& lr, bool lanes, const float* raw, const float* rms, const float* delta,
                   const bf16* norm_w, const int32_t* cand_c, const uint8_t* head_w, const uint8_t* head_sf,
                   float wscale, float* lattice, cudaStream_t s);
+void dspine_transpose_bf16(const bf16* src, int rows, int cols, bf16* dst, cudaStream_t s);
+void dspine_dequant_head_norm(const uint8_t* head_w, const uint8_t* head_sf, const bf16* norm_w, int row0, int n,
+                              bf16* out, cudaStream_t s);
+void dspine_base(const LaneRows& lr, bool lanes, const float* raw, const bf16* norm_w, const int32_t* cand_c,
+                 const uint8_t* head_w, const uint8_t* head_sf, bf16* rawb, float* raw_norm2, float* base_dot,
+                 cudaStream_t s);
+void dspine_table_lr(const LaneRows& lr, bool lanes, const float* rms, const float* raw_norm2, const float* raw_proj,
+                     const float* base_dot, const bf16* emsg, const float* g_emsg, const int32_t* cand_c,
+                     const bf16* u_head, float wscale, float* lattice, cudaStream_t s);
 // The walk over the table (the selector's, see draft_select): one block of nd positions (sl null) or the lanes of
 // sl->lr.
 void dspine_select(int nd, const SelectLanes* sl, const SpecSampling& smp, const int32_t* cand_i,

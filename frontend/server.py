@@ -467,6 +467,18 @@ class EngineClient:
         HUB.submitted(rid)
         return rid, q
 
+    def prefetch(self, ids):
+        """Fire-and-forget async H2D pre-stage of a prefix checkpoint (0 ms compute stall)."""
+        if not self.ready.is_set():
+            return False
+        ids_b = array.array("i", ids).tobytes() if ids else b""
+        try:
+            with self.send_lock:
+                self.conn.send(("prefetch", ids_b))
+            return True
+        except OSError:
+            return False
+
     def configure(self, changes):
         """Changes the admission settings (kept for a restarted engine); returns the worker's settings."""
         if not self.ready.is_set():
@@ -1258,6 +1270,7 @@ class Handler(BaseHTTPRequestHandler):
                 log(f"API_DUMP_DIR: {e}")
         routes = {"/v1/chat/completions": self.chat, "/v1/completions": self.completions, "/v1/responses": self.responses_api,
                   "/v1/messages": self.messages, "/v1/messages/count_tokens": self.count_tokens,
+                  "/v1/prefetch": self.prefetch_api,
                   "/tokenize": self.tokenize, "/detokenize": self.detokenize, "/admin/concurrency": self.concurrency,
                   "/admin/engine": self.engine_control, "/admin/engine/plan": self.engine_plan,
                   "/admin/engine/idle": self.engine_idle}
@@ -1286,6 +1299,22 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(500, f"{type(e).__name__}: {e}", "api_error")
             except OSError:
                 pass
+
+    # ------------------------------------------------------------ Prefix prefetch
+
+    def prefetch_api(self, body):
+        """Async H2D pre-stage of a prefix checkpoint while the user is still speaking or typing.
+        Accepts {"messages": [...], "tools": [...]}, {"prompt_ids": [...]}, or {} (most recent checkpoint)."""
+        ids = []
+        if body.get("prompt_ids"):
+            ids = [int(x) for x in body["prompt_ids"]]
+        elif body.get("messages"):
+            kwargs = template_kwargs(body, self.srv.thinking_default)
+            tools = body.get("tools") or None
+            messages = normalize_messages(body.get("messages"))
+            ids, _ = self.srv.render(messages, tools, kwargs, body.get("mm_processor_kwargs"))
+        ok = self.srv.engine.prefetch(ids)
+        self._json(200, {"status": "staged" if ok else "not_ready", "tokens": len(ids)})
 
     # ------------------------------------------------------------ OpenAI chat completions
 

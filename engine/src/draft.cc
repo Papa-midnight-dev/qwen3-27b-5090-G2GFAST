@@ -165,7 +165,16 @@ Draft::Draft(const std::string& dir, Pool& weights, Pool& act, Pool& host, int m
     vocab_w_off_ = wpool_.add("draft vocabulary head", size_t(n) * kHidden / 2);
     vocab_sf_off_ = wpool_.add("draft vocabulary head scales", size_t(sf_bytes(n, kHidden / 16)));
     log("draft vocabulary: %d ids (%s)", n, vf.c_str());
-    if (dspine()) tsv_off_ = wpool_.add("draft sender table", size_t(n) * 2 * kBridgeRank * 2);
+    if (dspine()) {
+      tsv_off_ = wpool_.add("draft sender table", size_t(n) * 2 * kBridgeRank * 2);
+      const char* lr_e = getenv("Q27_DSPINE_LR");
+      dspine_lr_ = !lr_e || !*lr_e || atoi(lr_e) != 0;
+      if (dspine_lr_) {
+        write4_t_off_ = wpool_.add("draft write4 transpose", size_t(kBridgeRank) * kHidden * 2);
+        gram4_off_ = wpool_.add("draft write4 gram", size_t(kBridgeRank) * kBridgeRank * 2);
+        u_head_off_ = wpool_.add("draft low-rank head", size_t(n) * kBridgeRank * 2);
+      }
+    }
   }
 
   const int R = max_ctx_rows_;
@@ -224,6 +233,11 @@ Draft::Draft(const std::string& dir, Pool& weights, Pool& act, Pool& host, int m
     off_.egv = f32("refinement gates", int64_t(E) * 2 * kBridgeRank);
     off_.emsg = b16("refinement messages", int64_t(E) * kBridgeRank);
     off_.refined = f32("refinement writes", int64_t(E) * kHidden);
+    off_.rawb = b16("lr raw bf16", int64_t(NP) * kHidden);
+    off_.raw_norm2 = f32("lr raw norm2", NP);
+    off_.base_dot = f32("lr base dot", int64_t(NP) * kSelK);
+    off_.raw_proj = f32("lr raw proj", int64_t(NP) * kBridgeRank);
+    off_.g_emsg = f32("lr g emsg", int64_t(E) * kBridgeRank);
   }
 }
 
@@ -252,8 +266,20 @@ void Draft::bind() {
     rms_ = apool_.at<float>(off_.rms), cand_c_ = apool_.at<int32_t>(off_.cand_c), sid_ = apool_.at<int32_t>(off_.sid);
     ecode_ = apool_.at<bf16>(off_.ecode), egv_ = apool_.at<float>(off_.egv), emsg_ = apool_.at<bf16>(off_.emsg);
     refined_ = apool_.at<float>(off_.refined);
+    rawb_ = apool_.at<bf16>(off_.rawb);
+    raw_norm2_ = apool_.at<float>(off_.raw_norm2);
+    base_dot_ = apool_.at<float>(off_.base_dot);
+    raw_proj_ = apool_.at<float>(off_.raw_proj);
+    g_emsg_ = apool_.at<float>(off_.g_emsg);
     codebook_ = hpool_.at<bf16>(codebook_off_);
-    if (!vocab_.empty()) tsv_ = wpool_.at<bf16>(tsv_off_);
+    if (!vocab_.empty()) {
+      tsv_ = wpool_.at<bf16>(tsv_off_);
+      if (dspine_lr_) {
+        write4_t_ = wpool_.at<bf16>(write4_t_off_);
+        gram4_ = wpool_.at<bf16>(gram4_off_);
+        u_head_ = wpool_.at<bf16>(u_head_off_);
+      }
+    }
   }
   lattice_ = apool_.at<float>(off_.lattice);
   choice.cand = cand_i_;
@@ -352,6 +378,30 @@ void Draft::build_vocab_head(const uint8_t* lm_w, const uint8_t* lm_sf, cudaStre
   Q27_CUDA(cudaFree(codes));
   Q27_CUDA(cudaFree(gv));
   (void)gv16;
+  if (u_head_) {
+    // Low-rank DSpine refinement tables: W_4^T [512][5120], G = W_4^T W_4 [512][512], and U_head = (head*norm) @ W_4.
+    const bf16* ww = write_w_ + size_t(kLayers - 1) * kHidden * kBridgeRank;
+    dspine_transpose_bf16(ww, kHidden, kBridgeRank, write4_t_, s);
+    float* gram_f32 = nullptr;
+    Q27_CUDA(cudaMalloc(&gram_f32, size_t(kBridgeRank) * kBridgeRank * 4));
+    gemm_bf16(kBridgeRank, kBridgeRank, kHidden, write4_t_, write4_t_, 1.f, nullptr, 0.f, gram_f32, s);
+    draft_round_bf16(gram_f32, int64_t(kBridgeRank) * kBridgeRank, gram4_, s);
+    constexpr int kHRows = 4096;
+    bf16* h_tmp = nullptr;
+    float* u_tmp = nullptr;
+    Q27_CUDA(cudaMalloc(&h_tmp, size_t(kHRows) * kHidden * 2));
+    Q27_CUDA(cudaMalloc(&u_tmp, size_t(kHRows) * kBridgeRank * 4));
+    for (int c = 0; c < n; c += kHRows) {
+      const int m = std::min(kHRows, n - c);
+      dspine_dequant_head_norm(vocab_w_, vocab_sf_, norm_, c, m, h_tmp, s);
+      gemm_bf16(m, kBridgeRank, kHidden, h_tmp, write4_t_, 1.f, nullptr, 0.f, u_tmp, s);
+      draft_round_bf16(u_tmp, int64_t(m) * kBridgeRank, u_head_ + size_t(c) * kBridgeRank, s);
+    }
+    Q27_CUDA(cudaStreamSynchronize(s));
+    Q27_CUDA(cudaFree(gram_f32));
+    Q27_CUDA(cudaFree(h_tmp));
+    Q27_CUDA(cudaFree(u_tmp));
+  }
 }
 
 void Draft::reset(cudaStream_t s) {
@@ -640,11 +690,20 @@ void Draft::propose_dspine(const LaneRows& lr, const DraftLanes& lanes, const in
                   egv_ + size_t(c) * 2 * kBridgeRank, ws, ws_bytes, s);
   }
   dspine_emsg(lr, batched, egv_, pk_, gate_b_, emsg_, s, tsv_, cand_c_);
-  const bf16* ww = write_w_ + size_t(kLayers - 1) * kHidden * kBridgeRank;
-  for (int c = 0; c < E; c += kChunk)
-    skinny_bf16(std::min(kChunk, E - c), kHidden, kBridgeRank, emsg_ + size_t(c) * kBridgeRank, ww, 1.f, nullptr, 0.f,
-                refined_ + size_t(c) * kHidden, ws, ws_bytes, s);
-  dspine_table(lr, batched, raw_, rms_, refined_, norm_, cand_c_, hw, hsf, lm_alpha / lm_in_scale, lattice_, s);
+  if (u_head_ && dspine_lr_) {
+    const int P = R - nb;
+    dspine_base(lr, batched, raw_, norm_, cand_c_, hw, hsf, rawb_, raw_norm2_, base_dot_, s);
+    skinny_bf16(P, kBridgeRank, kHidden, rawb_, write4_t_, 1.f, nullptr, 0.f, raw_proj_, ws, ws_bytes, s);
+    gemm_bf16(E, kBridgeRank, kBridgeRank, emsg_, gram4_, 1.f, nullptr, 0.f, g_emsg_, s);
+    dspine_table_lr(lr, batched, rms_, raw_norm2_, raw_proj_, base_dot_, emsg_, g_emsg_, cand_c_, u_head_,
+                    lm_alpha / lm_in_scale, lattice_, s);
+  } else {
+    const bf16* ww = write_w_ + size_t(kLayers - 1) * kHidden * kBridgeRank;
+    for (int c = 0; c < E; c += kChunk)
+      skinny_bf16(std::min(kChunk, E - c), kHidden, kBridgeRank, emsg_ + size_t(c) * kBridgeRank, ww, 1.f, nullptr, 0.f,
+                  refined_ + size_t(c) * kHidden, ws, ws_bytes, s);
+    dspine_table(lr, batched, raw_, rms_, refined_, norm_, cand_c_, hw, hsf, lm_alpha / lm_in_scale, lattice_, s);
+  }
   DraftChoice ch = choice;
   ch.tree = trees;
   if (batched) ch.src = src_lanes_;

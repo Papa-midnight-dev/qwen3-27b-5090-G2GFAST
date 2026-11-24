@@ -155,6 +155,9 @@ class Model {
   // prefill chunk is left, stopping after at least `budget` tokens, and returns the tokens run. The rest
   // then goes to forward_sample / spec_begin with the same chunk cuts as one call over all of it.
   // spec: the caller continues with spec_begin (the draft's context is filled the same way).
+  // Async H2D pre-stage of a cached checkpoint into GPU stage_ on cs_ (0 ms compute stall).
+  // When n == 0, stages the most recently used checkpoint (ideal for voice key-down warmup).
+  int prefix_stage(const int32_t* ids, int n, bool spec = true);
   int prefill(const int32_t* ids, int n, int budget, bool spec);
 
   // Several sequences (Phase 6). The running sequence (its GDN / conv state, the draft's context ring,
@@ -331,6 +334,7 @@ class Model {
   std::vector<bool> slot_used_;
   char* stage_ = nullptr;            // device copy of one checkpoint on its way to the host
   int stage_slot_ = -1;              // checkpoint slot currently mirrored in stage_ (0-PCIe GPU hot hit)
+  bool stage_h2d_ = false;           // true when stage_ was filled by async H2D prefetch on cs_
   cudaEvent_t stage_ev_ = nullptr, stage_in_ev_ = nullptr;  // staging free again / filled
   cudaStream_t cs_ = nullptr;        // device -> host copies of checkpoints
   std::vector<int32_t> plan_;        // checkpoint positions of the running prefill (ascending)

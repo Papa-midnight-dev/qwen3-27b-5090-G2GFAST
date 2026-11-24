@@ -400,8 +400,8 @@ void Model::configure() {
   adapt_on_ = draft_ && draft_->block() > ddims::kBlock && env_int("Q27_SPEC_ADAPT", 1) != 0;
   adapt_low_ = draft_ ? std::clamp(env_int("Q27_SPEC_ADAPT_LOW", ddims::kBlock), 2, draft_->block()) : ddims::kBlock;
   adapt_paths_ = std::clamp(env_int("Q27_SPEC_ADAPT_PATHS", 2), 1, kTreePaths);
-  adapt_up_ = env_f("Q27_SPEC_ADAPT_UP", 4.5f);
-  adapt_down_ = env_f("Q27_SPEC_ADAPT_DOWN", 4.0f);
+  adapt_up_ = env_f("Q27_SPEC_ADAPT_UP", 6.5f);
+  adapt_down_ = env_f("Q27_SPEC_ADAPT_DOWN", 5.5f);
   adapt_alpha_ = std::clamp(env_f("Q27_SPEC_ADAPT_ALPHA", 0.125f), 0.f, 1.f);
   batch_adapt_ = adapt_on_ && env_int("Q27_SPEC_ADAPT_BATCH", 1) != 0;
   batch_hyst_ = std::max(0.f, env_f("Q27_SPEC_ADAPT_HYST", 0.01f));
@@ -647,8 +647,33 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
   Q27_CUDA(cudaMemcpyAsync(slot_mem_[slot], stage_, ckpt_bytes_, cudaMemcpyDeviceToHost, cs_));
   Q27_CUDA(cudaEventRecord(stage_ev_, cs_));
   stage_slot_ = slot;
+  stage_h2d_ = false;
   ckpts_.push_back(std::move(ck));
   cstats_.saved++;
+}
+
+int Model::prefix_stage(const int32_t* ids, int n, bool spec) {
+  if (!cache_on_ || ckpts_.empty()) return 0;
+  const Checkpoint* best = nullptr;
+  if (n > 0 && ids) {
+    for (auto& c : ckpts_)
+      if (c.pos() <= n && (!spec || c.ring) && (!best || c.pos() > best->pos()) &&
+          std::equal(c.ids.begin(), c.ids.end(), ids))
+        best = &c;
+  } else {
+    // Empty prompt: stage the most recently used checkpoint (e.g. voice key-down warmup).
+    for (auto& c : ckpts_)
+      if ((!spec || c.ring) && (!best || c.last_use > best->last_use)) best = &c;
+  }
+  if (!best) return 0;
+  if (stage_slot_ == best->slot) return best->pos();
+  Q27_CUDA(cudaEventRecord(stage_in_ev_, s_));
+  Q27_CUDA(cudaStreamWaitEvent(cs_, stage_in_ev_));
+  Q27_CUDA(cudaMemcpyAsync(stage_, slot_mem_[best->slot], ckpt_bytes_, cudaMemcpyHostToDevice, cs_));
+  Q27_CUDA(cudaEventRecord(stage_ev_, cs_));
+  stage_slot_ = best->slot;
+  stage_h2d_ = true;
+  return best->pos();
 }
 
 int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, bool spec) {
@@ -670,6 +695,11 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
     const bool gpu_hit = (stage_slot_ == best->slot);
     if (gpu_hit) {
       // Zero-PCIe GPU hot hit: restore directly from device staging buffer (0.13 ms D2D vs 7.2 ms PCIe H2D).
+      // Only wait on stage_ev_ if stage_ was filled by async H2D prefetch on cs_ (not D2H read by save_checkpoint).
+      if (stage_h2d_) {
+        Q27_CUDA(cudaStreamWaitEvent(s_, stage_ev_));
+        stage_h2d_ = false;
+      }
       const char* src = stage_;
       Q27_CUDA(cudaMemcpyAsync(ssm_, src, ssm_bytes_, cudaMemcpyDeviceToDevice, s_));
       Q27_CUDA(cudaMemcpyAsync(conv_, src + ssm_bytes_, conv_bytes_, cudaMemcpyDeviceToDevice, s_));

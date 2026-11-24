@@ -1247,6 +1247,156 @@ __global__ void round_bf16_kernel(const float* x, int64_t n, bf16* out) {
   const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i < n) out[i] = __float2bfloat16(x[i]);
 }
+
+__global__ void dspine_transpose_bf16_kernel(const bf16* src, int rows, int cols, bf16* dst) {
+  const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= int64_t(rows) * cols) return;
+  const int r = int(i / cols), c = int(i % cols);
+  dst[int64_t(c) * rows + r] = src[i];
+}
+
+__global__ void __launch_bounds__(kNormThreads) dspine_dequant_head_norm_kernel(const uint8_t* head_w,
+                                                                                const uint8_t* head_sf,
+                                                                                const bf16* norm_w, int row0,
+                                                                                bf16* out) {
+  const int i = blockIdx.x, g = threadIdx.x;
+  const int64_t row = int64_t(row0) + i;
+  constexpr int kGroups16 = kHidden / 16;
+  const uint2 q = *reinterpret_cast<const uint2*>(head_w + row * (kHidden / 2) + g * 8);
+  const float sff = float(__half(__nv_cvt_fp8_to_halfraw(head_sf[sf_offset(row, g, kGroups16)], __NV_E4M3)));
+  float wv[16];
+  load16(norm_w + g * 16, wv);
+  const uint8_t* qb = reinterpret_cast<const uint8_t*>(&q);
+  uint32_t pk[8];
+#pragma unroll
+  for (int j = 0; j < 8; j++) {
+    const float a = e2m1_value(qb[j] & 15) * sff * wv[2 * j];
+    const float b = e2m1_value(qb[j] >> 4) * sff * wv[2 * j + 1];
+    pk[j] = pack_bf16x2(a, b);
+  }
+  uint4* dst = reinterpret_cast<uint4*>(out + int64_t(i) * kHidden + g * 16);
+  dst[0] = make_uint4(pk[0], pk[1], pk[2], pk[3]);
+  dst[1] = make_uint4(pk[4], pk[5], pk[6], pk[7]);
+}
+
+// Low-rank DSpine refinement (1/2): once per drafted position p = (z, e), packs raw[br] to BF16,
+// computes ||raw[br]||^2, and computes base_dot[p, b] = <raw[br] * norm_w, head_w[cand_c[p, b]]>
+// (reads each candidate's NVFP4 head row once instead of 16 times across senders).
+__global__ void __launch_bounds__(kNormThreads) dspine_base_kernel(DsGeo geo, const float* raw, const bf16* norm_w,
+                                                                   const int32_t* cand_c, const uint8_t* head_w,
+                                                                   const uint8_t* head_sf, bf16* rawb,
+                                                                   float* raw_norm2, float* base_dot) {
+  pdl_trigger();
+  pdl_wait();
+  const int p = blockIdx.x, g = threadIdx.x, warp = g / 32, lane = g % 32;
+  const int z = geo.lr.lane_of_pos(p), e = p - geo.lr.pos0(z);
+  const int br = geo.brow(z, e);
+  float v[16], wv[16];
+  load16(raw + int64_t(br) * kHidden + g * 16, v);
+  load16(norm_w + g * 16, wv);
+  uint32_t pk[8];
+  float ss = 0.f;
+#pragma unroll
+  for (int j = 0; j < 8; j++) {
+    const float a = v[2 * j], b = v[2 * j + 1];
+    ss += a * a + b * b;
+    pk[j] = pack_bf16x2(a, b);
+  }
+  uint4* dst = reinterpret_cast<uint4*>(rawb + int64_t(p) * kHidden + g * 16);
+  dst[0] = make_uint4(pk[0], pk[1], pk[2], pk[3]);
+  dst[1] = make_uint4(pk[4], pk[5], pk[6], pk[7]);
+  const float tot_ss = block_sum(ss);
+  if (g == 0) raw_norm2[p] = tot_ss;
+#pragma unroll
+  for (int j = 0; j < 16; j++) v[j] *= wv[j];
+  constexpr int kGroups16 = kHidden / 16;
+  float dot[kSelK];
+  const int32_t* cc = cand_c + geo.crow(z, e) * kSelK;
+#pragma unroll
+  for (int b = 0; b < kSelK; b++) {
+    const int64_t row = cc[b];
+    const uint2 q = *reinterpret_cast<const uint2*>(head_w + row * (kHidden / 2) + g * 8);
+    const float sff = float(__half(__nv_cvt_fp8_to_halfraw(head_sf[sf_offset(row, g, kGroups16)], __NV_E4M3)));
+    const uint8_t* qb = reinterpret_cast<const uint8_t*>(&q);
+    float acc = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; j++) acc += v[2 * j] * e2m1_value(qb[j] & 15) + v[2 * j + 1] * e2m1_value(qb[j] >> 4);
+    dot[b] = acc * sff;
+  }
+#pragma unroll
+  for (int b = 0; b < kSelK; b++)
+    for (int o = 16; o > 0; o >>= 1) dot[b] += __shfl_xor_sync(0xffffffffu, dot[b], o);
+  __shared__ float red[kNormThreads / 32][kSelK];
+  if (lane == 0)
+#pragma unroll
+    for (int b = 0; b < kSelK; b++) red[warp][b] = dot[b];
+  __syncthreads();
+  if (g < kSelK) {
+    float acc = 0.f;
+    for (int w = 0; w < kNormThreads / 32; w++) acc += red[w][g];
+    base_dot[int64_t(p) * kSelK + g] = acc;
+  }
+}
+
+// Low-rank DSpine refinement (2/2): exact 512-dim algebraic table evaluation using precomputed
+// Gram G = W_4^T W_4 (via g_emsg = emsg @ G) and U_head = (head * norm_w) @ W_4.
+// Block per (z, e, a), 128 threads (4 channels/thread over kBridgeRank=512).
+__global__ void __launch_bounds__(128) dspine_table_lr_kernel(DsGeo geo, const float* rms, const float* raw_norm2,
+                                                              const float* raw_proj, const float* base_dot,
+                                                              const bf16* emsg, const float* g_emsg,
+                                                              const int32_t* cand_c, const bf16* u_head, float wscale,
+                                                              float* lattice) {
+  pdl_trigger();
+  pdl_wait();
+  const int m = blockIdx.x, t = threadIdx.x, warp = t / 32, lane = t % 32;
+  const int p = m / kSelK;
+  int z, e, a;
+  geo.at(m, z, e, a);
+  const int br = geo.brow(z, e);
+  const float rr = rms[br];
+  const uint2 eraw = *reinterpret_cast<const uint2*>(emsg + int64_t(m) * kBridgeRank + t * 4);
+  const __nv_bfloat162* eh = reinterpret_cast<const __nv_bfloat162*>(&eraw);
+  const float2 ef0 = __bfloat1622float2(eh[0]), ef1 = __bfloat1622float2(eh[1]);
+  const float4 rp = *reinterpret_cast<const float4*>(raw_proj + int64_t(p) * kBridgeRank + t * 4);
+  const float4 ge = *reinterpret_cast<const float4*>(g_emsg + int64_t(m) * kBridgeRank + t * 4);
+  float dr = ef0.x * rp.x + ef0.y * rp.y + ef1.x * rp.z + ef1.y * rp.w;
+  float dg = ef0.x * ge.x + ef0.y * ge.y + ef1.x * ge.z + ef1.y * ge.w;
+  for (int o = 16; o > 0; o >>= 1) {
+    dr += __shfl_xor_sync(0xffffffffu, dr, o);
+    dg += __shfl_xor_sync(0xffffffffu, dg, o);
+  }
+  __shared__ float red_n[4][2];
+  __shared__ float s_rn;
+  if (lane == 0) red_n[warp][0] = dr, red_n[warp][1] = dg;
+  __syncthreads();
+  if (t == 0) {
+    const float tdr = red_n[0][0] + red_n[1][0] + red_n[2][0] + red_n[3][0];
+    const float tdg = red_n[0][1] + red_n[1][1] + red_n[2][1] + red_n[3][1];
+    const float ss = fmaxf(raw_norm2[p] + 2.f * rr * tdr + rr * rr * tdg, 0.f);
+    s_rn = rsqrtf(ss / kHidden + kEps);
+  }
+  const int32_t* cc = cand_c + geo.crow(z, e) * kSelK;
+  float dot[kSelK];
+#pragma unroll
+  for (int b = 0; b < kSelK; b++) {
+    const uint2 uraw = *reinterpret_cast<const uint2*>(u_head + int64_t(cc[b]) * kBridgeRank + t * 4);
+    const __nv_bfloat162* uh = reinterpret_cast<const __nv_bfloat162*>(&uraw);
+    const float2 uf0 = __bfloat1622float2(uh[0]), uf1 = __bfloat1622float2(uh[1]);
+    dot[b] = ef0.x * uf0.x + ef0.y * uf0.y + ef1.x * uf1.x + ef1.y * uf1.y;
+  }
+#pragma unroll
+  for (int b = 0; b < kSelK; b++)
+    for (int o = 16; o > 0; o >>= 1) dot[b] += __shfl_xor_sync(0xffffffffu, dot[b], o);
+  __shared__ float red[4][kSelK];
+  if (lane == 0)
+#pragma unroll
+    for (int b = 0; b < kSelK; b++) red[warp][b] = dot[b];
+  __syncthreads();
+  if (t < kSelK) {
+    const float acc = red[0][t] + red[1][t] + red[2][t] + red[3][t];
+    lattice[int64_t(m) * kSelK + t] = wscale * s_rn * (base_dot[int64_t(p) * kSelK + t] + rr * acc);
+  }
+}
 }  // namespace
 
 void draft_norm(const float* x, const bf16* w, int T, float* out, ActOut ao, bf16* hb, cudaStream_t s) {
@@ -1455,6 +1605,36 @@ void dspine_table(const LaneRows& lr, bool lanes, const float* raw, const float*
   const DsGeo geo{lr, lanes};
   launch_pdl(dspine_table_kernel, dim3((lr.total() - lr.n) * kSelK), dim3(kNormThreads), 0, s, geo, raw, rms, delta, norm_w,
              cand_c, head_w, head_sf, wscale, lattice);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void dspine_transpose_bf16(const bf16* src, int rows, int cols, bf16* dst, cudaStream_t s) {
+  const int64_t n = int64_t(rows) * cols;
+  dspine_transpose_bf16_kernel<<<unsigned((n + 255) / 256), 256, 0, s>>>(src, rows, cols, dst);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void dspine_dequant_head_norm(const uint8_t* head_w, const uint8_t* head_sf, const bf16* norm_w, int row0, int n,
+                              bf16* out, cudaStream_t s) {
+  dspine_dequant_head_norm_kernel<<<dim3(n), dim3(kNormThreads), 0, s>>>(head_w, head_sf, norm_w, row0, out);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void dspine_base(const LaneRows& lr, bool lanes, const float* raw, const bf16* norm_w, const int32_t* cand_c,
+                 const uint8_t* head_w, const uint8_t* head_sf, bf16* rawb, float* raw_norm2, float* base_dot,
+                 cudaStream_t s) {
+  const DsGeo geo{lr, lanes};
+  launch_pdl(dspine_base_kernel, dim3(lr.total() - lr.n), dim3(kNormThreads), 0, s, geo, raw, norm_w, cand_c, head_w,
+             head_sf, rawb, raw_norm2, base_dot);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void dspine_table_lr(const LaneRows& lr, bool lanes, const float* rms, const float* raw_norm2, const float* raw_proj,
+                     const float* base_dot, const bf16* emsg, const float* g_emsg, const int32_t* cand_c,
+                     const bf16* u_head, float wscale, float* lattice, cudaStream_t s) {
+  const DsGeo geo{lr, lanes};
+  launch_pdl(dspine_table_lr_kernel, dim3((lr.total() - lr.n) * kSelK), dim3(128), 0, s, geo, rms, raw_norm2, raw_proj,
+             base_dot, emsg, g_emsg, cand_c, u_head, wscale, lattice);
   Q27_CUDA(cudaGetLastError());
 }
 

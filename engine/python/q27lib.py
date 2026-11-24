@@ -42,6 +42,7 @@ SIGNATURES = {
     "q27_spec_step_lanes": ([P, P, I, P, P], I),
     "q27_spec_stats": ([P, P], I),
     "q27_prefix_begin": ([P, P, I, P, I, I, P], I),
+    "q27_prefix_stage": ([P, P, I, I, P], I),
     "q27_checkpoint": ([P], I),
     "q27_cache_stats": ([P, P], I),
     "q27_cache_grow": ([P, I, P], I),
@@ -426,6 +427,18 @@ class Engine:
         out = ctypes.c_int()
         self._check(lib().q27_prefix_begin(self.h, src.buffer_info()[0], len(ids), pts.buffer_info()[0], len(at),
                                            int(spec), ctypes.byref(out)), "q27_prefix_begin")
+        return out.value
+
+    def prefix_stage(self, ids=(), spec=True):
+        """Async H2D pre-stage of a cached prefix checkpoint into GPU staging memory (0 compute stall).
+        Pass empty ids to stage the most recently used checkpoint."""
+        out = ctypes.c_int()
+        if ids:
+            src = self._i32(ids)
+            ptr, n = src.buffer_info()[0], len(ids)
+        else:
+            ptr, n = 0, 0
+        self._check(lib().q27_prefix_stage(self.h, ptr, n, int(spec), ctypes.byref(out)), "q27_prefix_stage")
         return out.value
 
     def checkpoint(self):

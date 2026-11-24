@@ -350,6 +350,10 @@ int q27_prefix_begin(void* m, const int32_t* ids, int n, const int32_t* at, int 
   return guard([&] { *cached = static_cast<Model*>(m)->prefix_begin(ids, n, at, nat, spec != 0); });
 }
 
+int q27_prefix_stage(void* m, const int32_t* ids, int n, int spec, int* staged) {
+  return guard([&] { *staged = static_cast<Model*>(m)->prefix_stage(ids, n, spec != 0); });
+}
+
 int q27_checkpoint(void* m) {
   return guard([&] { static_cast<Model*>(m)->checkpoint(); });
 }
