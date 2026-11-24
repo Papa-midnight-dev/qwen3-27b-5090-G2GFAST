@@ -1,0 +1,18 @@
+[Unit]
+Description=RTX 5090 True NVML Undervolt & 450W Longevity Profile
+Before=q27-engine.service
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=UV_WATTS=450
+Environment=UV_CORE_OFFSET=180
+Environment=UV_MAX_CLOCK=2750
+Environment=UV_MEM_OFFSET=1000
+EnvironmentFile=-/etc/rtx5090-undervolt.env
+ExecStart=/usr/bin/python3 /usr/local/bin/rtx5090-undervolt.py --apply --watts ${UV_WATTS} --core-offset ${UV_CORE_OFFSET} --max-clock ${UV_MAX_CLOCK} --mem-offset ${UV_MEM_OFFSET}
+ExecStop=/usr/bin/python3 /usr/local/bin/rtx5090-undervolt.py --reset
+
+[Install]
+WantedBy=multi-user.target

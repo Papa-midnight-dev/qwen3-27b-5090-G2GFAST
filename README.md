@@ -1,4 +1,16 @@
-# Qwen3.8-27B on one RTX 5090
+# Qwen3.8-27B on one RTX 5090 *(Moonshot Community Fork)*
+
+> **Attribution:** This is a community optimization fork of Masahiro Kiyota's [**`mkyt/qwen3-27b-5090`**](https://github.com/mkyt/qwen3-27b-5090) (MIT License). All core engine architecture and original work belong to Masahiro Kiyota.
+>
+> **What's new in this fork** (see [`docs/moonshot-fork.md`](docs/moonshot-fork.md) for full details & benchmarks):
+> - Fused SM120 NVFP4 epilogues (`skinny_fp4_glu`, `gdn_rec`, `gated_norm`, `attention_combine`)
+> - Sarathi chunked-prefill interleaving (`PREFILL_DECODE_CHUNK=512`, **11.6x lower** C=4 32K tail ITL: `652 ms -> 56 ms`)
+> - CUDA 13.4 Graph conditional prompt-lookup (`Q27_LOOKUP=1`) + adaptive 2-path DSpine trees on FP8 Tensor Cores (`attention_tc8_kernel` ancestor bitmask)
+> - Low-rank DSpine refinement (precomputed Gram $G = W_4^T W_4$ + $U_{\text{head}}$, 16x less NVFP4 head traffic)
+> - Zero-PCIe GPU prefix cache + async `POST /v1/prefetch` (`7.24 ms -> 0.23 ms`) + zero-lag UDS/HTTP/1.1 serving stack
+> - Standalone Linux tools in [`tools/`](tools/): [`rtx5090-undervolt.py`](tools/rtx5090-undervolt.py) (true NVML V/F curve undervolt) & [`q27-fwd.c`](tools/q27-fwd.c) (`--network none` UDS forwarder)
+
+---
 
 A single-purpose inference engine for [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) on one NVIDIA RTX 5090
 (32 GB, SM120), written from scratch in C++ / CUDA with a small Python server in front. It serves OpenAI- and
