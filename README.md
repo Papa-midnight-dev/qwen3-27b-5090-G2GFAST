@@ -2,12 +2,12 @@
 
 > **Attribution:** This is a community optimization fork of Masahiro Kiyota's [**`mkyt/qwen3-27b-5090`**](https://github.com/mkyt/qwen3-27b-5090) (MIT License). All core engine architecture and original work belong to Masahiro Kiyota.
 >
-> **What's new in this fork** (see [`docs/moonshot-fork.md`](docs/moonshot-fork.md) for full details & benchmarks):
+> **What's new in this fork** (see [`docs/moonshot-fork.md`](docs/moonshot-fork.md) for full details & upstream-base benchmarks):
 > - Fused SM120 NVFP4 epilogues (`skinny_fp4_glu`, `gdn_rec`, `gated_norm`, `attention_combine`)
-> - Sarathi chunked-prefill interleaving (`PREFILL_DECODE_CHUNK=512`, **11.6x lower** C=4 32K tail ITL: `652 ms -> 56 ms`)
+> - Sarathi chunked-prefill interleaving (`PREFILL_DECODE_CHUNK=512`, **9.7x lower** C=4 32K worst-case ITL stall vs upstream `0.5.0`: `545 ms -> 56 ms`, mean stream `+85%`)
 > - CUDA 13.4 Graph conditional prompt-lookup (`Q27_LOOKUP=1`) + adaptive 2-path DSpine trees on FP8 Tensor Cores (`attention_tc8_kernel` ancestor bitmask)
-> - Low-rank DSpine refinement (precomputed Gram $G = W_4^T W_4$ + $U_{\text{head}}$, 16x less NVFP4 head traffic)
-> - Zero-PCIe GPU prefix cache + async `POST /v1/prefetch` (`7.24 ms -> 0.23 ms`) + zero-lag UDS/HTTP/1.1 serving stack
+> - Low-rank DSpine refinement (precomputed Gram $G = W_4^T W_4$ + $U_{\text{head}}$, 16x less NVFP4 head traffic; C=8 engine `1,646 -> 1,710 tok/s`)
+> - Zero-PCIe GPU prefix cache + async `POST /v1/prefetch` (`7.21 ms -> 0.23 ms`) + zero-lag UDS/HTTP/1.1 serving stack (warm 60K TTFT `92.9 ms -> 25.1 ms`, HTTP keep-alive `41.0 ms -> 0.13 ms`)
 > - Standalone Linux tools in [`tools/`](tools/): [`rtx5090-undervolt.py`](tools/rtx5090-undervolt.py) (true NVML V/F curve undervolt) & [`q27-fwd.c`](tools/q27-fwd.c) (`--network none` UDS forwarder)
 
 ---
