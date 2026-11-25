@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""True NVML Undervolt & Longevity Controller for NVIDIA RTX 5090 (Blackwell) on Linux.
+"""NVML power-limit and V/F-curve controller for NVIDIA RTX 5090 (Blackwell) on Linux.
 
-How true undervolting works on Linux without MSI Afterburner:
-  1. Shift the P0 Graphics V/F curve UPWARD (+core_offset MHz via nvmlDeviceSetClockOffsets).
-     Every frequency point now requires LESS voltage (typically -70 to -120 mV).
-  2. Cap the top of the boost curve (--max-clock, e.g. 2750 MHz via nvmlDeviceSetGpuLockedClocks
-     with min=210 MHz so idle P8 power stays low). This flattens the top of the V/F curve so the
-     GPU never climbs into the inefficient high-voltage tail (>1.0 V).
-  3. Set a longevity-first power cap (--watts 450, STRICTLY capped at <= 550 W).
-  4. Apply a conservative, ECC-safe GDDR7 memory clock offset (+1000 MHz default) because LLM
-     decode on RTX 5090 is overwhelmingly memory-bandwidth bound.
+What it sets (no MSI Afterburner needed):
+  1. A positive P0 graphics clock offset (+core_offset MHz via nvmlDeviceSetClockOffsets). This shifts the V/F
+     curve; at a given clock the card should run at a lower voltage. NVML does not report voltage, so this tool
+     does not measure the reduction.
+  2. A boost ceiling (--max-clock via nvmlDeviceSetGpuLockedClocks, min=210 MHz so idle stays low). If the ceiling
+     is below the clock the card reaches at stock (about 2,940 MHz on the test card at 550 W), this is also an
+     underclock at the top of the curve.
+  3. A power limit (--watts, refused above 550 W).
+  4. A GDDR7 memory clock offset (an overclock). The RTX 5090 has no ECC; check stability on your own card with
+     long, repeated greedy runs before you keep an offset.
+
+Measured on one card, 25 Nov 2026 (one short run per profile): +1,500 MHz memory gave about 3-4% more single-stream
+decode than +0; a 450 W limit read cold prompts about 9% slower than 550 W; greedy outputs were identical across all
+profiles tested.
 
 Usage:
   rtx5090-undervolt.py --status                      # read-only (no root required)

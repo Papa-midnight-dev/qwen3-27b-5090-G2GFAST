@@ -41,6 +41,7 @@ typedef struct {
     bool eof_in;
     bool shut_out;
     bool connecting;
+    bool hup;              /* full hang-up seen: removed from epoll (25 Nov 2026 fix) */
     uint32_t events;
     size_t head, len;
     uint8_t buf[BUF_SIZE]; /* data read FROM this side, to be written TO peer */
@@ -77,7 +78,7 @@ static void set_tcp_fast(int fd) {
 }
 
 static void ep_mod(Side *s, uint32_t ev) {
-    if (s->fd < 0 || s->events == ev) return;
+    if (s->fd < 0 || s->hup || s->events == ev) return;
     struct epoll_event e = { .events = ev, .data.ptr = s };
     if (epoll_ctl(g_ep, EPOLL_CTL_MOD, s->fd, &e) == 0) {
         s->events = ev;
@@ -337,7 +338,21 @@ int main(int argc, char **argv) {
                 s->connecting = false;
                 if (!flush_to(peer, s)) { close_conn(c); continue; }
             }
-            if (!c->closing && (rev & (EPOLLIN | EPOLLHUP | EPOLLRDHUP))) {
+            if (rev & EPOLLHUP) {
+                /* Full hang-up (25 Nov 2026 fix): this side can neither send nor receive any more. Take its last
+                   bytes, hand them to the peer, and stop watching it; a level-triggered EPOLLHUP is reported even
+                   with an empty interest mask, so leaving the fd registered made the loop spin. */
+                if (!read_from(s, peer)) { close_conn(c); continue; }
+                s->eof_in = true;
+                s->shut_out = true;
+                if (!flush_to(s, peer)) { close_conn(c); continue; }
+                if (s->len == 0) { close_conn(c); continue; }
+                epoll_ctl(g_ep, EPOLL_CTL_DEL, s->fd, NULL);
+                s->hup = true;
+                update_interests(c);
+                continue;
+            }
+            if (!c->closing && (rev & (EPOLLIN | EPOLLRDHUP))) {
                 if (!read_from(s, peer)) { close_conn(c); continue; }
             }
             if (!c->closing && (rev & EPOLLOUT)) {

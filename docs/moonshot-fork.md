@@ -72,7 +72,7 @@ Measured directly against `libq27.so` (no HTTP proxy in between). *Caveat: the `
 
 *Important baseline caveats:*
 - The baseline ran official `ghcr.io/mkyt/qwen3-27b-5090:0.5.0` (27 upstream commits before `fe41696`) behind a local `socat` TCP proxy (no `TCP_NODELAY`, forks per connection), so the HTTP keep-alive RTT and frontend-overhead improvements reflect **both** the fork's HTTP/1.1 UDS stack and replacing `socat`.
-- The `moonshot` run below was captured just before commit `34e1270` restored the `4.0 / 4.5` adaptive thresholds (which caused the `-23.5%` sampled-reasoning dip on the `5.5 / 6.5` build). All workloads — wins and regressions — are shown below.
+- Correction (25 Nov 2026): this run used the `4.0 / 4.5` thresholds already (the measured image's library carries them), so the `-23.5%` sampled-reasoning row is not explained by the thresholds. It is one unseeded sample. All workloads — wins and regressions — are shown below.
 
 | Workload | `v0.5.0` + `socat` | Moonshot + `q27-fwd` | Delta |
 |---|---:|---:|---:|
@@ -92,7 +92,7 @@ Measured directly against `libq27.so` (no HTTP proxy in between). *Caveat: the `
 | Greedy edit / copy decode | 1,040.0 tok/s | 1,011.8 tok/s | -2.7% |
 | C=4 mixed sampled (agg / max ITL) | 802.5 tok/s / 62.5 ms | 760.5 tok/s / **39.3 ms** | -5.2% agg / **1.6x lower tail** |
 | Greedy prose decode | 245.7 tok/s | 219.7 tok/s | -10.6% |
-| Sampled reasoning *(pre-`34e1270` `5.5/6.5`)* | 411.0 tok/s | 314.6 tok/s | -23.5% *(fixed threshold in `34e1270`)* |
+| Sampled reasoning *(one unseeded sample)* | 411.0 tok/s | 314.6 tok/s | -23.5% *(cause not established)* |
 
 ### 3. RTX 5090 450W Undervolt + GDDR7 OC (`tools/rtx5090-undervolt.py`)
 

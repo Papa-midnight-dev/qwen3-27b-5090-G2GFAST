@@ -1,5 +1,27 @@
 # Qwen3.8-27B on one RTX 5090 *(Moonshot Community Fork)*
 
+> **Status, 25 Nov 2026: use upstream v0.8.1 instead of this branch.** A measured review compared this fork with
+> upstream on the same card, weights and power limit (one run per build, plus a repeat of the first):
+>
+> | | this fork | this fork, `Q27_LOOKUP=0` | upstream v0.8.1 |
+> |---|---:|---:|---:|
+> | Long structured output (7,229 tokens), tok/s | 575 | 1,069 | 1,067 |
+> | Coding chats with thinking, median tok/s | 393 | 390 | 436 |
+> | First follow-up after a cold 73K-token read | 0.62 s | 0.63 s | 0.13 s |
+> | Whole-file edits, median tok/s | 709 | 612 | 604 |
+> | Same question again on a cached document | 0.03-0.04 s | 0.03-0.04 s | 0.07-0.14 s |
+>
+> - The prompt look-up default (`Q27_LOOKUP=1`) halves long structured output. Set `Q27_LOOKUP=0` if you run
+>   this fork anyway.
+> - A rule that skips checkpoints within 64 tokens of the prompt end (commit `c61b9f9`) makes the first short
+>   follow-ups after a long document re-read about 7,500 tokens.
+> - Coding chats are 10-14% slower than upstream on every variant tested; the cause is not yet found.
+> - Kept and worth porting: the faster repeat questions (GPU staging hit) and the serving changes.
+> - Branch [`local-0.8.1`](../../tree/local-0.8.1) is upstream v0.8.1 plus two small patches: a parser fallback
+>   for a tool call written inside the thinking, and an `ADMIN_LOCK` switch.
+> - Benchmark scripts: [`bench/moonshot/`](bench/moonshot/). The "lossless" and "bit-identical" wording below is
+>   too strong: the sampler's accept step is exact, but some new paths compute scores with other rounding.
+
 > **What this repo is:** A full, build-and-run community optimization fork of Masahiro Kiyota's [**`mkyt/qwen3-27b-5090`**](https://github.com/mkyt/qwen3-27b-5090) C++/CUDA inference engine + Python OpenAI/Anthropic API server (MIT License; all core engine architecture and original work belong to Masahiro Kiyota). Model and draft weights are **not** included — download Qwen3.8-27B NVFP4 + DSpine weights from Hugging Face as usual.
 >
 > **Fork base & build note:** Forked from upstream `v0.6.2` (`fe41696`, 17 commits behind upstream `v0.8.1`). **Build from source** (`docker build` or `cmake + ninja` — see [`docs/moonshot-fork.md`](docs/moonshot-fork.md)). Do **not** use the upstream `docker compose pull` or `update.cmd` commands further down in the original README, as those fetch upstream images without this fork's changes.
