@@ -435,7 +435,10 @@ void Model::configure() {
   // gets its chain from that span instead of from the draft model. 0: off (0.8.1 as shipped).
   copy_on_ = draft_ && draft_->dspine() && env_int("Q27_COPY", 0) != 0;
   copy_min_ = std::clamp(env_int("Q27_COPY_MIN", 16), 4, 64);
-  copy_rows_ = env_int("Q27_COPY_ROWS", 32) > kSpecBlock ? kTreeMax : kSpecBlock;
+  {  // (research patch: 64 rows too)
+    const int r = env_int("Q27_COPY_ROWS", 32);
+    copy_rows_ = r > 32 ? kCopyMaxT : r > kSpecBlock ? 32 : kSpecBlock;
+  }
   // (32 rows only where a 32-row verify runs on the same FP8-MMA attention as decode: FP8 / NVFP4 KV, tensor cores on)
   if ((opt_.kv_type != KvType::FP8 && opt_.kv_type != KvType::NVFP4) || env_int("Q27_ATTN_TC", 1) == 0 ||
       env_int("Q27_ATTN_TC_F8", 1) == 0)
@@ -974,7 +977,9 @@ void Model::gemm_q(const char* what, const LinearFp4& l, int T, float* out, bool
 // Fused projections (strided outputs: decode-style attention). A batched verify (up to 64 rows, Phase 7)
 // takes them too: its rows must run the GEMMs of a single sequence's verify (another shape splits K
 // differently).
-bool Model::fused(int T) const { return (batch_n_ ? kSpecBlock : T) <= kDecodeMaxT && skinny_; }
+bool Model::fused(int T) const {  // (research patch: a copy step's verify of up to 64 rows takes the fused shapes too)
+  return (batch_n_ ? kSpecBlock : T) <= (copy_verify_ && verify_ ? kCopyMaxT : kDecodeMaxT) && skinny_;
+}
 
 // Captured target features for the draft: the input of layer i is the output of layer i - 1.
 bf16* Model::cap_for(int i) const {
@@ -1114,7 +1119,7 @@ void Model::attn(int i, int T) {
               {rope_delta_, mpos_on_ && !verify_ ? mpos_ : nullptr});
   mark("attn core");
   if (skip("attn")) {
-  } else if (T <= kDecodeMaxT) {
+  } else if (T <= kDecodeMaxT || (verify_ && copy_verify_ && T <= kCopyMaxT)) {
     attention_decode(v_, qg, ldq, T, pos_dev_, kv, opt_.kv_type, page_table_, o_, attn_ws_, kAttnDecodeWsBytes, s_,
                      A.o.static8() ? aq_ : nullptr, A.o.in_scale(), tree, verify_ && copy_verify_);
     quant_in(A.o, o_, T, kHeads * kHeadDim);
@@ -1935,8 +1940,8 @@ bool Model::copy_prepare() {
       if (S(p - j) != S(L - 1 - j)) return false;  // (a hash collision)
     copy_src_ = p + 1, fresh = true;
   }
-  int W = std::min(copy_rows_, step_capacity_);  // (32 rows; 16 near the page limit or for a 16-token caller)
-  if (pos_ + kSpecBlock + W > max_pages_ * kPageTokens) W = kSpecBlock;
+  int W = std::min(copy_rows_, step_capacity_);  // (64 or 32 rows; fewer near the page limit or for a 16-token caller)
+  while (W > kSpecBlock && pos_ + kSpecBlock + W > max_pages_ * kPageTokens) W /= 2;
   if (pos_ + kSpecBlock + W > max_pages_ * kPageTokens) return false;
   int32_t d[kTreeMax];  // d[m]: the output token expected at position L + m
   for (int m = 0; m < W - 1; m++) {

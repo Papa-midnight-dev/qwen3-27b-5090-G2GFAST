@@ -345,7 +345,7 @@ class Engine:
     def spec_step(self, ahead=True):
         """One draft + verify step; returns the new tokens (1..spec_block). ahead=False: the next step is not launched
         before returning (the caller switches to another sequence next)."""
-        out = (ctypes.c_int32 * 32)()  # (local patch: a copy step returns up to 32 tokens)
+        out = (ctypes.c_int32 * 64)()  # (local patch: a copy step returns up to 64 tokens)
         n = lib().q27_spec_step2(self.h, out, int(ahead)) if not ahead else lib().q27_spec_step(self.h, out)
         if n < 0:
             self._check(n, "q27_spec_step")

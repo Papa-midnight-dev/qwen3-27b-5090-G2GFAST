@@ -328,7 +328,7 @@ void gdn_gated_norm(const float* o, const float* z, int ldz, const bf16* w, int 
 // Speculative verify of T <= 32 tree nodes (see gdn.cu): the decode kernels' arithmetic per token along
 // each node's path, without advancing the states; the tokens the previous verify committed are
 // replayed first. Per-row inputs of one layer live in two buffers selected by the step parity *par.
-constexpr int kVerifyMaxT = 32;  // verify rows (nodes of the draft tree, see spec.h)
+constexpr int kVerifyMaxT = 64;  // (research patch: a copy step verifies up to 64 rows)  // verify rows (nodes of the draft tree, see spec.h)
 struct SpecTree;
 struct GdnSpec {
   float* raw[2];  // [32][10240] raw conv inputs (by verify row)
@@ -406,6 +406,7 @@ int attention_prefill_mode(KvType kv_type, bool staged);
 // (splits = min(128, 2 * SMs / 4)); kAttnDecodeWsBytes is enough. qg rows are ldq floats apart.
 // q8 (optional): also e4m3(out / in_scale) for the o_proj GEMM.
 constexpr int kDecodeMaxT = 32;
+constexpr int kCopyMaxT = 64;  // (research patch: a copy step's chain, decode-style, up to 64 rows)
 constexpr int kDecodeMaxSplits = 128;
 // tree (optional, speculative verify): row t is node t of the draft tree; it sees the committed keys
 // and its ancestors (stored at slots pos0 + node) as if its path were decoded alone.

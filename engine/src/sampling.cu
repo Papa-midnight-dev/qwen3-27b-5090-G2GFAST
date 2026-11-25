@@ -342,7 +342,8 @@ __device__ __forceinline__ void spec_accept_body(int32_t* ids, int32_t* block_id
         float px = 0.f;
         for (int i = 0; i < m; i++)
           if (id[i] == x) px = p[i] / mass;
-        if (rng_uniform(rng, kRngAccept + 4 * n + j) * qx < px) {
+        // (a point draw: index 32 + n, so a copy chain of up to 64 rows stays below the residual draws at 160 + n)
+        if (rng_uniform(rng, point ? kRngAccept + n : kRngAccept + 4 * n + j) * qx < px) {
           next = c;
           break;
         }

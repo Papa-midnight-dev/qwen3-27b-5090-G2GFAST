@@ -2060,7 +2060,7 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
                       KvType kv_type, const int32_t* page_table, float* out, void* ws, size_t ws_bytes,
                       cudaStream_t s, uint8_t* q8, float in_scale, const SpecTree* tree, bool wide_chain) {
   if (T == 0) return;
-  Q27_CHECK(T <= kDecodeMaxT, "attention_decode: T must be <= 32");
+  Q27_CHECK(T <= kDecodeMaxT || (wide_chain && T <= kCopyMaxT), "attention_decode: T must be <= 32 (64: a copy step)");
   if (!g_attn_sms) Q27_CUDA(cudaDeviceGetAttribute(&g_attn_sms, cudaDevAttrMultiProcessorCount, 0));
   // About 2 CTAs per SM; short contexts leave most splits empty (they exit at once).
   const int waves = getenv("Q27_ATTN_WAVES") ? atoi(getenv("Q27_ATTN_WAVES")) : 2;  // read per launch (configure)
@@ -2075,7 +2075,7 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
   // (local patch: a copy step's chain of 17..32 rows (wide_chain) also runs on the FP8-MMA kernel, in 16-row launches
   // with the same splits, so its rows are bit-identical to those of shorter steps; prompt chunks of 17..32 rows keep
   // the CUDA-core kernel, as shipped)
-  const bool tc = tc_on && !tree && (T <= kT8MaxT || (wide_chain && tc_f8(kv_type) && T <= kDecodeMaxT));
+  const bool tc = tc_on && !tree && (T <= kT8MaxT || (wide_chain && tc_f8(kv_type) && T <= kCopyMaxT));
   const int tc_splits = getenv("Q27_ATTN_TC_SPLITS") ? atoi(getenv("Q27_ATTN_TC_SPLITS"))
                                                      : std::max(1, g_attn_sms / kKvHeads);
   const int splits = std::min(kDecodeMaxSplits,

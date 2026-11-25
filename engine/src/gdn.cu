@@ -1115,15 +1115,18 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
   }
   namespace cg = cooperative_groups;
   cg::cluster_group cluster = cg::this_cluster();
-  // rows staged at once (kWide, local patch: a single sequence's chain of up to 32 rows, a copy step)
-  constexpr int kRows = (kTree || kWide) ? kTreeMax : kSpecBlock;
+  // Rows of a call (kWide, local patch: a single sequence's chain of up to kTreeMax = 64 rows, a copy step; trees hold
+  // at most 32 nodes) and rows staged at once (kStage: at most 32, the static shared memory; a wide chain runs in tiles
+  // of 32, the same operations in the same order as one pass)
+  constexpr int kRows = kWide ? kTreeMax : kTree ? 32 : kSpecBlock;
+  constexpr int kStage = kRows < 32 ? kRows : 32;
   const int h = blockIdx.x / kRecSplit, part = blockIdx.x % kRecSplit, kh = h / (kVHeads / kKHeads);
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, j = lane % 8;
   const int lcol = kRecCols * warp + lane / 8;  // the lane's column in the CTA
   const int col = part * kRecCtaCols + lcol;    // ... and in the head
-  __shared__ float sk[kRows][kKDim], sq[kRows][kKDim], sv[kRows][kRecCtaCols];
+  __shared__ float sk[kStage][kKDim], sq[kStage][kKDim], sv[kStage][kRecCtaCols];
   __shared__ float so[kRows][kRecCtaCols], s_part[kRows];
-  __shared__ float s_decay[kRows], s_beta[kRows];
+  __shared__ float s_decay[kStage], s_beta[kStage];
   __shared__ int s_rows[kRows];
   // The state (16 KiB per CTA) and the weights do not depend on the previous kernels: the state of
   // this layer is written only by this kernel, and every step ends with a host synchronization.
@@ -1166,8 +1169,8 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
     const int cur = sp.par[ln], prev = cur ^ 1, nc = sp.ncommit[ln];
     // (local patch: in tiles of kRows, since a copy step may commit up to 32 rows and the next step may be a 16-row
     // one; with nc <= kRows this is the one tile of 0.8.1, the same operations in the same order)
-    for (int b0 = 0; b0 < nc; b0 += kRows) {
-      const int m = min(kRows, nc - b0);
+    for (int b0 = 0; b0 < nc; b0 += kStage) {
+      const int m = min(kStage, nc - b0);
       if (tid < m) s_rows[tid] = sp.cpath[cp0 + b0 + tid];
       __syncthreads();
       const float* kp = (prev ? sp.k[1] : sp.k[0]) + pr0 * kQ;
@@ -1210,9 +1213,19 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
   }
   __syncthreads();
   GDN_PROBE(1);
-  stage(in, n, s_rows);
+  if constexpr (!kWide) stage(in, n, s_rows);
   GDN_PROBE(2);
-  if constexpr (kTree) {
+  if constexpr (kWide) {  // (research patch: tiles of kStage rows; S carries over, row order unchanged)
+    for (int b0 = 0; b0 < n; b0 += kStage) {
+      const int m = min(kStage, n - b0);
+      stage(in, m, s_rows + b0);
+      for (int t = 0; t < m; t++) {
+        const float o = gdn_step(S, sk[t], sq[t], sv[t][lcol], s_decay[t], s_beta[t]);
+        if (j == 4) so[b0 + t][lcol] = o;
+      }
+      __syncthreads();  // (the staging buffers are refilled by the next tile)
+    }
+  } else if constexpr (kTree) {
     // Path k > 0 starts at its first own node (depth beg) from the state after its parent node par,
     // which an earlier path computed: that path saves S into snap[k - 1] right after computing par.
     const SpecTree* tree = sp.tree + ln;
