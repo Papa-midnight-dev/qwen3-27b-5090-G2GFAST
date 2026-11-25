@@ -231,7 +231,9 @@ class Scheduler:
                 return
             s.gm = s.matcher if s.grammar_after is None else None
             self.m["q27:structured_requests_total"] += 1
+        _t_sub0 = time.perf_counter() if os.environ.get("Q27_TIMING") else 0.0
         s.reusable = self.reusable(s.prompt)
+        _t_sub1 = time.perf_counter() if _t_sub0 else 0.0
         # Requests that arrive together (an agent and its sub-agents) often share a long prefix (the system
         # prompt and tools) that no checkpoint holds yet: the later one waits until the earlier one has run
         # past it (with a checkpoint planned there) instead of computing it again.
@@ -246,10 +248,17 @@ class Scheduler:
             if not o.started:
                 o.at = sorted(set(o.at) | {s.share_len})
             s.reusable = s.share_len
+        _t_sub2 = time.perf_counter() if _t_sub0 else 0.0
         s.at = self.checkpoints(s.prompt, s.reusable)
+        _t_sub3 = time.perf_counter() if _t_sub0 else 0.0
         # (stats: where the first message ends, the last message and the generation prompt start)
         starts = [i for i, t in enumerate(s.prompt) if t == self.im_start]
         s.marks = (starts[1:2] or [0]) + (starts[-2:-1] or [0]) + (starts[-1:] or [0])
+        if _t_sub0 and len(s.prompt) >= 1000:
+            _t_sub4 = time.perf_counter()
+            log(f"[timing] worker.submit n={len(s.prompt)} reusable={(_t_sub1-_t_sub0)*1000:.2f} "
+                f"share={(_t_sub2-_t_sub1)*1000:.2f} ckpt={(_t_sub3-_t_sub2)*1000:.2f} "
+                f"im_start={(_t_sub4-_t_sub3)*1000:.2f} tot={(_t_sub4-_t_sub0)*1000:.2f} ms")
         s.est_cached = s.reusable
         if s.images:
             self.prefetch(s)
@@ -978,6 +987,9 @@ class Scheduler:
             rate = (len(s.out) - 1) / max(now - s.first_token, 1e-6)
             log(f"{s.rid}: {reason}, {len(s.out)} tokens, ttft {info['ttft']:.2f} s, {rate:.1f} tok/s"
                 + (f", preempted {s.preempted}x" if s.preempted else ""))
+        if os.environ.get("Q27_PROFILE") == "1" and not self.alive:
+            log(f"--- profile_dump after {s.rid} (pt={len(s.prompt)} ct={len(s.out)} steps={s.steps}) ---")
+            self.engine.profile_dump()
 
     def metrics(self):
         self.last_metrics = time.time()

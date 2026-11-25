@@ -522,9 +522,11 @@ void Draft::append_ctx(const bf16* cap, int rows, const int32_t* pos, int pos_ad
   const ActOut ao = act();
   // (local patch: a copy step's committed rows, up to 32 with their commit path, take the decode path too)
   if (rows <= block_ || (rowmap && rows <= kTreeMax && rows <= max_ctx_rows_)) {  // decode step: skinny GEMMs on the draft's format
+    dmark("dctx_fc");
     draft_quant_rows(cap, rows, kCtxFeatures * kHidden, ao, s, rowmap);
     gemm(rows, fc_, ctx_, ws, ws_bytes, s);
     draft_norm(ctx_, hidden_norm_, rows, nullptr, ao, nullptr, s);
+    dmark("dctx_qkv");
     for (int l = 0; l < kLayers; l++) {
       const auto& L = layers_[l];
       gemm(rows, rows_of(L.qkv, quant_, kHeads * kHeadDim, 2 * kKvHeads * kHeadDim), kv_, ws, ws_bytes, s);
@@ -534,6 +536,7 @@ void Draft::append_ctx(const bf16* cap, int rows, const int32_t* pos, int pos_ad
     return;
   }
   Q27_CHECK(!rowmap, "draft append_ctx: rowmap needs a block's rows at most");
+  dmark("dctx_pf_fc");
   // Prompt: BF16 GEMMs (gemm_bf16), quantized weights dequantized slice by slice into scratch.
   auto big = [&](const DLinear& l, int r0, int n, const bf16* a, float* d, int ldd) {
     if (!l.scale) {
@@ -583,12 +586,15 @@ void Draft::propose_dspine(const LaneRows& lr, const DraftLanes& lanes, const in
   const int R = lr.total(), T = lr.rows(0), nd = T - 1;  // (T, nd: one block's)
   const bool batched = sl != nullptr;
   const ActOut ao = act();
+  dmark("d_emb");
   embed_gather(embed, block_ids, R, kHidden, x_, s);
   draft_norm(x_, layers_[0].in_norm, R, nullptr, ao, nullptr, s);
   for (int l = 0; l < kLayers; l++) {
     const auto& L = layers_[l];
     const bool last = l + 1 == kLayers;
+    dmark("d_qkv");
     gemm(R, L.qkv, qkv_, ws, ws_bytes, s);
+    dmark("d_attn");
     if (batched) {
       draft_qk_prep_lanes(lanes, qkv_, L.q_norm, L.k_norm, q_, kb_, vb_, s);
       draft_attention_lanes(ring_layer(lanes, ring_bytes_ / 2, l), q_, kb_, vb_, part_, o32_, s, window_, true);
@@ -597,13 +603,16 @@ void Draft::propose_dspine(const LaneRows& lr, const DraftLanes& lanes, const in
       draft_attention(q_, kb_, vb_, ring_k_ + ring_bytes_ / 2 * l, ring_v_ + ring_bytes_ / 2 * l, lanes.pos, part_, o32_,
                       s, T, window_, true);
     }
+    dmark("d_o");
     draft_quant_rows(o32_, R, kHeads * kHeadDim, ao, s);
     gemm(R, L.o, y_, ws, ws_bytes, s);
+    dmark("d_mlp");
     dspine_add_norm(y_, x_, L.post_norm, R, ao, s);
     gemm(R, L.gate_up, gu_, ws, ws_bytes, s);
     draft_silu_mul(gu_, 2 * kInter, R, kInter, ao, s);
     gemm(R, L.down, y_, ws, ws_bytes, s);
     // The code bridge: read each row's code, the anchor's from the codebook; write the predecessor's message.
+    dmark("d_bridge");
     bf16* nrm = static_cast<bf16*>(act_q_);  // (free until the write below)
     dspine_read(y_, x_, last ? raw_ : nullptr, rms_, nrm, R, s);
     const bf16* rw = last ? last_read_ : early_read_ + size_t(l) * kCode * kHidden;
@@ -618,6 +627,7 @@ void Draft::propose_dspine(const LaneRows& lr, const DraftLanes& lanes, const in
                       last ? ActOut{int(DraftQuant::kBf16), act_q_, nullptr, nullptr} : ao, s);
   }
   // Candidates: the top 16 of the target head (one block: its drafted rows; batched: every row), as head rows.
+  dmark("d_head");
   const bool voc = !vocab_.empty();
   const int V = voc ? int(vocab_.size()) : dims::kVocab;
   const uint8_t* hw = voc ? vocab_w_ : lm_w;
@@ -628,6 +638,7 @@ void Draft::propose_dspine(const LaneRows& lr, const DraftLanes& lanes, const in
   topk_rows(logits, nc, V, kSelK, cand_v_, cand_c_, s);
   // The refinement: the last write redone with each candidate of the predecessor as the sender (its codebook
   // row as the code), giving the 16 x 16 logits per position the selector walks.
+  dmark("d_refined");
   dspine_cand(lr, batched, cand_c_, voc ? vocab_ids_ : nullptr, block_ids, cand_i_, sid_, s);
   const int nb = lr.n, E = (R - nb) * kSelK;
   constexpr int kChunk = 64;  // (the skinny GEMMs take up to 64 rows)
@@ -643,10 +654,10 @@ void Draft::propose_dspine(const LaneRows& lr, const DraftLanes& lanes, const in
   }
   dspine_emsg(lr, batched, egv_, pk_, gate_b_, emsg_, s, tsv_, cand_c_);
   const bf16* ww = write_w_ + size_t(kLayers - 1) * kHidden * kBridgeRank;
-  for (int c = 0; c < E; c += kChunk)
-    skinny_bf16(std::min(kChunk, E - c), kHidden, kBridgeRank, emsg_ + size_t(c) * kBridgeRank, ww, 1.f, nullptr, 0.f,
-                refined_ + size_t(c) * kHidden, ws, ws_bytes, s);
+  gemm_bf16(E, kHidden, kBridgeRank, emsg_, ww, 1.f, nullptr, 0.f, refined_, s);
+  dmark("d_table");
   dspine_table(lr, batched, raw_, rms_, refined_, norm_, cand_c_, hw, hsf, lm_alpha / lm_in_scale, lattice_, s);
+  dmark("d_select");
   DraftChoice ch = choice;
   ch.tree = trees;
   if (batched) ch.src = src_lanes_;

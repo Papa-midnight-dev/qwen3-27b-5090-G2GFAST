@@ -19,7 +19,7 @@ COPY engine /src/engine
 # Parallel compile jobs (empty: one per CPU); the GitHub workflow limits them to fit the runner's RAM.
 ARG BUILD_JOBS=
 # The build directory stays in the BuildKit cache, so a change to one source recompiles only that file.
-RUN --mount=type=cache,target=/build \
+RUN --mount=type=cache,id=q27-gemini-climb-v1,target=/build \
     cmake -S /src/engine -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null \
  && cmake --build /build --target q27 ${BUILD_JOBS:+-j $BUILD_JOBS} \
  && install -D /build/libq27.so /opt/q27/libq27.so

@@ -1501,18 +1501,16 @@ __global__ void kv_fp4_to_e4m3_kernel(const Fp4Kv* kc, const Fp4Kv* vc, const in
 // rounded to E4M3 by the producers), the softmax in base 2, P x 256 in E4M3 and O += P V with V^T
 // (transposed by the producers, keys in the order of the P fragments). Default for FP8 and NVFP4 KV (tc_f8).
 constexpr int kT8Rows = 16;
-#ifndef Q27_X_T8RAW
-#define Q27_X_T8RAW 3
-#endif
 template <class KV>
-constexpr int kT8Ahead = kKvFp8<KV> ? Q27_X_T8RAW - 2 : Q27_X_T8RAW - 1;  // FP8: K is read from its raw slot
-constexpr int kT8Raw = Q27_X_T8RAW;
+constexpr int kT8Raw = kKvFp8<KV> ? 5 : 3;
+template <class KV>
+constexpr int kT8Ahead = kKvFp8<KV> ? kT8Raw<KV> - 2 : kT8Raw<KV> - 1;  // FP8: K is read from its raw slot
 constexpr int kT8Grp = 4;  // compute warps of a single row tile (Q27_ATTN_TC8_GRP=0: 1)
 // Per converted slot: (NVFP4: K and V in E4M3 rows) then V^T.
 template <class KV>
 constexpr int kT8Conv = (kKvFp4<KV> ? 2 * kTcChunk * kHeadDim : 0) + kFaVtBytes;
 template <class KV>
-constexpr int kT8Smem = kT8Raw * 2 * kTcChunk * kKvRowBytes<KV> + 2 * kT8Conv<KV>;
+constexpr int kT8Smem = kT8Raw<KV> * 2 * kTcChunk * kKvRowBytes<KV> + 2 * kT8Conv<KV>;
 
 // kWide: up to 6 row tiles (T <= 16: DSpine's verify), launch bounds for 6 compute warps (other instances keep the
 // register budget of 4).
@@ -1545,7 +1543,7 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
   constexpr int kRowBytes = kKvRowBytes<KV>;
   constexpr int kUnits = kTcChunk * (kRowBytes / 16);
   constexpr int kStageBytes = 2 * kTcChunk * kRowBytes;
-  constexpr int kR = kT8Raw, kAhead = kT8Ahead<KV>;
+  constexpr int kR = kT8Raw<KV>, kAhead = kT8Ahead<KV>;
   constexpr int kProd = kT8Prod<kWide>;
   extern __shared__ __align__(128) uint8_t tc_smem[];
   const uint32_t sbase = uint32_t(__cvta_generic_to_shared(tc_smem));
@@ -1827,10 +1825,42 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
 // Block per (token, head): merge the splits, normalize, apply sigmoid(gate).
 // chunk > 0: the splits of attention_tc_kernel (chunk c in split c % splits).
 // kBatch (P6-10): row t belongs to lane lanes.lr.lane(t).
+__device__ __forceinline__ void attn_quant_block16_subwarp(float y, float input_scale, int m, int kb, int K,
+                                                           uint8_t* q, uint8_t* sf) {
+  const int l16 = threadIdx.x & 15;
+  float amax = fabsf(y);
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 8));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+  const float gs = 1.f / input_scale;
+  const __nv_fp8_storage_t sfq = __nv_cvt_float_to_fp8(gs * amax / 6.f, __NV_SATFINITE, __NV_E4M3);
+  const float sff = float(__half(__nv_cvt_fp8_to_halfraw(sfq, __NV_E4M3)));
+  const float inv = sff != 0.f ? gs / sff : 0.f;
+  const float ys = y * inv;
+  const float y_odd = __shfl_xor_sync(0xffffffffu, ys, 1);
+  uint16_t b16 = 0;
+  if ((l16 & 1) == 0) {
+    asm("{\n .reg .b8 t;\n cvt.rn.satfinite.e2m1x2.f32 t, %1, %2;\n cvt.u16.u8 %0, t;\n}"
+        : "=h"(b16) : "f"(y_odd), "f"(ys));
+  }
+  const uint32_t b0 = uint32_t(b16);
+  const uint32_t b1 = __shfl_xor_sync(0xffffffffu, b0, 2);
+  const uint32_t b2 = __shfl_xor_sync(0xffffffffu, b0, 4);
+  const uint32_t b3 = __shfl_xor_sync(0xffffffffu, b0, 6);
+  const uint32_t word = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+  const uint32_t word1 = __shfl_xor_sync(0xffffffffu, word, 8);
+  if (l16 == 0) {
+    *reinterpret_cast<uint2*>(q + int64_t(m) * (K / 2) + kb * 8) = make_uint2(word, word1);
+    sf[sf_offset(m, kb, K / 16)] = sfq;
+  }
+}
+
 template <bool kBatch = false>
 __global__ void attention_combine_kernel(const float* qg, int ldq, const int32_t* pos_dev, int splits, int min_keys,
                                          int chunk, DecPartial part, float* out, uint8_t* q8, float in_scale,
-                                         const SpecTree* tree, SeqLanes lanes) {
+                                         const SpecTree* tree, SeqLanes lanes, uint8_t* q4 = nullptr,
+                                         uint8_t* sf4 = nullptr) {
   pdl_trigger();
   const int64_t row = blockIdx.x;  // t * 24 + h
   const int d = threadIdx.x, t = blockIdx.x / kHeads, h = blockIdx.x % kHeads;
@@ -1856,8 +1886,9 @@ __global__ void attention_combine_kernel(const float* qg, int ldq, const int32_t
   }
   float gate = qg[int64_t(t) * ldq + h * (2 * kHeadDim) + kHeadDim + d];
   float y = a / L * (1.f / (1.f + __expf(-gate)));
-  out[row * kHeadDim + d] = y;
+  if (out) out[row * kHeadDim + d] = y;
   if (q8) q8[row * kHeadDim + d] = to_kv<uint8_t>(y / in_scale);
+  if (q4) attn_quant_block16_subwarp(y, in_scale, t, h * (kHeadDim / 16) + (d >> 4), kHeads * kHeadDim, q4, sf4);
 }
 
 // Moves the KV of the accepted tree path (rows cpath[i], at slots pos + cpath[i]) to pos + i. Block
@@ -2058,7 +2089,8 @@ static bool tc_f8(KvType kv_type) {
 
 void attention_decode(const float* q, const float* qg, int ldq, int T, const int32_t* pos_dev, KvLayer kv,
                       KvType kv_type, const int32_t* page_table, float* out, void* ws, size_t ws_bytes,
-                      cudaStream_t s, uint8_t* q8, float in_scale, const SpecTree* tree, bool wide_chain) {
+                      cudaStream_t s, uint8_t* q8, float in_scale, const SpecTree* tree, bool wide_chain,
+                      uint8_t* q4, uint8_t* sf4) {
   if (T == 0) return;
   Q27_CHECK(T <= kDecodeMaxT || (wide_chain && T <= kCopyMaxT), "attention_decode: T must be <= 32 (64: a copy step)");
   if (!g_attn_sms) Q27_CUDA(cudaDeviceGetAttribute(&g_attn_sms, cudaDevAttrMultiProcessorCount, 0));
@@ -2156,7 +2188,7 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
                prefetch, part, tree);
   Q27_CUDA(cudaGetLastError());
   launch_pdl(attention_combine_kernel<false>, dim3(unsigned(rows)), dim3(kHeadDim), 0, s, qg, ldq, pos_dev, splits,
-             min_keys, tc ? kTcChunk : 0, part, out, q8, in_scale, tree, SeqLanes{});
+             min_keys, tc ? kTcChunk : 0, part, out, q8, in_scale, tree, SeqLanes{}, q4, sf4);
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -2188,7 +2220,7 @@ bool attention_lanes_vary(KvType kv_type) { return tc_f8(kv_type); }
 // FP8 MMAs only (attention_lanes_vary); otherwise every lane has the same rows (<= 8).
 void attention_decode_lanes(const float* q, const float* qg, int ldq, const SeqLanes& lanes, KvLayer kv,
                             KvType kv_type, float* out, void* ws, size_t ws_bytes, cudaStream_t s, uint8_t* q8,
-                            float in_scale) {
+                            float in_scale, uint8_t* q4, uint8_t* sf4) {
   Q27_CHECK(lanes.n >= 1 && lanes.n <= kMaxLanes && lanes.lr.n == lanes.n, "attention_decode_lanes: 1..8 lanes");
   if (!g_attn_sms) Q27_CUDA(cudaDeviceGetAttribute(&g_attn_sms, cudaDevAttrMultiProcessorCount, 0));
   const int T = lanes.lr.max_rows();
@@ -2254,7 +2286,7 @@ void attention_decode_lanes(const float* q, const float* qg, int ldq, const SeqL
   }
   Q27_CUDA(cudaGetLastError());
   launch_pdl(attention_combine_kernel<true>, dim3(unsigned(rows)), dim3(kHeadDim), 0, s, qg, ldq, lanes.pos, splits, 0,
-             kTcChunk, part, out, q8, in_scale, static_cast<const SpecTree*>(nullptr), lanes);
+             kTcChunk, part, out, q8, in_scale, static_cast<const SpecTree*>(nullptr), lanes, q4, sf4);
   Q27_CUDA(cudaGetLastError());
 }
 

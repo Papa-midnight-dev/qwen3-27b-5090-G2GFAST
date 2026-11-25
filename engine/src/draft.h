@@ -160,9 +160,15 @@ class Draft {
   void* ring_v() const { return ring_v_; }
   size_t ring_layers_bytes() const { return ring_bytes_ * ddims::kLayers; }
 
+  using MarkFn = void (*)(void*, const char*);
+  void set_mark(MarkFn fn, void* ctx) { mark_fn_ = fn, mark_ctx_ = ctx; }
+
   DraftChoice choice;
 
  private:
+  MarkFn mark_fn_ = nullptr;
+  void* mark_ctx_ = nullptr;
+  void dmark(const char* label) const { if (mark_fn_) mark_fn_(mark_ctx_, label); }
   std::unique_ptr<SafeTensors> ckpt_;
   Pool& wpool_;
   Pool& apool_;

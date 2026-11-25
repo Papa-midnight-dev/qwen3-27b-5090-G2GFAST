@@ -1,6 +1,7 @@
 #include "model.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstring>
@@ -465,6 +466,8 @@ void Model::configure() {
   head_a4x2_ = env_int("Q27_LM_HEAD_A4X2", 1) != 0;
   const char* prof = getenv("Q27_PROFILE");
   prof_.on = prof && *prof && *prof != '0';
+  if (draft_)
+    draft_->set_mark(prof_.on ? +[](void* p, const char* s) { static_cast<Model*>(p)->mark(s); } : nullptr, this);
   graphs_ = !getenv("Q27_NO_GRAPH") && !skinny_check_;
 }
 
@@ -705,7 +708,12 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
 }
 
 int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, bool spec) {
+  static const bool timing = getenv("Q27_TIMING") && atoi(getenv("Q27_TIMING")) != 0;
+  auto clk = [] { return std::chrono::steady_clock::now(); };
+  auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+  const auto t0 = timing ? clk() : clk();
   reset();
+  const auto t1 = timing ? clk() : t0;
   cstats_.lookups++;
   cstats_.prompt_tokens += n;
   if (!cache_on_) return 0;
@@ -714,7 +722,9 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
     if (c.pos() < n && (!spec || c.ring) && (!best || c.pos() > best->pos()) &&
         std::equal(c.ids.begin(), c.ids.end(), ids))
       best = &c;
+  const auto t2 = timing ? clk() : t0;
   int cached = 0;
+  auto t3 = t2, t4 = t2, t5 = t2;
   if (best) {
     cached = best->pos();
     const_cast<Checkpoint*>(best)->last_use = ++use_clock_;
@@ -723,12 +733,14 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
     const char* src = slot_mem_[best->slot];
     Q27_CUDA(cudaMemcpyAsync(ssm_, src, ssm_bytes_, cudaMemcpyHostToDevice, s_));
     Q27_CUDA(cudaMemcpyAsync(conv_, src + ssm_bytes_, conv_bytes_, cudaMemcpyHostToDevice, s_));
+    if (timing) { Q27_CUDA(cudaStreamSynchronize(s_)); t3 = clk(); }
     if (draft_) {
       const size_t rb = draft_->ring_layers_bytes();
       Q27_CUDA(cudaMemcpyAsync(draft_->ring_k(), src + ssm_bytes_ + conv_bytes_, rb, cudaMemcpyHostToDevice, s_));
       Q27_CUDA(cudaMemcpyAsync(draft_->ring_v(), src + ssm_bytes_ + conv_bytes_ + rb, rb, cudaMemcpyHostToDevice, s_));
     }
     Q27_CUDA(cudaStreamSynchronize(s_));
+    if (timing) t4 = clk();
     // Full pages are shared; the partial last page is copied (the sequence writes its later rows).
     const int full = cached / kPageTokens;
     std::vector<int32_t> pages = best->pages;
@@ -754,8 +766,12 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
     Q27_CUDA(cudaMemcpyAsync(pos_dev_, &pos_, 4, cudaMemcpyHostToDevice, s_));
     if (hist_) copy_hist(hist_, ids, cached);
     Q27_CUDA(cudaStreamSynchronize(s_));
+    if (timing) t5 = clk();
     cstats_.hits++;
     cstats_.cached_tokens += cached;
+    if (timing && n >= 1000)
+      log("[timing] prefix_begin n=%d cached=%d rem=%d reset=%.2f lookup=%.2f ssm_h2d=%.2f ring_h2d=%.2f pages_hist=%.2f tot=%.2f ms",
+          n, cached, n - cached, ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), ms(t4, t5), ms(t0, t5));
   }
   // Checkpoints of this prefill: the requested positions, and the last few interval multiples that are
   // more than 64 tokens away from the others and from both ends (a chunk of <= 64 tokens takes the
@@ -1040,10 +1056,15 @@ void Model::gdn(int i, int T) {
     mark("gdn prep");
     if (!skip("gdn")) gdn_verify_prep(qkv, ld, Tv, conv, G.conv, h_, G.a, G.b, q_, sp, s_);
     mark("gdn recurrent+norm");
+    const bool fuse4 = G.out.fp4 && !act_a4x2_;
     if (!skip("gdn"))
-      gdn_verify(q_, Tv, G.A_log, G.dt_bias, ssm, z, ldz, G.norm, kEps, n_, G.out.static8() ? aq_ : nullptr,
-                 G.out.in_scale(), sp, s_);
-    quant_in(G.out, n_, T, kVHeads * kVDim);
+      gdn_verify(q_, Tv, G.A_log, G.dt_bias, ssm, z, ldz, G.norm, kEps, fuse4 ? nullptr : n_,
+                 G.out.static8() ? aq_ : nullptr, G.out.in_scale(), sp, s_, fuse4 ? aq_ : nullptr,
+                 fuse4 ? asf_ : nullptr);
+    if (fuse4)
+      a2_row_ = 0;
+    else
+      quant_in(G.out, n_, T, kVHeads * kVDim);
     gemm_q("gdn out", G.out, T, x_, true);
     return;
   }
@@ -1051,10 +1072,15 @@ void Model::gdn(int i, int T) {
     mark("gdn prep");
     if (!skip("gdn")) gdn_decode_prep(qkv, conv, G.conv, h_, G.a, G.b, q_, k_, v_, a_, b_, s_);
     mark("gdn recurrent+norm");
+    const bool fuse4 = G.out.fp4 && !act_a4x2_;
     if (!skip("gdn"))
-      gdn_decode(q_, k_, v_, a_, b_, G.A_log, G.dt_bias, ssm, z, G.norm, kEps, n_, G.out.static8() ? aq_ : nullptr,
-                 G.out.in_scale(), s_);
-    quant_in(G.out, n_, T, kVHeads * kVDim);
+      gdn_decode(q_, k_, v_, a_, b_, G.A_log, G.dt_bias, ssm, z, G.norm, kEps, fuse4 ? nullptr : n_,
+                 G.out.static8() ? aq_ : nullptr, G.out.in_scale(), s_, fuse4 ? aq_ : nullptr,
+                 fuse4 ? asf_ : nullptr);
+    if (fuse4)
+      a2_row_ = 0;
+    else
+      quant_in(G.out, n_, T, kVHeads * kVDim);
     gemm_q("gdn out", G.out, T, x_, true);
     return;
   }
@@ -1106,10 +1132,15 @@ void Model::attn(int i, int T) {
     mark("attn prep");
     if (!skip("attn")) attn_prep_lanes(qg, ldq, k, v, ldkv, A.q_norm, A.k_norm, bsl_, kv, opt_.kv_type, v_, s_);
     mark("attn core");
+    const bool fuse4 = A.o.fp4 && !act_a4x2_;
     if (!skip("attn"))
-      attention_decode_lanes(v_, qg, ldq, bsl_, kv, opt_.kv_type, o_, attn_ws_, kAttnDecodeWsBytes, s_,
-                             A.o.static8() ? aq_ : nullptr, A.o.in_scale());
-    quant_in(A.o, o_, T, kHeads * kHeadDim);
+      attention_decode_lanes(v_, qg, ldq, bsl_, kv, opt_.kv_type, fuse4 ? nullptr : o_, attn_ws_, kAttnDecodeWsBytes, s_,
+                             A.o.static8() ? aq_ : nullptr, A.o.in_scale(), fuse4 ? aq_ : nullptr,
+                             fuse4 ? asf_ : nullptr);
+    if (fuse4)
+      a2_row_ = 0;
+    else
+      quant_in(A.o, o_, T, kHeads * kHeadDim);
     gemm_q("attn o", A.o, T, x_, true);
     return;
   }
@@ -1121,9 +1152,14 @@ void Model::attn(int i, int T) {
   mark("attn core");
   if (skip("attn")) {
   } else if (T <= kDecodeMaxT || (verify_ && copy_verify_ && T <= kCopyMaxT)) {
-    attention_decode(v_, qg, ldq, T, pos_dev_, kv, opt_.kv_type, page_table_, o_, attn_ws_, kAttnDecodeWsBytes, s_,
-                     A.o.static8() ? aq_ : nullptr, A.o.in_scale(), tree, verify_ && copy_verify_);
-    quant_in(A.o, o_, T, kHeads * kHeadDim);
+    const bool fuse4 = A.o.fp4 && !act_a4x2_;
+    attention_decode(v_, qg, ldq, T, pos_dev_, kv, opt_.kv_type, page_table_, fuse4 ? nullptr : o_, attn_ws_,
+                     kAttnDecodeWsBytes, s_, A.o.static8() ? aq_ : nullptr, A.o.in_scale(), tree, verify_ && copy_verify_,
+                     fuse4 ? aq_ : nullptr, fuse4 ? asf_ : nullptr);
+    if (fuse4)
+      a2_row_ = 0;
+    else
+      quant_in(A.o, o_, T, kHeads * kHeadDim);
   } else {
     Q27_CHECK(ldq == kHeads * 2 * kHeadDim, "attention: unexpected q stride");
     // (big2_ is free in attention layers.)
@@ -1173,6 +1209,17 @@ void Model::mlp(int i, int T) {
     mark("mlp silu+quant");
     a2_row_ = 0;
     if (!skip("silu")) silu_mul_quant_fp4_glu(gu, T, kInter, ag, au, L.down.in_scale, aq_, asf_, s_);
+  } else if (mlp_fused_ && !act_a4x2_ && T <= kSkinnyMaxM && skinny_ && !skinny_check_ && !skip("gemm") &&
+             !skip("gemm4") && !skip("silu")) {
+    auto* q = reinterpret_cast<uint8_t*>(big1_);
+    auto* qsf = reinterpret_cast<uint8_t*>(big2_);
+    mark("mlp gate_up+silu");
+    skinny_fp4_glu(T, kInter, kHidden, aq_, asf_, L.gate_up.w, L.gate_up.sf, ag, au, L.down.in_scale, q, qsf,
+                   skinny_ws_, kSkinnyWsBytes, s_);
+    mark("mlp down");
+    skinny_fp4(T, L.down.out, L.down.in, q, qsf, L.down.w, L.down.sf, L.down.alpha, x_, 1.f, x_, skinny_ws_,
+               kSkinnyWsBytes, s_);
+    return;
   } else {
     // fp32 [T][2 I]: in big1_ ([Tc][I]) up to Tc / 2 rows, beyond that also in big2_ (adjacent).
     Q27_CHECK(2 * T <= opt_.prefill_chunk || big2_ == big1_ + size_t(opt_.prefill_chunk) * kInter,
@@ -1498,6 +1545,7 @@ int Model::prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, 
       if (plan_.front() == pos_) save_checkpoint(ring_valid_);
       while (!plan_.empty() && plan_.front() <= pos_) plan_.erase(plan_.begin());
     }
+    if (prof_.on) profile_collect(false);
     c0 += T;
     if (last) *last = T - 1;
   }
@@ -1641,6 +1689,8 @@ void Model::spec_flush() {
 
 int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, uint64_t seed, float uniform,
                           int max_new) {
+  static const bool timing = getenv("Q27_TIMING") && atoi(getenv("Q27_TIMING")) != 0;
+  const auto t0 = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   Q27_CHECK(draft_, "spec_begin: no draft model loaded");
   spec_flush();
   copy_reset();
@@ -1668,6 +1718,10 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
   Q27_CUDA(cudaMemcpyAsync(block_ids_, blk, sizeof blk, cudaMemcpyHostToDevice, s_));
   Q27_CUDA(cudaMemcpyAsync(ids_ver_, blk, sizeof blk, cudaMemcpyHostToDevice, s_));
   Q27_CUDA(cudaStreamSynchronize(s_));
+  if (timing && pos_ >= 1000) {
+    const double dt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    log("[timing] spec_begin pos=%d n_rem=%d tot=%.2f ms", pos_, n, dt);
+  }
   spec_smp_ = smp;
   if (!smp.ignore_eos) std::copy(stop_, stop_ + 2, spec_smp_.stop);
   if (spec_smp_.paths <= 0) spec_smp_.paths = spec_paths_;
@@ -2879,7 +2933,7 @@ bool Model::cut_rows(int n) {
 // A cut step's part (batch_body's: 1 the draft with the expected tokens, 2 the cut and the rest), its graph keyed by
 // the part's total rows (part 2's re-captured when the split of its verify or draft rows differs).
 bool Model::cut_part(int n, int part) {
-  if (!graphs_ || !bwarm_) {
+  if (!graphs_ || !bwarm_ || prof_.on) {
     batch_body(n, part);
     return false;
   }
@@ -2916,11 +2970,18 @@ void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* 
     cut = false;
     for (int z = 0; z < n; z++) cut |= !lane_smp(z).pinned && bdlr_.rows(z) > 4;
   }
+  static const bool timing = getenv("Q27_TIMING") && atoi(getenv("Q27_TIMING")) != 0;
+  auto clk = [] { return std::chrono::steady_clock::now(); };
+  auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+  const auto bt0 = timing ? clk() : std::chrono::steady_clock::time_point{};
+  auto bt1 = bt0, bt2 = bt0;
   if (cut) {
     cut_step_ = true;
     cut_part(n, 1);
     Q27_CUDA(cudaStreamSynchronize(s_));  // (b_conf_ written)
+    if (timing) bt1 = clk();
     cut_rows(n);
+    if (timing) bt2 = clk();
     graphed = cut_part(n, 2);
     bwarm_ = true;
   } else if (batch_masked()) {
@@ -2940,6 +3001,15 @@ void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* 
     Q27_CUDA(cudaGraphLaunch(exec, s_));
   }
   Q27_CUDA(cudaStreamSynchronize(s_));
+  if (timing && (bstep_ < 5 || bstep_ % 25 == 0)) {
+    const auto bt3 = clk();
+    int got_t = 0;
+    for (int z = 0; z < n; z++) got_t += b_out_[2 * z + bpar_].n;
+    log("[timing] batch step=%lld n=%d cut=%d dr=%d vr=%d acc=%d p1=%.2f cut_cpu=%.3f p2=%.2f tot=%.2f ms caps=%lld",
+        (long long)bstep_, n, int(cut), bdlr_.total(), blr_.total(), got_t,
+        cut ? ms(bt0, bt1) : 0.0, cut ? ms(bt1, bt2) : 0.0, cut ? ms(bt2, bt3) : ms(bt0, bt3), ms(bt0, bt3),
+        (long long)bcaptures_);
+  }
   profile_collect(exec != nullptr || graphed);
   static int trace_steps = 0;
   static const int trace_at = getenv("Q27_TRACE_STEP") ? atoi(getenv("Q27_TRACE_STEP")) : 20;

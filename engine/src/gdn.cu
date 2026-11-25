@@ -798,11 +798,14 @@ constexpr int kPrepAB = 2 * kVHeads / kPrepABPer;        // 24
 // doing all 8 tokens took 5 of the 5.3 us at T = 8; in the step, 4 tokens per block beat 2). Decode keeps 8: with
 // 2, the code the compiler emits made T = 1 0.4 us slower.
 constexpr int kPrepGroup = 8;  // tokens per batch of per-token reductions (see below)
+constexpr int kPrepWideTok = 16;  // token slice for T > 16 single-sequence chains (64-row copy steps)
 template <bool kVerify>
 constexpr int kPrepABTok = kVerify ? 4 : kPrepGroup;
-template <bool kVerify>
+template <bool kVerify, bool kSplitQkv = false>
 int prep_blocks(int T) {
-  return kPrepQK + kPrepV + kPrepAB * std::max(1, (T + kPrepABTok<kVerify> - 1) / kPrepABTok<kVerify>);
+  const int qkv_slices = kSplitQkv ? std::max(1, (T + kPrepWideTok - 1) / kPrepWideTok) : 1;
+  const int ab_tok = kSplitQkv ? kPrepWideTok : kPrepABTok<kVerify>;
+  return (kPrepQK + kPrepV) * qkv_slices + kPrepAB * std::max(1, (T + ab_tok - 1) / ab_tok);
 }
 
 // Conv window of channel c before token 0 of the call: the decode state, or the verify's committed
@@ -849,7 +852,7 @@ __device__ __forceinline__ float conv_path(const ConvIn& in, const float* qkv, i
   return acc / (1.f + expf(-acc));
 }
 
-template <bool kVerify, bool kTree, bool kBatch = false>
+template <bool kVerify, bool kTree, bool kBatch = false, bool kSplitQkv = false>
 __global__ void __launch_bounds__(kPrepThreads) gdn_prep_kernel(const float* qkv, int ld, int T, float* conv_state,
                                                                 const bf16* conv_w, const float* h, const bf16* wa,
                                                                 const bf16* wb, PrepOut po, GdnSpec sp) {
@@ -879,14 +882,28 @@ __global__ void __launch_bounds__(kPrepThreads) gdn_prep_kernel(const float* qkv
     po.k = (cur ? sp.k[1] : sp.k[0]) + r0 * kQ, po.v = (cur ? sp.v[1] : sp.v[0]) + r0 * kVHeads * kVDim;
     po.ab = (cur ? sp.ab[1] : sp.ab[0]) + r0 * 2 * kVHeads;
   }
-  if (blk < kPrepQK + kPrepV) {
-    const bool is_qk = blk < kPrepQK;
+  const int qkv_slices = kSplitQkv ? max(1, (T + kPrepWideTok - 1) / kPrepWideTok) : 1;
+  const int qkv_blks = (kPrepQK + kPrepV) * qkv_slices;
+  if (blk < qkv_blks) {
+    const int slice = kSplitQkv ? blk / (kPrepQK + kPrepV) : 0;
+    const int cblk = kSplitQkv ? blk % (kPrepQK + kPrepV) : blk;
+    const int tbeg_q = kSplitQkv ? slice * kPrepWideTok : 0;
+    const int tend_q = kSplitQkv ? min(T, tbeg_q + kPrepWideTok) : T;
+    const bool is_qk = cblk < kPrepQK;
     const int half = tid / kKDim, j = tid % kKDim;  // qk blocks: half 0 = q, 1 = k
-    const int c = is_qk ? half * kQ + blk * kKDim + j : 2 * kQ + (blk - kPrepQK) * kPrepThreads + tid;
-    ConvIn in = conv_load(conv_state, conv_w, c);
-    // (the committed window is written back by gdn_rec_kernel once every block has read the old one)
-    if constexpr (kVerify) conv_replay(in, c, (prev ? sp.raw[1] : sp.raw[0]) + pr0 * kConvDim, nc, sp.cpath + cp0);
-    if (T == 0) return;  // flush: replay only
+    const int c = is_qk ? half * kQ + cblk * kKDim + j : 2 * kQ + (cblk - kPrepQK) * kPrepThreads + tid;
+    ConvIn in;
+    if (!kSplitQkv || slice == 0) {
+      in = conv_load(conv_state, conv_w, c);
+      // (the committed window is written back by gdn_rec_kernel once every block has read the old one)
+      if constexpr (kVerify) conv_replay(in, c, (prev ? sp.raw[1] : sp.raw[0]) + pr0 * kConvDim, nc, sp.cpath + cp0);
+    } else {
+#pragma unroll
+      for (int i = 0; i < kConvK; i++) in.w[i] = __bfloat162float(conv_w[c * kConvK + i]);
+#pragma unroll
+      for (int i = 0; i < kConvK - 1; i++) in.x[i] = 0.f;
+    }
+    if (T == 0 || tbeg_q >= tend_q) return;  // flush: replay only
     pdl_wait();
     // Paths of the rows: the tree (written by this step's selector, after the wait), or the chain 0..t
     // (row t at depth t: computed in place, no staging).
@@ -898,8 +915,8 @@ __global__ void __launch_bounds__(kPrepThreads) gdn_prep_kernel(const float* qkv
       }
       __syncthreads();
     }
-    for (int t0 = 0; t0 < T; t0 += kPrepGroup) {
-      const int tn = min(kPrepGroup, T - t0);
+    for (int t0 = tbeg_q; t0 < tend_q; t0 += kPrepGroup) {
+      const int tn = min(kPrepGroup, tend_q - t0);
       float x[kPrepGroup];
 #pragma unroll
       for (int u = 0; u < kPrepGroup; u++) {
@@ -944,9 +961,9 @@ __global__ void __launch_bounds__(kPrepThreads) gdn_prep_kernel(const float* qkv
         const float ss = red[u][4 * half] + red[u][4 * half + 1] + red[u][4 * half + 2] + red[u][4 * half + 3];
         const int t = t0 + u;
         if (half == 0)
-          po.q[int64_t(t) * kQ + blk * kKDim + j] = x[u] * rsqrtf(ss + 1e-6f) * rsqrtf(float(kKDim));
+          po.q[int64_t(t) * kQ + cblk * kKDim + j] = x[u] * rsqrtf(ss + 1e-6f) * rsqrtf(float(kKDim));
         else
-          po.k[int64_t(t) * kQ + blk * kKDim + j] = x[u] * rsqrtf(ss + 1e-6f);
+          po.k[int64_t(t) * kQ + cblk * kKDim + j] = x[u] * rsqrtf(ss + 1e-6f);
       }
       __syncthreads();  // red is refilled by the next group
     }
@@ -956,9 +973,10 @@ __global__ void __launch_bounds__(kPrepThreads) gdn_prep_kernel(const float* qkv
     }
   } else {
     __shared__ float red_ab[kPrepABPer][kPrepGroup][kPrepThreads / 32];
-    const int ab = blk - kPrepQK - kPrepV;
+    const int ab = blk - qkv_blks;
     const int n0 = (ab % kPrepAB) * kPrepABPer;  // outputs n0 .. n0 + 3 of 0 .. 95: a then b
-    const int tbeg = (ab / kPrepAB) * kPrepABTok<kVerify>, tend = min(T, tbeg + kPrepABTok<kVerify>);  // this block's tokens
+    constexpr int kAbTok = kSplitQkv ? kPrepWideTok : kPrepABTok<kVerify>;
+    const int tbeg = (ab / kPrepAB) * kAbTok, tend = min(T, tbeg + kAbTok);  // this block's tokens
     constexpr int kIters = (kHidden + kPrepThreads * 8 - 1) / (kPrepThreads * 8);  // 3
     uint4 wraw[kPrepABPer][kIters];
 #pragma unroll
@@ -1082,6 +1100,58 @@ __device__ __forceinline__ float gdn_step(float (&S)[kRecRows], const float* k, 
   return s + d * kq;
 }
 
+// Replay-only delta rule (output discarded): exact same state update S *= decay; S += k * ((v - S^T k) * beta)^T
+// with identical butterfly reduction order, skipping the dead S^T q and k . q work.
+__device__ __forceinline__ void gdn_replay_step(float (&S)[kRecRows], const float* k, float v, float decay,
+                                                float beta) {
+  const int j = threadIdx.x % 8;
+  float kr[kRecRows];
+  float akv = 0.f;
+#pragma unroll
+  for (int i = 0; i < kRecRows; i++) {
+    kr[i] = k[j + 8 * i];
+    S[i] *= decay;
+    akv += S[i] * kr[i];
+  }
+  akv += __shfl_xor_sync(0xffffffffu, akv, 4);
+  akv += __shfl_xor_sync(0xffffffffu, akv, 2);
+  akv += __shfl_xor_sync(0xffffffffu, akv, 1);
+  const float d = (v - akv) * beta;
+#pragma unroll
+  for (int i = 0; i < kRecRows; i++) S[i] += kr[i] * d;
+}
+
+__device__ __forceinline__ void gdn_quant_block16_subwarp(float y, float input_scale, int m, int kb, int K,
+                                                          uint8_t* q, uint8_t* sf) {
+  const int l16 = threadIdx.x & 15;
+  float amax = fabsf(y);
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 8));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+  const float gs = 1.f / input_scale;
+  const __nv_fp8_storage_t sfq = __nv_cvt_float_to_fp8(gs * amax / 6.f, __NV_SATFINITE, __NV_E4M3);
+  const float sff = float(__half(__nv_cvt_fp8_to_halfraw(sfq, __NV_E4M3)));
+  const float inv = sff != 0.f ? gs / sff : 0.f;
+  const float ys = y * inv;
+  const float y_odd = __shfl_xor_sync(0xffffffffu, ys, 1);
+  uint16_t b16 = 0;
+  if ((l16 & 1) == 0) {
+    asm("{\n .reg .b8 t;\n cvt.rn.satfinite.e2m1x2.f32 t, %1, %2;\n cvt.u16.u8 %0, t;\n}"
+        : "=h"(b16) : "f"(y_odd), "f"(ys));
+  }
+  const uint32_t b0 = uint32_t(b16);
+  const uint32_t b1 = __shfl_xor_sync(0xffffffffu, b0, 2);
+  const uint32_t b2 = __shfl_xor_sync(0xffffffffu, b0, 4);
+  const uint32_t b3 = __shfl_xor_sync(0xffffffffu, b0, 6);
+  const uint32_t word = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+  const uint32_t word1 = __shfl_xor_sync(0xffffffffu, word, 8);
+  if (l16 == 0) {
+    *reinterpret_cast<uint2*>(q + int64_t(m) * (K / 2) + kb * 8) = make_uint2(word, word1);
+    sf[sf_offset(m, kb, K / 16)] = sfq;
+  }
+}
+
 struct RecIn {  // a token's inputs: k / q rows [2048] (16 key heads), v rows [6144], ab rows [96]
   const float *k, *q, *v, *ab;
 };
@@ -1099,7 +1169,8 @@ template <bool kVerify, bool kTree, bool kBatch = false, bool kWide = false>
 __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T, const bf16* A_log,
                                                                  const bf16* dt_bias, float* state, const float* z,
                                                                  int ldz, const bf16* norm_w, float eps, float* out,
-                                                                 uint8_t* q8, float in_scale, GdnSpec sp) {
+                                                                 uint8_t* q8, float in_scale, GdnSpec sp,
+                                                                 uint8_t* q4 = nullptr, uint8_t* sf4 = nullptr) {
   pdl_trigger();
   GDN_PROBE(0);
   // Batched verify (P6-10): lane ln = blockIdx.y (clusters run along x), its rows from r0, the previous verify's
@@ -1110,16 +1181,16 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
   if constexpr (kBatch) {
     ln = blockIdx.y;
     r0 = sp.lr.live().first(ln), pr0 = sp.prow0[ln], cp0 = int64_t(kLaneSlot) * ln;
-    in.q += r0 * kQ, z += r0 * ldz, out += r0 * kVHeads * kVDim;
+    in.q += r0 * kQ, z += r0 * ldz;
+    if (out) out += r0 * kVHeads * kVDim;
     if (q8) q8 += r0 * kVHeads * kVDim;
   }
   namespace cg = cooperative_groups;
   cg::cluster_group cluster = cg::this_cluster();
   // Rows of a call (kWide, local patch: a single sequence's chain of up to kTreeMax = 64 rows, a copy step; trees hold
-  // at most 32 nodes) and rows staged at once (kStage: at most 32, the static shared memory; a wide chain runs in tiles
-  // of 32, the same operations in the same order as one pass)
+  // at most 32 nodes) and rows staged at once (kStage: 16 for kWide so smem fits 2 CTAs/SM -> 1 wave on 170 SMs!)
   constexpr int kRows = kWide ? kTreeMax : kTree ? 32 : kSpecBlock;
-  constexpr int kStage = kRows < 32 ? kRows : 32;
+  constexpr int kStage = kWide ? 16 : (kRows < 32 ? kRows : 32);
   const int h = blockIdx.x / kRecSplit, part = blockIdx.x % kRecSplit, kh = h / (kVHeads / kKHeads);
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, j = lane % 8;
   const int lcol = kRecCols * warp + lane / 8;  // the lane's column in the CTA
@@ -1176,7 +1247,7 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
       const float* kp = (prev ? sp.k[1] : sp.k[0]) + pr0 * kQ;
       stage({kp, nullptr, (prev ? sp.v[1] : sp.v[0]) + pr0 * kVHeads * kVDim, (prev ? sp.ab[1] : sp.ab[0]) + pr0 * 2 * kVHeads},
             m, s_rows);
-      for (int t = 0; t < m; t++) gdn_step(S, sk[t], sk[t], sv[t][lcol], s_decay[t], s_beta[t]);
+      for (int t = 0; t < m; t++) gdn_replay_step(S, sk[t], sv[t][lcol], s_decay[t], s_beta[t]);
       __syncthreads();  // the staging buffers are refilled below
     }
     {  // the committed state moves to the other buffer (also when nothing was replayed)
@@ -1298,8 +1369,9 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
     const float zz = z[int64_t(row) * ldz + h * kVDim + c];
     const float y = o * rsqrtf(ss / kVDim + eps) * __bfloat162float(norm_w[c]) * (zz / (1.f + expf(-zz)));
     const int64_t oi = int64_t(row) * (kVHeads * kVDim) + h * kVDim + c;
-    out[oi] = y;
+    if (out) out[oi] = y;
     if (q8) q8[oi] = __nv_cvt_float_to_fp8(y / in_scale, __NV_SATFINITE, __NV_E4M3);
+    if (q4) gdn_quant_block16_subwarp(y, in_scale, int(r0) + row, h * 8 + part * 2 + (lane >> 4), kVHeads * kVDim, q4, sf4);
   }
   GDN_PROBE(6);
   cluster.sync();  // the other CTAs may still read s_part
@@ -1387,11 +1459,11 @@ void gdn_decode_prep(const float* qkv, float* conv_state, const bf16* conv_w, co
 
 void gdn_decode(const float* q, const float* k, const float* v, const float* a, const float* b, const bf16* A_log,
                 const bf16* dt_bias, float* state, const float* z, const bf16* norm_w, float eps, float* out,
-                uint8_t* q8, float in_scale, cudaStream_t s) {
+                uint8_t* q8, float in_scale, cudaStream_t s, uint8_t* q4, uint8_t* sf4) {
   (void)b;
   launch_pdl_cluster(gdn_rec_kernel<false, false>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s, kRecSplit,
                      RecIn{k, q, v, a}, 1, A_log, dt_bias, state, z, kVHeads * kVDim, norm_w, eps, out, q8, in_scale,
-                     GdnSpec{});
+                     GdnSpec{}, q4, sf4);
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -1408,6 +1480,9 @@ void gdn_verify_prep(const float* qkv, int ld, int T, float* conv_state, const b
   } else if (sp.paths > 1)
     launch_pdl(gdn_prep_kernel<true, true>, dim3(prep_blocks<true>(T)), dim3(kPrepThreads), 0, s, qkv, ld, T, conv_state, conv_w,
                h, wa, wb, PrepOut{q, nullptr, nullptr, nullptr}, sp);
+  else if (T > kPrepWideTok)
+    launch_pdl(gdn_prep_kernel<true, false, false, true>, dim3(prep_blocks<true, true>(T)), dim3(kPrepThreads), 0, s, qkv, ld, T,
+               conv_state, conv_w, h, wa, wb, PrepOut{q, nullptr, nullptr, nullptr}, sp);
   else
     launch_pdl(gdn_prep_kernel<true, false>, dim3(prep_blocks<true>(T)), dim3(kPrepThreads), 0, s, qkv, ld, T, conv_state,
                conv_w, h, wa, wb, PrepOut{q, nullptr, nullptr, nullptr}, sp);
@@ -1416,25 +1491,25 @@ void gdn_verify_prep(const float* qkv, int ld, int T, float* conv_state, const b
 
 void gdn_verify(const float* q, int T, const bf16* A_log, const bf16* dt_bias, float* state, const float* z, int ldz,
                 const bf16* norm_w, float eps, float* out, uint8_t* q8, float in_scale, const GdnSpec& sp,
-                cudaStream_t s) {
+                cudaStream_t s, uint8_t* q4, uint8_t* sf4) {
   Q27_CHECK(T <= kVerifyMaxT, "gdn_verify: T must be <= 32");
   if (sp.lanes > 0) {
     Q27_CHECK(sp.paths <= 1 && sp.lanes <= kMaxLanes && sp.lr.n == sp.lanes && sp.prow0, "gdn_verify: batched chains only");
     launch_pdl_cluster(gdn_rec_kernel<true, false, true>, dim3(kVHeads * kRecSplit, sp.lanes), dim3(kRecWarps * 32), 0,
                        s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w,
-                       eps, out, q8, in_scale, sp);
+                       eps, out, q8, in_scale, sp, q4, sf4);
   } else if (sp.paths > 1)
     launch_pdl_cluster(gdn_rec_kernel<true, true>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s, kRecSplit,
                        RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w, eps, out, q8,
-                       in_scale, sp);
-  else if (T > kSpecBlock)  // (local patch: a copy step's chain of 17..32 rows)
+                       in_scale, sp, q4, sf4);
+  else if (T > kSpecBlock)  // (local patch: a copy step's chain of 17..64 rows)
     launch_pdl_cluster(gdn_rec_kernel<true, false, false, true>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s,
                        kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w, eps,
-                       out, q8, in_scale, sp);
+                       out, q8, in_scale, sp, q4, sf4);
   else
     launch_pdl_cluster(gdn_rec_kernel<true, false>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s, kRecSplit,
                        RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w, eps, out, q8,
-                       in_scale, sp);
+                       in_scale, sp, q4, sf4);
   Q27_CUDA(cudaGetLastError());
 }
 

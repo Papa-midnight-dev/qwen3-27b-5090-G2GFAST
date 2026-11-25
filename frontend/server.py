@@ -1155,6 +1155,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        self._t_post0 = time.perf_counter() if os.environ.get("Q27_TIMING") else 0.0
         if not origin_allowed(self.headers):
             self.close_connection = True  # (the body is not read)
             return self._error(403, "cross-origin request: a web page of another site cannot use this server "
@@ -1166,6 +1167,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("the request body must be a JSON object")
         except (ValueError, json.JSONDecodeError) as e:
             return self._error(400, f"bad JSON: {e}")
+        self._t_json = time.perf_counter() if self._t_post0 else 0.0
         path = self.path.split("?")[0].rstrip("/")
         if DUMP_DIR:  # (debug: the requests as clients send them; a failed write does not fail the request)
             name = f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 10**9:09d}{path.replace('/', '_')}.json"
@@ -1218,7 +1220,9 @@ class Handler(BaseHTTPRequestHandler):
         choice = tool_choice_of(body.get("tool_choice"), tools)
         parse_tools = tools is not None and choice[0] != "none"
         messages = normalize_messages(body.get("messages"))
+        _t_r0 = time.perf_counter() if getattr(self, "_t_post0", 0.0) else 0.0
         ids, images = self.srv.render(messages, tools, kwargs, body.get("mm_processor_kwargs"))
+        _t_r1 = time.perf_counter() if _t_r0 else 0.0
         left = self.srv.limit(len(ids))
         max_new = body.get("max_completion_tokens") or body.get("max_tokens") or left
         if max_new <= 0:
@@ -1230,6 +1234,11 @@ class Handler(BaseHTTPRequestHandler):
         gen = Generation(self.srv, ids, min(max_new, left), sampling,
                          stops_of(body.get("stop")), images, self.connection, keep, self.srv.force(choice, thinking),
                          grammar, marked=True)
+        if _t_r0 and len(ids) >= 1000:
+            _t_g1 = time.perf_counter()
+            log(f"[timing] server.chat n={len(ids)} read_json={(self._t_json-self._t_post0)*1000:.2f} "
+                f"render={(_t_r1-_t_r0)*1000:.2f} gen_submit={(_t_g1-_t_r1)*1000:.2f} "
+                f"pre_gpu_tot={(_t_g1-self._t_post0)*1000:.2f} ms")
         parser = OutputParser(thinking, tools if parse_tools else None, marked=True)
         rid, created, model = f"chatcmpl-{gen.rid[4:]}", int(time.time()), self._model(body)
         single_call = body.get("parallel_tool_calls") is False or choice[0] == "named"
