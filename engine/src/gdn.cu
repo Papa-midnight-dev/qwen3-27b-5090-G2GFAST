@@ -1095,7 +1095,7 @@ struct RecIn {  // a token's inputs: k / q rows [2048] (16 key heads), v rows [6
 // of the previous step only), every CTA replays the previous verify's committed rows onto the
 // committed state in registers and writes it to the other state buffer (other CTAs may still be
 // reading `state`).
-template <bool kVerify, bool kTree, bool kBatch = false>
+template <bool kVerify, bool kTree, bool kBatch = false, bool kWide = false>
 __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T, const bf16* A_log,
                                                                  const bf16* dt_bias, float* state, const float* z,
                                                                  int ldz, const bf16* norm_w, float eps, float* out,
@@ -1115,7 +1115,8 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
   }
   namespace cg = cooperative_groups;
   cg::cluster_group cluster = cg::this_cluster();
-  constexpr int kRows = kTree ? kTreeMax : kSpecBlock;  // rows staged at once
+  // rows staged at once (kWide, local patch: a single sequence's chain of up to 32 rows, a copy step)
+  constexpr int kRows = (kTree || kWide) ? kTreeMax : kSpecBlock;
   const int h = blockIdx.x / kRecSplit, part = blockIdx.x % kRecSplit, kh = h / (kVHeads / kKHeads);
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, j = lane % 8;
   const int lcol = kRecCols * warp + lane / 8;  // the lane's column in the CTA
@@ -1163,13 +1164,16 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
   if constexpr (kVerify) {
     // Replay of the previous verify's committed rows (inputs final: before the PDL wait).
     const int cur = sp.par[ln], prev = cur ^ 1, nc = sp.ncommit[ln];
-    if (nc > 0) {
-      if (tid < nc) s_rows[tid] = sp.cpath[cp0 + tid];
+    // (local patch: in tiles of kRows, since a copy step may commit up to 32 rows and the next step may be a 16-row
+    // one; with nc <= kRows this is the one tile of 0.8.1, the same operations in the same order)
+    for (int b0 = 0; b0 < nc; b0 += kRows) {
+      const int m = min(kRows, nc - b0);
+      if (tid < m) s_rows[tid] = sp.cpath[cp0 + b0 + tid];
       __syncthreads();
       const float* kp = (prev ? sp.k[1] : sp.k[0]) + pr0 * kQ;
       stage({kp, nullptr, (prev ? sp.v[1] : sp.v[0]) + pr0 * kVHeads * kVDim, (prev ? sp.ab[1] : sp.ab[0]) + pr0 * 2 * kVHeads},
-            nc, s_rows);
-      for (int t = 0; t < nc; t++) gdn_step(S, sk[t], sk[t], sv[t][lcol], s_decay[t], s_beta[t]);
+            m, s_rows);
+      for (int t = 0; t < m; t++) gdn_step(S, sk[t], sk[t], sv[t][lcol], s_decay[t], s_beta[t]);
       __syncthreads();  // the staging buffers are refilled below
     }
     {  // the committed state moves to the other buffer (also when nothing was replayed)
@@ -1197,7 +1201,8 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
     } else {
       const int leaf = tree->leaf[0];
       n = tree->depth[leaf] + 1;
-      if (tid < n) s_rows[tid] = tree->path[leaf][tid];
+      // (kWide: rows in order, as in every chain; the tree's paths hold 16 nodes)
+      if (tid < n) s_rows[tid] = kWide ? tid : tree->path[leaf][tid];
     }
   } else {
     pdl_wait();
@@ -1409,6 +1414,10 @@ void gdn_verify(const float* q, int T, const bf16* A_log, const bf16* dt_bias, f
     launch_pdl_cluster(gdn_rec_kernel<true, true>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s, kRecSplit,
                        RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w, eps, out, q8,
                        in_scale, sp);
+  else if (T > kSpecBlock)  // (local patch: a copy step's chain of 17..32 rows)
+    launch_pdl_cluster(gdn_rec_kernel<true, false, false, true>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s,
+                       kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w, eps,
+                       out, q8, in_scale, sp);
   else
     launch_pdl_cluster(gdn_rec_kernel<true, false>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s, kRecSplit,
                        RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w, eps, out, q8,

@@ -412,7 +412,8 @@ constexpr int kDecodeMaxSplits = 128;
 constexpr size_t kAttnDecodeWsBytes = size_t(kDecodeMaxT) * 24 * kDecodeMaxSplits * 258 * 4;
 void attention_decode(const float* q, const float* qg, int ldq, int T, const int32_t* pos_dev, KvLayer kv,
                       KvType kv_type, const int32_t* page_table, float* out, void* ws, size_t ws_bytes,
-                      cudaStream_t s, uint8_t* q8 = nullptr, float in_scale = 1.f, const SpecTree* tree = nullptr);
+                      cudaStream_t s, uint8_t* q8 = nullptr, float in_scale = 1.f, const SpecTree* tree = nullptr,
+                      bool wide_chain = false);  // (local patch: a copy step's verify of 17..32 rows on the FP8 MMAs)
 // Batched chain verify (P6-10): lanes.n blocks (lane z: rows lanes.lr.first(z) .., its position, page table and
 // rotary delta), each computed exactly as attn_prep / attention_decode of that lane alone.
 void attn_prep_lanes(const float* qg, int ldq, const float* k, const float* v, int ldkv, const bf16* q_norm,

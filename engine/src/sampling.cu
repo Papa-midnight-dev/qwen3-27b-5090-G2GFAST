@@ -303,7 +303,7 @@ __device__ __forceinline__ void spec_accept_body(int32_t* ids, int32_t* block_id
                                                  const int32_t* budget) {
   if (par) out += *par;  // the step's slot (the host may read the previous step's while this one runs)
   const SpecTree* tr = ch.tree;
-  int acc[kSpecBlock], a = 0, n = 0, bonus = 0;
+  int acc[kTreeMax], a = 0, n = 0, bonus = 0;  // (local patch: kTreeMax, a copy step's chain of up to 32 rows)
   acc[0] = 0;
   // An accepted end-of-sequence token ends the step like a bonus token: the sequence then holds exactly
   // the tokens before it (a prefix cache checkpoint at the end of the generation matches the next turn).

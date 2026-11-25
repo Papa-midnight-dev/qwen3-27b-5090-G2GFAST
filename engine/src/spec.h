@@ -65,7 +65,8 @@ struct SpecSampling {
   float accept_ema = 0.f;
   bool pinned = false;  // the width stays (Model::spec_set_block)
   // Copy step (local patch, 25 Nov 2026, Q27_COPY): the host drafts the chain from an earlier span of the sequence that
-  // the output is copying (Model::copy_prepare) instead of the draft model. Greedy single sequences only.
+  // the output is copying (Model::copy_prepare) instead of the draft model. Greedy single sequences only. The value is
+  // the step's rows (16 or 32; 0: a draft step).
   int copy = 0;
   // Batched steps (Model::batch_prepare): the lane's rows (4 / 8 / 12 / 16, DSpine) and the moving average of its tokens
   // per batched step at those rows. Past batched steps decide them, as the single width above.
@@ -113,7 +114,7 @@ constexpr int kLookupMax = 16;  // longest match measured
 // then the bonus token).
 struct SpecOut {
   int32_t n;
-  int32_t tok[kSpecBlock];
+  int32_t tok[kTreeMax];  // (local patch: kTreeMax, a copy step returns up to 32 tokens)
   int32_t src;  // DraftChoice::src of the step
 };
 

@@ -519,7 +519,8 @@ void Draft::append_ctx(const bf16* cap, int rows, const int32_t* pos, int pos_ad
   if (rows == 0) return;
   Q27_CHECK(rows <= max_ctx_rows_, "draft append_ctx: too many rows");
   const ActOut ao = act();
-  if (rows <= block_) {  // decode step: skinny GEMMs on the draft's format
+  // (local patch: a copy step's committed rows, up to 32 with their commit path, take the decode path too)
+  if (rows <= block_ || (rowmap && rows <= kTreeMax && rows <= max_ctx_rows_)) {  // decode step: skinny GEMMs on the draft's format
     draft_quant_rows(cap, rows, kCtxFeatures * kHidden, ao, s, rowmap);
     gemm(rows, fc_, ctx_, ws, ws_bytes, s);
     draft_norm(ctx_, hidden_norm_, rows, nullptr, ao, nullptr, s);

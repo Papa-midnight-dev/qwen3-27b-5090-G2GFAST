@@ -242,7 +242,9 @@ class Model {
   void spec_flush();  // replays the last verify's commits into the GDN / conv states
   void set_sbuf(int b);  // host side of the GDN state buffer switch
   int spec_block_of(const SpecSampling& smp) const { return smp.block > 0 ? smp.block : draft_->block(); }
-  int spec_rows(const SpecSampling& smp) const { return 1 + (spec_block_of(smp) - 1) * std::max(1, smp.paths); }
+  int spec_rows(const SpecSampling& smp) const {
+    return smp.copy > 0 ? smp.copy : 1 + (spec_block_of(smp) - 1) * std::max(1, smp.paths);
+  }
   GdnSpec gdn_spec(int gdn_layer) const;
   bool fused(int T) const;
   bf16* cap_for(int layer) const;
@@ -594,8 +596,9 @@ class Model {
   // Copy steps (local patch, Q27_COPY): host-drafted chains from an earlier span the output is copying.
   bool copy_on_ = false;
   int copy_min_ = 16;                    // Q27_COPY_MIN: tokens that must match to lock onto a source span
+  int copy_rows_ = 32;                   // Q27_COPY_ROWS: rows of a copy step (16 or 32)
   SpecTree* copy_tree_host_ = nullptr;   // pinned: the chain tree of the next copy step
-  int32_t* copy_ids_host_ = nullptr;     // pinned: [kSpecBlock] its verify ids; [kSpecBlock] = 1 (choice.src)
+  int32_t* copy_ids_host_ = nullptr;     // pinned: [kTreeMax] its verify ids; [kTreeMax] = 1 (choice.src)
   std::unordered_map<uint64_t, int32_t> copy_index_;  // hash of copy_min_ tokens ending at i -> the latest such i
   size_t copy_len_ = 0;                  // tokens of the sequence whose windows are indexed (positions < copy_len_)
   uint64_t copy_pow_ = 1;                // kCopyBase ^ copy_min_
@@ -603,6 +606,8 @@ class Model {
   int copy_cool_ = 0, copy_backoff_ = 16;
   bool copy_last_ = false;               // the last step was a copy step
   bool copy_fresh_ = false;              // the lock of the last copy step was found for it
+  int copy_w_ = 0;                       // rows of the prepared copy step
+  bool copy_verify_ = false;             // a copy step's verify is running (attention_decode wide_chain)
   int64_t copy_steps_ = 0, copy_tokens_ = 0;
   bool copy_eligible(const SpecSampling& smp) const;
   bool copy_prepare();                   // decide and fill the host chain for the next step (no step in flight)

@@ -101,7 +101,7 @@ Model::Model(const Options& opt) : opt_(opt) {
     o_rng = state_.add("spec rng", 16);
     o_idv = state_.add("spec verify ids", kTreeMax * 4);
     o_tree = state_.add("spec tree", sizeof(SpecTree));
-    o_cpath = state_.add("spec commit path", kSpecBlock * 4);
+    o_cpath = state_.add("spec commit path", kTreeMax * 4);  // (local patch: a copy step commits up to 32)
     o_sbuf = state_.add("gdn state buffer", 4);
     o_kvl = state_.add("kv layer table", kAttnLayers * sizeof(KvLayer));
     o_blk = state_.add("spec block ids", kSpecBlock * 4);
@@ -383,9 +383,9 @@ Model::Model(const Options& opt) : opt_(opt) {
   // Grammar masks (2 MiB each; outside the plan like the sampler's scratch).
   Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&mask_host_), size_t(kMaskRows) * kMaskWords * 4, cudaHostAllocDefault));
   Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&copy_tree_host_), sizeof(SpecTree), cudaHostAllocDefault));
-  Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&copy_ids_host_), (kSpecBlock + 1) * sizeof(int32_t), cudaHostAllocDefault));
+  Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&copy_ids_host_), (kTreeMax + 1) * sizeof(int32_t), cudaHostAllocDefault));
   memset(copy_tree_host_, 0, sizeof(SpecTree));
-  memset(copy_ids_host_, 0, (kSpecBlock + 1) * sizeof(int32_t));
+  memset(copy_ids_host_, 0, (kTreeMax + 1) * sizeof(int32_t));
   memset(mask_host_, 0xff, size_t(kMaskRows) * kMaskWords * 4);
   Q27_CUDA(cudaMalloc(reinterpret_cast<void**>(&mask_dev_), size_t(kMaskRows) * kMaskWords * 4));
   Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&draft_host_), size_t(kMaxLanes) * kSpecBlock * 4, cudaHostAllocDefault));
@@ -435,6 +435,7 @@ void Model::configure() {
   // gets its chain from that span instead of from the draft model. 0: off (0.8.1 as shipped).
   copy_on_ = draft_ && draft_->dspine() && env_int("Q27_COPY", 0) != 0;
   copy_min_ = std::clamp(env_int("Q27_COPY_MIN", 16), 4, 64);
+  copy_rows_ = env_int("Q27_COPY_ROWS", 32) > kSpecBlock ? kTreeMax : kSpecBlock;
   adapt_up_ = env_f("Q27_SPEC_ADAPT_UP", 4.5f);
   adapt_down_ = env_f("Q27_SPEC_ADAPT_DOWN", 4.0f);
   adapt_alpha_ = std::clamp(env_f("Q27_SPEC_ADAPT_ALPHA", 0.125f), 0.f, 1.f);
@@ -1108,7 +1109,7 @@ void Model::attn(int i, int T) {
   if (skip("attn")) {
   } else if (T <= kDecodeMaxT) {
     attention_decode(v_, qg, ldq, T, pos_dev_, kv, opt_.kv_type, page_table_, o_, attn_ws_, kAttnDecodeWsBytes, s_,
-                     A.o.static8() ? aq_ : nullptr, A.o.in_scale(), tree);
+                     A.o.static8() ? aq_ : nullptr, A.o.in_scale(), tree, verify_ && copy_verify_);
     quant_in(A.o, o_, T, kHeads * kHeadDim);
   } else {
     Q27_CHECK(ldq == kHeads * 2 * kHeadDim, "attention: unexpected q stride");
@@ -1679,7 +1680,7 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
       Q27_CUDA(cudaMemcpyAsync(tree_, copy_tree_host_, sizeof(SpecTree), cudaMemcpyHostToDevice, s_));
       Q27_CUDA(cudaMemcpyAsync(ids_ver_ + 1, copy_ids_host_ + 1, size_t(spec_rows(smp) - 1) * sizeof(int32_t),
                                cudaMemcpyHostToDevice, s_));
-      Q27_CUDA(cudaMemcpyAsync(draft_->choice.src, copy_ids_host_ + kSpecBlock, sizeof(int32_t), cudaMemcpyHostToDevice, s_));
+      Q27_CUDA(cudaMemcpyAsync(draft_->choice.src, copy_ids_host_ + kTreeMax, sizeof(int32_t), cudaMemcpyHostToDevice, s_));
     } else {
     Lookup lk = lookup_;
     lk.hist = hist_, lk.pos = pos_dev_, lk.best = lk_best_;
@@ -1698,9 +1699,11 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
   const int W = spec_rows(smp);
   verify_paths_ = smp.paths;
   verify_ = true;
+  copy_verify_ = smp.copy > 0;  // (local patch: see attention_decode's wide_chain)
   cap_ = cap_buf_;
   chunk(ids_ver_, W, false);
   verify_ = false;
+  copy_verify_ = false;
   cap_ = nullptr;
   logits(x_, W);
   mark("accept");
@@ -1736,7 +1739,8 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
   if (smp.paths > 1) kv_commit(kv_layers_dev_, kAttnLayers, opt_.kv_type, page_table_, pos_dev_, ncommit_, cpath_, s_);
   mark("draft context");
   if (!skip("dctx"))
-    draft_->append_ctx(cap_buf_, spec_block_of(smp), pos_dev_, 0, ncommit_, skinny_ws_, kSkinnyWsBytes, nullptr, 0, s_, cpath_);
+    draft_->append_ctx(cap_buf_, smp.copy > 0 ? smp.copy : spec_block_of(smp), pos_dev_, 0, ncommit_, skinny_ws_,
+                       kSkinnyWsBytes, nullptr, 0, s_, cpath_);
   spec_advance(pos_dev_, ncommit_, par_, sbuf_, rng_, s_, budget_);
 }
 
@@ -1757,8 +1761,8 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
     // (local patch: a copy step takes the full block as a chain; the adaptive width is kept for the draft's steps)
     if (copy_on_) {
       copy_last_ = copy_prepare();
-      spec_smp_.copy = copy_last_ ? 1 : 0;
-      if (copy_last_) spec_smp_.block = draft_->block(), spec_smp_.paths = 1;
+      spec_smp_.copy = copy_last_ ? copy_w_ : 0;
+      if (copy_last_) spec_smp_.paths = 1;
     }
   }
   const SpecSampling smp = spec_smp_;
@@ -1836,7 +1840,7 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   spec_pending_ = true;
   const SpecOut& so = spec_out_[slot];
   const int n = so.n;
-  Q27_CHECK(n >= 1 && n <= kSpecBlock, "spec_step: bad token count");
+  Q27_CHECK(n >= 1 && n <= kTreeMax, "spec_step: bad token count");
   // Debug (Q27_DBG_ACCEPT=1, greedy): the step's tree, the target's argmax per row and the accepted path.
   if (dbg_accept && spec_smp_.temperature <= 0.f) {
     SpecTree tr;
@@ -1855,7 +1859,7 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
     }
   }
   stat_steps_++, stat_lookup_ += so.src, stat_tokens_ += n;
-  last_block_ = spec_block_of(smp);  // (a width change waits for the step in flight: smp's is the returned step's)
+  last_block_ = smp.copy > 0 ? smp.copy : spec_block_of(smp);  // (a width change waits for the step in flight: smp's is the returned step's)
   spec_adapt(spec_smp_, n);
   set_sbuf(sbuf_host_ ^ 1);  // (the device flipped it in spec_advance)
   for (int i = 0; i < n; i++) out[i] = so.tok[i];
@@ -1912,8 +1916,10 @@ bool Model::copy_prepare() {
       if (S(p - j) != S(L - 1 - j)) return false;  // (a hash collision)
     copy_src_ = p + 1, fresh = true;
   }
-  const int W = draft_->block();
-  int32_t d[kSpecBlock];  // d[m]: the output token expected at position L + m
+  int W = copy_rows_;  // (32 rows; 16 near the page limit)
+  if (pos_ + kSpecBlock + W > max_pages_ * kPageTokens) W = kSpecBlock;
+  if (pos_ + kSpecBlock + W > max_pages_ * kPageTokens) return false;
+  int32_t d[kTreeMax];  // d[m]: the output token expected at position L + m
   for (int m = 0; m < W - 1; m++) {
     const int64_t j = copy_src_ + m;
     d[m] = j < L ? S(j) : d[j - L];
@@ -1925,7 +1931,7 @@ bool Model::copy_prepare() {
   for (int i = 0; i < W; i++) {  // a chain, laid out as the draft's selector lays one out
     t.tok[i] = i == 0 ? spec_last_ : d[i - 1];
     t.depth[i] = int8_t(i);
-    for (int k = 0; k <= i; k++) t.path[i][k] = int8_t(k);
+    for (int k = 0; k <= i && k < kSpecBlock; k++) t.path[i][k] = int8_t(k);  // (paths hold 16; the 32-row GDN chain reads none)
     t.owner[i] = 0;
     t.ndraws[i] = i + 1 < W ? 1 : 0;
     if (i + 1 < W) t.draws[i][0] = int8_t(i + 1);
@@ -1933,8 +1939,9 @@ bool Model::copy_prepare() {
   for (int p = 0; p < kTreePaths; p++) t.leaf[p] = int8_t(W - 1);
   for (int i = W; i < kTreeMax; i++) t.tok[i] = t.tok[0], t.depth[i] = 0, t.path[i][0] = int8_t(i);
   for (int i = 0; i < W; i++) copy_ids_host_[i] = t.tok[i];
-  copy_ids_host_[kSpecBlock] = 1;  // (choice.src: counted with the lookup steps in spec_stats)
+  copy_ids_host_[kTreeMax] = 1;  // (choice.src: counted with the lookup steps in spec_stats)
   copy_fresh_ = fresh;
+  copy_w_ = W;
   return true;
 }
 
