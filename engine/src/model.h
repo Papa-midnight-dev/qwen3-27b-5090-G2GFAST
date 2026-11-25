@@ -1,6 +1,7 @@
 // Model runner, Phase 1: one sequence, chunked prefill and decode through the same path.
 #pragma once
 
+#include "edit_copy.h"
 #include <functional>
 #include <memory>
 #include <string>
@@ -621,7 +622,15 @@ class Model {
   void copy_reset() {
     copy_index_.clear(), copy_len_ = 0, copy_src_ = -1, copy_cool_ = 0, copy_backoff_ = 16, copy_last_ = false;
     copy_hint_ = false;
+    ec_.reset(), ec_first_edit_ = -1;
   }
+  // Edit copy (research patch, Q27_EDIT_COPY, port of YASAKANI's): learned replacements applied to the copied input.
+  bool ec_on_ = false;
+  std::unique_ptr<q27_editcopy::EditCopy> ec_;
+  int ec_first_edit_ = -1;               // the chain row - 1 of the first edited token of the last copy step (-1: none)
+  std::vector<int32_t> ec_out_;
+  int64_t ec_steps_ = 0;
+  int ec_n_ = 0;                         // tokens of the step copy_follow is handling
   float adapt_up_ = 4.5f, adapt_down_ = 4.0f, adapt_alpha_ = 0.125f;
   void spec_adapt(SpecSampling& smp, int n) const;
   bool spec_pending_ = false;  // a verify ran since the last flush / reset

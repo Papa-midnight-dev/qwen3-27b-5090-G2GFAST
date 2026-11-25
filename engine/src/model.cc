@@ -446,6 +446,7 @@ void Model::configure() {
   // (research patch, 25 Nov 2026) Copy steps for sampled sequences too: the copied chain is a point-mass proposal,
   // accepted token by token with the target's probability (spec_accept_body). 0: greedy only (as before).
   copy_sampled_ = env_int("Q27_COPY_SAMPLED", 0) != 0;
+  ec_on_ = copy_on_ && env_int("Q27_EDIT_COPY", 0) != 0;  // (research patch: edit copy, YASAKANI's)
   adapt_up_ = env_f("Q27_SPEC_ADAPT_UP", 4.5f);
   adapt_down_ = env_f("Q27_SPEC_ADAPT_DOWN", 4.0f);
   adapt_alpha_ = std::clamp(env_f("Q27_SPEC_ADAPT_ALPHA", 0.125f), 0.f, 1.f);
@@ -1925,8 +1926,27 @@ bool Model::copy_prepare() {
     return h;
   };
   copy_index_upto(L);
+  int W = std::min(copy_rows_, step_capacity_);  // (64 or 32 rows; fewer near the page limit or for a 16-token caller)
+  while (W > kSpecBlock && pos_ + kSpecBlock + W > max_pages_ * kPageTokens) W /= 2;
+  if (pos_ + kSpecBlock + W > max_pages_ * kPageTokens) return false;
+  int32_t d[kTreeMax];  // d[m]: the output token expected at position L + m
+  bool fresh = false, from_ec = false;
+  ec_first_edit_ = -1;
+  if (ec_ && ec_->active()) {  // (edit copy: the input with the learned replacements; from committed tokens only)
+    seq_ids_.push_back(spec_last_);
+    const int fe = ec_->propose(seq_ids_, int(L), W - 1, ec_out_);
+    seq_ids_.pop_back();
+    if (!ec_out_.empty() && (fe >= 0 || copy_src_ < 0)) {
+      bool text = true;  // (an image placeholder or another non-text id: no copy step)
+      for (int m = 0; m < W - 1; m++) {
+        d[m] = m < int(ec_out_.size()) ? ec_out_[size_t(m)] : ec_out_.back();
+        text = text && d[m] >= 0 && d[m] < kVocab;
+      }
+      if (text) ec_first_edit_ = fe, from_ec = true, ec_steps_++;
+    }
+  }
+  if (!from_ec) {
   if (copy_cool_ > 0) return false;
-  bool fresh = false;
   if (copy_src_ >= 0) {  // (a lock kept across batched steps: the K tokens before the source must still end the output)
     bool ok = copy_src_ >= K;
     for (int64_t j = 1; ok && j <= K; j++) ok = S(copy_src_ - j) == S(L - j);
@@ -1940,14 +1960,11 @@ bool Model::copy_prepare() {
       if (S(p - j) != S(L - 1 - j)) return false;  // (a hash collision)
     copy_src_ = p + 1, fresh = true;
   }
-  int W = std::min(copy_rows_, step_capacity_);  // (64 or 32 rows; fewer near the page limit or for a 16-token caller)
-  while (W > kSpecBlock && pos_ + kSpecBlock + W > max_pages_ * kPageTokens) W /= 2;
-  if (pos_ + kSpecBlock + W > max_pages_ * kPageTokens) return false;
-  int32_t d[kTreeMax];  // d[m]: the output token expected at position L + m
   for (int m = 0; m < W - 1; m++) {
     const int64_t j = copy_src_ + m;
     d[m] = j < L ? S(j) : d[j - L];
     if (d[m] < 0 || d[m] >= kVocab) return false;  // (an image placeholder or another non-text id: the draft model's step)
+  }
   }
   SpecTree& t = *copy_tree_host_;
   memset(&t, 0, sizeof t);
@@ -1982,6 +1999,21 @@ void Model::copy_follow(const int32_t* out, int n) {
     int64_t L;
     ~Hint() {
       m->copy_hint_ = false;
+      if (m->ec_on_ && m->copy_eligible(m->spec_smp_)) {  // (edit copy: feedback, then align on the committed tokens)
+        if (!m->ec_) m->ec_ = std::make_unique<q27_editcopy::EditCopy>(int(std::max<int64_t>(0, L - m->ec_n_ - 1)));
+        auto& ec = *m->ec_;
+        if (m->copy_last_ && m->ec_first_edit_ >= 0) {
+          if (m->ec_n_ - 1 > m->ec_first_edit_) ec.hit(); else ec.missed();
+        }
+        const int64_t raw = m->copy_src_ >= 0 && m->copy_src_ < ec.input_end() ? m->copy_src_ : -1;
+        m->seq_ids_.push_back(m->spec_last_);
+        ec.advance(m->seq_ids_, int(L), int(raw));
+        m->seq_ids_.pop_back();
+        if (ec.active()) {
+          m->copy_hint_ = true;
+          return;
+        }
+      }
       if (!m->copy_eligible(m->spec_smp_) || m->copy_cool_ > 0) return;
       if (m->copy_src_ >= 0) {
         m->copy_hint_ = true;
@@ -1996,6 +2028,7 @@ void Model::copy_follow(const int32_t* out, int n) {
       m->copy_hint_ = m->copy_index_.count(h) > 0;
     }
   } hint{this, L};
+  ec_n_ = n;
   if (copy_last_) {
     copy_steps_++, copy_tokens_ += n;
     if (n - 1 < 4 && copy_fresh_) {  // a fresh lock that failed at once: repeated structure, not a copy
