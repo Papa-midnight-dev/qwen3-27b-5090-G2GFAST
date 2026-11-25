@@ -600,6 +600,7 @@ class Model {
   int copy_min_ = 16;                    // Q27_COPY_MIN: tokens that must match to lock onto a source span
   int copy_rows_ = 32;                   // Q27_COPY_ROWS: rows of a copy step (16 or 32)
   int step_capacity_ = kSpecBlock;       // tokens the caller's step buffer holds (q27_set_step_capacity)
+  bool copy_sampled_ = false;            // Q27_COPY_SAMPLED (research patch): copy steps for sampled sequences too
   SpecTree* copy_tree_host_ = nullptr;   // pinned: the chain tree of the next copy step
   int32_t* copy_ids_host_ = nullptr;     // pinned: [kTreeMax] its verify ids; [kTreeMax] = 1 (choice.src)
   std::unordered_map<uint64_t, int32_t> copy_index_;  // hash of copy_min_ tokens ending at i -> the latest such i

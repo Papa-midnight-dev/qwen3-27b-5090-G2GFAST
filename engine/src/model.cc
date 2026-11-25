@@ -440,6 +440,9 @@ void Model::configure() {
   if ((opt_.kv_type != KvType::FP8 && opt_.kv_type != KvType::NVFP4) || env_int("Q27_ATTN_TC", 1) == 0 ||
       env_int("Q27_ATTN_TC_F8", 1) == 0)
     copy_rows_ = kSpecBlock;
+  // (research patch, 25 Nov 2026) Copy steps for sampled sequences too: the copied chain is a point-mass proposal,
+  // accepted token by token with the target's probability (spec_accept_body). 0: greedy only (as before).
+  copy_sampled_ = env_int("Q27_COPY_SAMPLED", 0) != 0;
   adapt_up_ = env_f("Q27_SPEC_ADAPT_UP", 4.5f);
   adapt_down_ = env_f("Q27_SPEC_ADAPT_DOWN", 4.0f);
   adapt_alpha_ = std::clamp(env_f("Q27_SPEC_ADAPT_ALPHA", 0.125f), 0.f, 1.f);
@@ -1890,7 +1893,7 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
 // the source while the output matches it, drops at the first difference and is found again copy_min_ tokens later.
 // A lock that fails on its first step (repeated structure, not a copy) backs off for copy_backoff_ steps (16 -> 256).
 bool Model::copy_eligible(const SpecSampling& smp) const {
-  return smp.temperature <= 0.f && !smp.masked && !smp.pinned && !smp.penalized() && !smp.biased && smp.logprobs < 0 &&
+  return (smp.temperature <= 0.f || copy_sampled_) && !smp.masked && !smp.pinned && !smp.penalized() && !smp.biased && smp.logprobs < 0 &&
          batch_n_ == 0;
 }
 
@@ -1951,6 +1954,7 @@ bool Model::copy_prepare() {
     for (int k = 0; k <= i && k < kSpecBlock; k++) t.path[i][k] = int8_t(k);  // (paths hold 16; the 32-row GDN chain reads none)
     t.owner[i] = 0;
     t.ndraws[i] = i + 1 < W ? 1 : 0;
+    if (i > 0) t.cidx[i] = -1;  // (research patch: a point-mass draw, for sampled acceptance; greedy ignores it)
     if (i + 1 < W) t.draws[i][0] = int8_t(i + 1);
   }
   for (int p = 0; p < kTreePaths; p++) t.leaf[p] = int8_t(W - 1);

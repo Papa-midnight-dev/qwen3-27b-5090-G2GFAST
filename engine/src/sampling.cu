@@ -335,7 +335,10 @@ __device__ __forceinline__ void spec_accept_body(int32_t* ids, int32_t* block_id
       int next = -1;
       for (int j = 0; j < tr->ndraws[n] && next < 0; j++) {
         const int c = tr->draws[n][j], x = tr->tok[c];
-        const float qx = tr->q[n][tr->cidx[c]];
+        // (research patch, 25 Nov 2026: cidx < 0 marks a point-mass draw, a copy step's host-drafted token: q(x) = 1,
+        // so x is accepted with probability p(x) and a rejection leaves p without x; the output still follows p)
+        const bool point = tr->cidx[c] < 0;
+        const float qx = point ? 1.f : tr->q[n][tr->cidx[c]];
         float px = 0.f;
         for (int i = 0; i < m; i++)
           if (id[i] == x) px = p[i] / mass;
@@ -346,8 +349,11 @@ __device__ __forceinline__ void spec_accept_body(int32_t* ids, int32_t* block_id
         float tot = 0.f;  // rejected: the residual max(p - q, 0)
         for (int i = 0; i < m; i++) {
           float qi = 0.f;
-          for (int cc = 0; cc < kSpecSelK; cc++)
-            if (ch.cand[d * kSpecSelK + cc] == id[i]) qi = tr->q[n][cc];
+          if (point)
+            qi = id[i] == x ? 1.f : 0.f;
+          else
+            for (int cc = 0; cc < kSpecSelK; cc++)
+              if (ch.cand[d * kSpecSelK + cc] == id[i]) qi = tr->q[n][cc];
           p[i] = fmaxf(p[i] / mass - qi, 0.f);
           tot += p[i];
         }
