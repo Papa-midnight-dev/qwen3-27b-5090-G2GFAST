@@ -3,8 +3,11 @@ template, set up as transformers 5.18 does (`TokenizersBackend`, `render_jinja_t
 and encodes to the same ids (frontend/tests/test_tokenizer.py compares them where transformers is installed).
 """
 
+import array
+import collections
 import hashlib
 import json
+import os
 import pathlib
 import re
 from datetime import datetime
@@ -123,6 +126,13 @@ class Tokenizer:
         self._unmark = {m[1]: s for s, m in self._mark.items()}
         self._unmark[ESC] = ESC
         self._added_re = re.compile("|".join(map(re.escape, strings)) or "(?!)")
+        # (research patch, 25 Nov 2026) Encoded text between added tokens, kept by its text (Q27_TOKEN_CACHE_MB of
+        # text, default 0: off). An agent or a chat resends the whole conversation each turn; the parts already seen
+        # are not encoded again. The tokenizer splits on added tokens before anything else (none strips or is
+        # normalized: tokenizer.json), so the ids of the parts are the ids of the whole.
+        self._seg_cache = collections.OrderedDict()
+        self._seg_chars = 0
+        self._seg_limit = int(float(os.environ.get("Q27_TOKEN_CACHE_MB", "0")) * 1e6)
         self._marked_re = re.compile(ESC + "(.)", re.S)
 
     def encode(self, text):
@@ -223,10 +233,26 @@ class Tokenizer:
             b = max(a, len(text.rstrip()) - len(RESULT[1]))
         return text[:a] + self._escape(text[a:b]) + text[b:]
 
+    def _encode_segments(self, segs):
+        """Ids of each text in segs (no added tokens), from the cache where it holds them."""
+        miss = list(dict.fromkeys(t for t in segs if t not in self._seg_cache))
+        if miss:
+            for t, e in zip(miss, self.plain.encode_batch(miss, add_special_tokens=False)):
+                self._seg_cache[t] = array.array("i", e.ids)  # (4 bytes a token)
+                self._seg_chars += len(t)
+        out = []
+        for t in segs:
+            self._seg_cache.move_to_end(t)
+            out.append(self._seg_cache[t])
+        while self._seg_chars > self._seg_limit and self._seg_cache:
+            t, _ = self._seg_cache.popitem(last=False)
+            self._seg_chars -= len(t)
+        return out
+
     def encode_marked(self, text):
         """Ids of a rendered prompt whose client text was marked (_escape): the added tokens the template wrote are
         tokens, the text between them is encoded without added tokens, with the marked strings put back."""
-        if ESC not in text:
+        if ESC not in text and not self._seg_limit:
             return self.encode(text)
         out, parts, at = [], [], 0
         for m in self._added_re.finditer(text):
@@ -235,8 +261,11 @@ class Tokenizer:
             at = m.end()
         parts.append((len(out), text[at:]))
         unmark = lambda m: self._unmark[m.group(1)]  # noqa: E731
-        segs = [self._marked_re.sub(unmark, s) for _, s in parts]
-        encs = self.plain.encode_batch(segs, add_special_tokens=False)
-        for (pos, _), e in reversed(list(zip(parts, encs))):
-            out[pos:pos] = e.ids
+        segs = [self._marked_re.sub(unmark, s) if ESC in s else s for _, s in parts]
+        if self._seg_limit:
+            encs = self._encode_segments(segs)
+        else:
+            encs = [e.ids for e in self.plain.encode_batch(segs, add_special_tokens=False)]
+        for (pos, _), ids in reversed(list(zip(parts, encs))):
+            out[pos:pos] = ids
         return out
