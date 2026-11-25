@@ -34,6 +34,7 @@ SIGNATURES = {
     "q27_kv_lent": ([P], I64),
     "q27_has_draft": ([P], I),
     "q27_spec_block": ([P], I),
+    "q27_set_step_capacity": ([P, I], I),
     "q27_last_step_block": ([P], I),
     "q27_last_lane_block": ([P, I], I),
     "q27_last_lane_draft": ([P, I], I),
@@ -192,6 +193,8 @@ class Engine:
         if not self.h:
             raise RuntimeError(f"{fn}: {lib().q27_last_error().decode()}")
         self.max_tokens = lib().q27_max_tokens(self.h)  # (MAX_TOKENS_FIT=1 lowers it to what the VRAM fits)
+        if hasattr(lib(), "q27_set_step_capacity"):  # (local patch: spec_step's buffer holds 32 tokens, copy steps)
+            lib().q27_set_step_capacity(self.h, 32)
 
     def close(self):
         if self.h:

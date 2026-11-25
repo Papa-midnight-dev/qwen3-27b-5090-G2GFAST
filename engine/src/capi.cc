@@ -347,6 +347,9 @@ int q27_spec_draft_lanes(void* m, const int32_t* lanes, int n, int32_t* chain) {
 int q27_has_draft(void* m) { return static_cast<Model*>(m)->has_draft() ? 1 : 0; }
 // Rows of a single sequence's speculative step (the draft block: 8 for DFlash2, up to 16 for DSpine; 0: no draft).
 int q27_spec_block(void* m) { return static_cast<Model*>(m)->spec_block(); }
+// (local patch) Tokens the caller's q27_spec_step buffer holds (16 unless a binding says more): a copy step verifies at
+// most this many rows, so an older caller with out[16] never receives more than 16 tokens.
+int q27_set_step_capacity(void* m, int cap) { return static_cast<Model*>(m)->set_step_capacity(cap); }
 // Rows of the block of the step the last q27_spec_step returned (Q27_SPEC_ADAPT: 8 or the draft's block).
 int q27_last_step_block(void* m) { return static_cast<Model*>(m)->last_step_block(); }
 // Rows of lane z's block in the last q27_spec_step_lanes (0: no such lane).

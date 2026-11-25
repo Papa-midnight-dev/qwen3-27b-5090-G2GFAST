@@ -121,6 +121,8 @@ class Model {
   // many, the verify takes the first rows of them, eagerly).
   void spec_set_draft_rows(int rows) { spec_draft_rows_ = rows; }
   bool has_draft() const { return draft_ != nullptr; }
+  // (local patch) tokens the caller's step buffer holds; copy steps verify at most this many rows
+  int set_step_capacity(int cap) { return step_capacity_ = std::clamp(cap, int(kSpecBlock), int(kTreeMax)); }
   int spec_block() const { return draft_ ? draft_->block() : 0; }
   int last_step_block() const { return last_block_; }  // rows of the block the last spec_step returned (adaptive width)
   // Rows of lane z's block in the last spec_step_lanes / spec_draft_lanes.
@@ -597,6 +599,7 @@ class Model {
   bool copy_on_ = false;
   int copy_min_ = 16;                    // Q27_COPY_MIN: tokens that must match to lock onto a source span
   int copy_rows_ = 32;                   // Q27_COPY_ROWS: rows of a copy step (16 or 32)
+  int step_capacity_ = kSpecBlock;       // tokens the caller's step buffer holds (q27_set_step_capacity)
   SpecTree* copy_tree_host_ = nullptr;   // pinned: the chain tree of the next copy step
   int32_t* copy_ids_host_ = nullptr;     // pinned: [kTreeMax] its verify ids; [kTreeMax] = 1 (choice.src)
   std::unordered_map<uint64_t, int32_t> copy_index_;  // hash of copy_min_ tokens ending at i -> the latest such i

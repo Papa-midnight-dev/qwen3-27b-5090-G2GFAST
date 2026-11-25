@@ -169,7 +169,8 @@ Draft::Draft(const std::string& dir, Pool& weights, Pool& act, Pool& host, int m
   }
 
   const int R = max_ctx_rows_;
-  const int B = std::max(block_, batch_row_budget(lanes));  // block rows of a (batched) step
+  // block rows of a (batched) step; (local patch) at least kTreeMax, a copy step's committed rows (append_ctx)
+  const int B = std::max({block_, batch_row_budget(lanes), int(kTreeMax)});
   auto f32 = [&](const char* what, int64_t n) { return act.add(std::string("draft ") + what, size_t(n) * 4); };
   auto b16 = [&](const char* what, int64_t n) { return act.add(std::string("draft ") + what, size_t(n) * 2); };
   const int BQ = attn_rows(B);

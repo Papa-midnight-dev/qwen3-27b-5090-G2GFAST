@@ -324,7 +324,7 @@ Model::Model(const Options& opt) : opt_(opt) {
     sbuf_ = state_.at<int32_t>(o_sbuf);
     kv_layers_dev_ = state_.at<KvLayer>(o_kvl);
     draft_->choice.tree = tree_;
-    Q27_CUDA(cudaMemset(cpath_, 0, kSpecBlock * 4));
+    Q27_CUDA(cudaMemset(cpath_, 0, kTreeMax * 4));  // (local patch: all of a copy step's 32 entries)
     lk_best_ = state_.at<uint32_t>(o_lk);
     Q27_CUDA(cudaMemset(lk_best_, 0, 4));
     tv_ = act_.at<float>(o_tv), ti_ = act_.at<int32_t>(o_ti);
@@ -436,6 +436,10 @@ void Model::configure() {
   copy_on_ = draft_ && draft_->dspine() && env_int("Q27_COPY", 0) != 0;
   copy_min_ = std::clamp(env_int("Q27_COPY_MIN", 16), 4, 64);
   copy_rows_ = env_int("Q27_COPY_ROWS", 32) > kSpecBlock ? kTreeMax : kSpecBlock;
+  // (32 rows only where a 32-row verify runs on the same FP8-MMA attention as decode: FP8 / NVFP4 KV, tensor cores on)
+  if ((opt_.kv_type != KvType::FP8 && opt_.kv_type != KvType::NVFP4) || env_int("Q27_ATTN_TC", 1) == 0 ||
+      env_int("Q27_ATTN_TC_F8", 1) == 0)
+    copy_rows_ = kSpecBlock;
   adapt_up_ = env_f("Q27_SPEC_ADAPT_UP", 4.5f);
   adapt_down_ = env_f("Q27_SPEC_ADAPT_DOWN", 4.0f);
   adapt_alpha_ = std::clamp(env_f("Q27_SPEC_ADAPT_ALPHA", 0.125f), 0.f, 1.f);
@@ -1915,6 +1919,11 @@ bool Model::copy_prepare() {
   copy_index_upto(L);
   if (copy_cool_ > 0) return false;
   bool fresh = false;
+  if (copy_src_ >= 0) {  // (a lock kept across batched steps: the K tokens before the source must still end the output)
+    bool ok = copy_src_ >= K;
+    for (int64_t j = 1; ok && j <= K; j++) ok = S(copy_src_ - j) == S(L - j);
+    if (!ok) copy_src_ = -1;
+  }
   if (copy_src_ < 0) {
     auto it = copy_index_.find(hash(L - 1));
     if (it == copy_index_.end()) return false;
@@ -1923,13 +1932,14 @@ bool Model::copy_prepare() {
       if (S(p - j) != S(L - 1 - j)) return false;  // (a hash collision)
     copy_src_ = p + 1, fresh = true;
   }
-  int W = copy_rows_;  // (32 rows; 16 near the page limit)
+  int W = std::min(copy_rows_, step_capacity_);  // (32 rows; 16 near the page limit or for a 16-token caller)
   if (pos_ + kSpecBlock + W > max_pages_ * kPageTokens) W = kSpecBlock;
   if (pos_ + kSpecBlock + W > max_pages_ * kPageTokens) return false;
   int32_t d[kTreeMax];  // d[m]: the output token expected at position L + m
   for (int m = 0; m < W - 1; m++) {
     const int64_t j = copy_src_ + m;
     d[m] = j < L ? S(j) : d[j - L];
+    if (d[m] < 0 || d[m] >= kVocab) return false;  // (an image placeholder or another non-text id: the draft model's step)
   }
   SpecTree& t = *copy_tree_host_;
   memset(&t, 0, sizeof t);
@@ -2079,7 +2089,7 @@ void Model::spec_set_masked(int area) {
   SpecSampling& smp = area < 0 ? spec_smp_ : parked_.at(area).smp;
   Q27_CHECK(area < 0 || parked_[area].used, "spec_set_masked: no such sequence");
   if (area < 0) spec_flush();
-  smp.masked = true, smp.paths = 1;
+  smp.masked = true, smp.paths = 1, smp.copy = 0;  // (local patch: no copy step's rows or tree carry over)
   smp.block = smp.block_next = smp.block_due = draft_->block();  // (a masked chain keeps the full block: the host masks its rows)
   smp.stop[2] = -1;  // (the reasoning has ended)
 }
@@ -2093,7 +2103,7 @@ void Model::spec_set_block(int area, int block) {
             "spec_set_block: 2 .. the draft's block rows (DFlash2: 8)");
   if (area < 0) spec_flush();
   smp.block = smp.block_next = smp.block_due = block;
-  smp.pinned = true;
+  smp.pinned = true, smp.copy = 0;
 }
 
 void Model::spec_stats(int64_t* out) {
