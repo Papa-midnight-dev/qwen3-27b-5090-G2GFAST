@@ -194,7 +194,7 @@ class Engine:
             raise RuntimeError(f"{fn}: {lib().q27_last_error().decode()}")
         self.max_tokens = lib().q27_max_tokens(self.h)  # (MAX_TOKENS_FIT=1 lowers it to what the VRAM fits)
         if hasattr(lib(), "q27_set_step_capacity"):  # (local patch: spec_step's buffer holds 32 tokens, copy steps)
-            lib().q27_set_step_capacity(self.h, 32)
+            lib().q27_set_step_capacity(self.h, 64)  # (research patch: 64-token copy steps)
 
     def close(self):
         if self.h:
