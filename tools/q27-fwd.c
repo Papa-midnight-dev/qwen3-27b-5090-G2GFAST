@@ -41,7 +41,8 @@ typedef struct {
     bool eof_in;
     bool shut_out;
     bool connecting;
-    bool hup;              /* full hang-up seen: removed from epoll (25 Nov 2026 fix) */
+    bool hup;              /* full hang-up seen (25 Nov 2026 fix) */
+    bool parked;           /* removed from epoll until the peer drains our buffer */
     uint32_t events;
     size_t head, len;
     uint8_t buf[BUF_SIZE]; /* data read FROM this side, to be written TO peer */
@@ -78,7 +79,7 @@ static void set_tcp_fast(int fd) {
 }
 
 static void ep_mod(Side *s, uint32_t ev) {
-    if (s->fd < 0 || s->hup || s->events == ev) return;
+    if (s->fd < 0 || s->parked || s->events == ev) return;
     struct epoll_event e = { .events = ev, .data.ptr = s };
     if (epoll_ctl(g_ep, EPOLL_CTL_MOD, s->fd, &e) == 0) {
         s->events = ev;
@@ -110,6 +111,13 @@ static void free_dead(void) {
     }
 }
 
+static void unpark(Side *s, uint32_t ev) {
+    /* A parked side is added back only when it can read again; until then the peer's EPOLLOUT drains our buffer. */
+    if (!s->parked || !(ev & EPOLLIN)) return;
+    struct epoll_event e = { .events = ev, .data.ptr = s };
+    if (epoll_ctl(g_ep, EPOLL_CTL_ADD, s->fd, &e) == 0) { s->parked = false; s->events = ev; }
+}
+
 static void update_interests(Conn *c) {
     if (c->closing) return;
     Side *a = &c->cli, *b = &c->srv;
@@ -119,21 +127,17 @@ static void update_interests(Conn *c) {
         return;
     }
     uint32_t ea = 0, eb = 0;
-    if (!a->eof_in) {
-        ea |= EPOLLRDHUP;
-        if (a->len < BUF_SIZE) ea |= EPOLLIN;
-    }
+    if (!a->eof_in && a->len < BUF_SIZE) ea |= EPOLLIN | EPOLLRDHUP;   /* RDHUP only with IN: a full buffer must not spin */
     if (b->len > 0 && !a->shut_out) ea |= EPOLLOUT;
 
     if (b->connecting) {
         eb |= EPOLLOUT;
     } else {
-        if (!b->eof_in) {
-            eb |= EPOLLRDHUP;
-            if (b->len < BUF_SIZE) eb |= EPOLLIN;
-        }
+        if (!b->eof_in && b->len < BUF_SIZE) eb |= EPOLLIN | EPOLLRDHUP;
         if (a->len > 0 && !b->shut_out) eb |= EPOLLOUT;
     }
+    unpark(a, ea);
+    unpark(b, eb);
     ep_mod(a, ea);
     ep_mod(b, eb);
 }
@@ -339,16 +343,17 @@ int main(int argc, char **argv) {
                 if (!flush_to(peer, s)) { close_conn(c); continue; }
             }
             if (rev & EPOLLHUP) {
-                /* Full hang-up (25 Nov 2026 fix): this side can neither send nor receive any more. Take its last
-                   bytes, hand them to the peer, and stop watching it; a level-triggered EPOLLHUP is reported even
-                   with an empty interest mask, so leaving the fd registered made the loop spin. */
-                if (!read_from(s, peer)) { close_conn(c); continue; }
-                s->eof_in = true;
-                s->shut_out = true;
-                if (!flush_to(s, peer)) { close_conn(c); continue; }
-                if (s->len == 0) { close_conn(c); continue; }
-                epoll_ctl(g_ep, EPOLL_CTL_DEL, s->fd, NULL);
+                /* Full hang-up (25 Nov 2026 fix, revised after review): this side accepts no more data. Read what fits
+                   in our buffer (EOF is set only when recv() returns 0), pass it on, and close when everything from
+                   this side has reached the peer. Otherwise park the fd: a level-triggered EPOLLHUP is reported even
+                   with an empty interest mask, so a registered fd would make the loop spin; update_interests() adds it
+                   back when the buffer has room again. */
                 s->hup = true;
+                s->shut_out = true;
+                if (!read_from(s, peer)) { close_conn(c); continue; }
+                if (!flush_to(s, peer)) { close_conn(c); continue; }
+                if (s->eof_in && s->len == 0) { close_conn(c); continue; }
+                if (!s->parked) { epoll_ctl(g_ep, EPOLL_CTL_DEL, s->fd, NULL); s->parked = true; s->events = 0; }
                 update_interests(c);
                 continue;
             }
