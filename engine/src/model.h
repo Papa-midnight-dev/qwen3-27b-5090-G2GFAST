@@ -589,6 +589,7 @@ class Model {
   bool adapt_on_ = false;
   int last_block_ = 0;
   int adapt_low_ = 8;
+  int adapt_paths_ = 1;     // Q27_SPEC_ADAPT_PATHS (local patch): tree walks at the low width, sampled only
   float adapt_up_ = 4.5f, adapt_down_ = 4.0f, adapt_alpha_ = 0.125f;
   void spec_adapt(SpecSampling& smp, int n) const;
   bool spec_pending_ = false;  // a verify ran since the last flush / reset

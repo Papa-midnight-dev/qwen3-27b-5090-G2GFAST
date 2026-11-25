@@ -423,6 +423,10 @@ void Model::configure() {
   };
   adapt_on_ = draft_ && draft_->block() > ddims::kBlock && env_int("Q27_SPEC_ADAPT", 1) != 0;
   adapt_low_ = draft_ ? std::clamp(env_int("Q27_SPEC_ADAPT_LOW", ddims::kBlock), 2, draft_->block()) : ddims::kBlock;
+  // Trees while the width is low (DSpine, local patch of 25 Nov 2026, from the 0.7.0 fork's Q27_SPEC_ADAPT_PATHS): a
+  // sampled single sequence verifies this many walks merged into a trie while its width is at most 8 rows, the
+  // layout the trees' random numbers and rows use. 1: chains only (0.8.1 as shipped).
+  adapt_paths_ = std::clamp(env_int("Q27_SPEC_ADAPT_PATHS", 1), 1, kTreePaths);
   adapt_up_ = env_f("Q27_SPEC_ADAPT_UP", 4.5f);
   adapt_down_ = env_f("Q27_SPEC_ADAPT_DOWN", 4.0f);
   adapt_alpha_ = std::clamp(env_f("Q27_SPEC_ADAPT_ALPHA", 0.125f), 0.f, 1.f);
@@ -1721,7 +1725,16 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   batch_exit();
   // A step not launched ahead takes the width decided after the step before the last (block_due): a step launched
   // ahead could only use that one, and the widths must not depend on it (SpecSampling).
-  if (!spec_inflight_) spec_smp_.block = spec_smp_.block_due;
+  if (!spec_inflight_) {
+    spec_smp_.block = spec_smp_.block_due;
+    // (local patch: trees at the low width; the paths follow from block_due and fixed request settings only, so a
+    // step launched ahead uses the same ones. Greedy sequences stay chains: their rows are bit-identical.)
+    if (adapt_on_ && adapt_paths_ > 1 && draft_->block() > ddims::kBlock)
+      spec_smp_.paths = !spec_smp_.masked && !spec_smp_.pinned && spec_smp_.temperature > 0.f &&
+                                spec_smp_.block <= ddims::kBlock
+                            ? adapt_paths_
+                            : 1;
+  }
   const SpecSampling smp = spec_smp_;
   Q27_CHECK(pos_ + spec_rows(smp) <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
   // Pages for this step's rows and for the one launched ahead (the position advances by <= 8).
