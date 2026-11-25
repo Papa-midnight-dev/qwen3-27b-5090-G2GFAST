@@ -1821,7 +1821,7 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   static const bool dbg_accept = getenv("Q27_DBG_ACCEPT") != nullptr;
   const bool ahead = allow_ahead && !smp.masked && spec_pipeline_ && graphs_ && spec_graph_ && spec_warm_ &&
                      same(smp, spec_key_) && !trace && smp.block_next == smp.block &&
-                     !prof_.on && !dbg_accept && !(copy_on_ && copy_eligible(smp)) &&
+                     !prof_.on && !dbg_accept && smp.copy == 0 && !(copy_on_ && copy_hint_ && copy_eligible(smp)) &&
                      pos_ + kSpecBlock + spec_rows(smp) <= max_pages_ * kPageTokens;  // (worst-case position)
   if (ahead) {
     Q27_CUDA(cudaEventRecord(spec_ev_[slot], s_));
@@ -1890,6 +1890,18 @@ bool Model::copy_eligible(const SpecSampling& smp) const {
          batch_n_ == 0;
 }
 
+void Model::copy_index_upto(int64_t L) {
+  const int64_t K = copy_min_;
+  if (copy_len_ > size_t(L)) copy_reset();  // (another sequence)
+  auto S = [&](int64_t i) { return i + 1 < L ? seq_ids_[size_t(i)] : spec_last_; };
+  for (int64_t i = std::max<int64_t>(int64_t(copy_len_), K - 1); i <= L - 2; i++) {
+    uint64_t h = 1469598103934665603ull;
+    for (int64_t j = i - K + 1; j <= i; j++) h = (h ^ uint32_t(S(j))) * 1099511628211ull;
+    copy_index_[h] = int32_t(i);
+  }
+  copy_len_ = size_t(std::max<int64_t>(L - 1, int64_t(copy_len_)));
+}
+
 bool Model::copy_prepare() {
   if (!copy_eligible(spec_smp_) || spec_last_ < 0) return false;
   const int64_t L = int64_t(seq_ids_.size()) + 1, K = copy_min_;
@@ -1900,13 +1912,8 @@ bool Model::copy_prepare() {
     for (int64_t j = end - K + 1; j <= end; j++) h = (h ^ uint32_t(S(j))) * 1099511628211ull;
     return h;
   };
-  if (copy_len_ > size_t(L)) copy_reset();  // (another sequence)
-  for (int64_t i = std::max<int64_t>(int64_t(copy_len_), K - 1); i <= L - 2; i++) copy_index_[hash(i)] = int32_t(i);
-  copy_len_ = size_t(std::max<int64_t>(L - 1, int64_t(copy_len_)));
-  if (copy_cool_ > 0) {
-    copy_cool_--;
-    return false;
-  }
+  copy_index_upto(L);
+  if (copy_cool_ > 0) return false;
   bool fresh = false;
   if (copy_src_ < 0) {
     auto it = copy_index_.find(hash(L - 1));
@@ -1949,6 +1956,27 @@ void Model::copy_follow(const int32_t* out, int n) {
   // seq_ids_ / spec_last_ already hold the step's n tokens, at positions L0 .. L0 + n - 1.
   const int64_t L = int64_t(seq_ids_.size()) + 1, L0 = L - n;
   auto S = [&](int64_t i) { return i + 1 < L ? seq_ids_[size_t(i)] : spec_last_; };
+  if (copy_cool_ > 0) copy_cool_--;
+  // The hint (computed after this function's updates): a lock, or a window at the end that was seen before.
+  struct Hint {
+    Model* m;
+    int64_t L;
+    ~Hint() {
+      m->copy_hint_ = false;
+      if (!m->copy_eligible(m->spec_smp_) || m->copy_cool_ > 0) return;
+      if (m->copy_src_ >= 0) {
+        m->copy_hint_ = true;
+        return;
+      }
+      const int64_t K = m->copy_min_;
+      if (L < K + 2) return;
+      m->copy_index_upto(L);
+      uint64_t h = 1469598103934665603ull;
+      for (int64_t j = L - K; j <= L - 1; j++)
+        h = (h ^ uint32_t(j + 1 < L ? m->seq_ids_[size_t(j)] : m->spec_last_)) * 1099511628211ull;
+      m->copy_hint_ = m->copy_index_.count(h) > 0;
+    }
+  } hint{this, L};
   if (copy_last_) {
     copy_steps_++, copy_tokens_ += n;
     if (n - 1 < 4 && copy_fresh_) {  // a fresh lock that failed at once: repeated structure, not a copy

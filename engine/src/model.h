@@ -609,10 +609,15 @@ class Model {
   int copy_w_ = 0;                       // rows of the prepared copy step
   bool copy_verify_ = false;             // a copy step's verify is running (attention_decode wide_chain)
   int64_t copy_steps_ = 0, copy_tokens_ = 0;
+  bool copy_hint_ = false;               // a copy step may come next: the next step is not launched ahead
   bool copy_eligible(const SpecSampling& smp) const;
+  void copy_index_upto(int64_t L);        // index the windows ending before position L - 1
   bool copy_prepare();                   // decide and fill the host chain for the next step (no step in flight)
   void copy_follow(const int32_t* out, int n);
-  void copy_reset() { copy_index_.clear(), copy_len_ = 0, copy_src_ = -1, copy_cool_ = 0, copy_backoff_ = 16, copy_last_ = false; }
+  void copy_reset() {
+    copy_index_.clear(), copy_len_ = 0, copy_src_ = -1, copy_cool_ = 0, copy_backoff_ = 16, copy_last_ = false;
+    copy_hint_ = false;
+  }
   float adapt_up_ = 4.5f, adapt_down_ = 4.0f, adapt_alpha_ = 0.125f;
   void spec_adapt(SpecSampling& smp, int n) const;
   bool spec_pending_ = false;  // a verify ran since the last flush / reset
