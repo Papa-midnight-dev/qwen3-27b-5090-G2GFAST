@@ -193,8 +193,8 @@ class Engine:
         if not self.h:
             raise RuntimeError(f"{fn}: {lib().q27_last_error().decode()}")
         self.max_tokens = lib().q27_max_tokens(self.h)  # (MAX_TOKENS_FIT=1 lowers it to what the VRAM fits)
-        if hasattr(lib(), "q27_set_step_capacity"):  # (local patch: spec_step's buffer holds 32 tokens, copy steps)
-            lib().q27_set_step_capacity(self.h, 64)  # (research patch: 64-token copy steps)
+        if hasattr(lib(), "q27_set_step_capacity"):  # (step buffer capacity for 128-row copy steps)
+            lib().q27_set_step_capacity(self.h, 128)
 
     def close(self):
         if self.h:
@@ -345,7 +345,7 @@ class Engine:
     def spec_step(self, ahead=True):
         """One draft + verify step; returns the new tokens (1..spec_block). ahead=False: the next step is not launched
         before returning (the caller switches to another sequence next)."""
-        out = (ctypes.c_int32 * 64)()  # (local patch: a copy step returns up to 64 tokens)
+        out = (ctypes.c_int32 * 128)()  # (128-token copy steps)
         n = lib().q27_spec_step2(self.h, out, int(ahead)) if not ahead else lib().q27_spec_step(self.h, out)
         if n < 0:
             self._check(n, "q27_spec_step")

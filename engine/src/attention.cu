@@ -1525,7 +1525,9 @@ template <class KV, bool kBatch = false, bool kWide = false>
 __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod<kWide>, 1) attention_tc8_kernel(const float* q, const int32_t* pos_dev, int T,
                                                                           const KV* kc, const KV* vc,
                                                                           const int32_t* page_table, int splits,
-                                                                          DecPartial part, SeqLanes lanes, int t0 = 0) {
+                                                                          DecPartial part, SeqLanes lanes, int t0 = 0,
+                                                                          const SpecTree* tree = nullptr,
+                                                                          bool local_part = false) {
   // (t0, local patch from the 0.7.0 fork: this launch computes rows t0 .. t0 + T - 1 of a longer single-sequence chain,
   // a copy step of up to 32 rows in 16-row launches. pos0 stays the step's first position (the keys this step writes
   // are read after the PDL wait); only the rows' key bounds, their queries and outputs move by t0.)
@@ -1554,7 +1556,116 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
   const int pos0 = *pos_dev, kmax = pos0 + t0 + T;
   const int nchunks = (kmax + kTcChunk - 1) / kTcChunk;
   if (split >= nchunks) return;
-  const int nmine = (nchunks - split + splits - 1) / splits;
+  const int c_tail0 = pos0 / kTcChunk;
+  const int nmine_all = (nchunks - split + splits - 1) / splits;
+  const int nmine = (!kBatch && tree) ? (c_tail0 > split ? (c_tail0 - split + splits - 1) / splits : 0) : nmine_all;
+  const bool has_tail = !kBatch && tree != nullptr &&
+                        ((c_tail0 < nchunks && c_tail0 % splits == split) ||
+                         (c_tail0 + 1 < nchunks && (c_tail0 + 1) % splits == split));
+  // Phase 2 helpers for bit-identical tree attention on the 1-2 tail chunks (c_tail0, c_tail0 + 1).
+  // All chunks c < c_tail0 run untouched at full speed (40/42 splits never touch Phase 2).
+  // Shared memory layout in Phase 2 (40 KiB <= kT8Smem for both uint8_t and Fp4Kv):
+  //   [0..8192) past K, [8192..16384) past V, [16384..20480) tree K, [20480..24576) tree V,
+  //   [24576..32768) per-tok packed K (sw8), [32768..40960) per-tok packed V^T (vt_off).
+  auto load_tail_kv = [&]() {
+    const int tid = threadIdx.x;
+    const int tail_off = pos0 - c_tail0 * kTcChunk;
+    const bool need_past = (c_tail0 < nchunks && c_tail0 % splits == split) && tail_off > 0;
+    uint8_t* p_past_k = tc_smem;
+    uint8_t* p_past_v = tc_smem + 8192;
+    uint8_t* p_tree_k = tc_smem + 16384;
+    uint8_t* p_tree_v = tc_smem + 20480;
+    auto load_kv_rows = [&](int nrows_l, int key0, bool same_page, uint8_t* dst_k, uint8_t* dst_v) {
+      if (nrows_l <= 0) return;
+      const int p0 = same_page ? __ldg(page_table + key0 / kPageTokens) : 0;
+      if constexpr (kFp4) {
+        const int tot = nrows_l * 8;
+        for (int u = tid; u < tot; u += blockDim.x) {
+          const int r = u >> 3, col = u & 7;
+          const int key = key0 + r;
+          const int page = same_page ? p0 : __ldg(page_table + key / kPageTokens);
+          const int64_t row = (int64_t(page) * kPageTokens + key % kPageTokens) * kKvHeads + g;
+          for (int kv = 0; kv < 2; kv++) {
+            const uint8_t* src = kv_row_ptr(kv ? vc : kc, row);
+            const uint4 w4 = __ldg(reinterpret_cast<const uint4*>(src + col * 16));
+            const uint32_t w[4] = {w4.x, w4.y, w4.z, w4.w};
+            const uint32_t sc = __ldg(reinterpret_cast<const uint16_t*>(src + kHeadDim / 2 + 2 * col));
+            uint32_t h[16], e[8];
+            fp4x32_to_f16(w, sc, h);
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+              uint16_t lo, hi;
+              asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(lo) : "r"(h[2 * i]));
+              asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(hi) : "r"(h[2 * i + 1]));
+              e[i] = uint32_t(lo) | uint32_t(hi) << 16;
+            }
+            uint8_t* dst = (kv ? dst_v : dst_k) + r * kHeadDim + col * 32;
+            reinterpret_cast<uint4*>(dst)[0] = make_uint4(e[0], e[1], e[2], e[3]);
+            reinterpret_cast<uint4*>(dst)[1] = make_uint4(e[4], e[5], e[6], e[7]);
+          }
+        }
+      } else {
+        const int tot = nrows_l * 16;
+        for (int u = tid; u < tot; u += blockDim.x) {
+          const int r = u >> 4, col = u & 15;
+          const int key = key0 + r;
+          const int page = same_page ? p0 : __ldg(page_table + key / kPageTokens);
+          const int64_t row = (int64_t(page) * kPageTokens + key % kPageTokens) * kKvHeads + g;
+          *reinterpret_cast<uint4*>(dst_k + r * kHeadDim + col * 16) =
+              __ldg(reinterpret_cast<const uint4*>(kv_row_ptr(kc, row) + col * 16));
+          *reinterpret_cast<uint4*>(dst_v + r * kHeadDim + col * 16) =
+              __ldg(reinterpret_cast<const uint4*>(kv_row_ptr(vc, row) + col * 16));
+        }
+      }
+    };
+    if (need_past) load_kv_rows(tail_off, c_tail0 * kTcChunk, true, p_past_k, p_past_v);
+    load_kv_rows(T, pos0, false, p_tree_k, p_tree_v);
+  };
+  auto stage_tail_tok = [&](int c_base, int tok, int kt_tok) {
+    const int tid = threadIdx.x;
+    const uint8_t* p_past_k = tc_smem;
+    const uint8_t* p_past_v = tc_smem + 8192;
+    const uint8_t* p_tree_k = tc_smem + 16384;
+    const uint8_t* p_tree_v = tc_smem + 20480;
+    const uint32_t s_wvt = sbase + 32768;
+    for (int u = tid; u < kTcChunk * 16; u += blockDim.x) {
+      const int r = u >> 4, col = u & 15;
+      const int key = c_base + r;
+      uint4 val = make_uint4(0u, 0u, 0u, 0u);
+      if (key < pos0) {
+        val = *reinterpret_cast<const uint4*>(p_past_k + r * kHeadDim + col * 16);
+      } else if (key < kt_tok) {
+        const int node = tree->path[tok][key - pos0];
+        val = *reinterpret_cast<const uint4*>(p_tree_k + node * kHeadDim + col * 16);
+      }
+      *reinterpret_cast<uint4*>(tc_smem + 24576 + sw8(r, col)) = val;
+    }
+    for (int u = tid; u < (kHeadDim / 4) * 4 * 2; u += blockDim.x) {
+      const int j = u & 3, rest = u >> 5;
+      const int dg = (rest & 7) * 8 + ((u >> 2) & 7), hh = rest >> 3;
+      uint32_t w[4];
+#pragma unroll
+      for (int k = 0; k < 4; k++) {
+        const int r = 16 * hh + 2 * j + (k & 1) + 8 * (k >> 1);
+        const int key = c_base + r;
+        if (key < pos0) {
+          w[k] = *reinterpret_cast<const uint32_t*>(p_past_v + r * kHeadDim + 4 * dg);
+        } else if (key < kt_tok) {
+          const int node = tree->path[tok][key - pos0];
+          w[k] = *reinterpret_cast<const uint32_t*>(p_tree_v + node * kHeadDim + 4 * dg);
+        } else {
+          w[k] = 0u;
+        }
+      }
+      const uint32_t t0_ = __byte_perm(w[0], w[1], 0x5140), t1_ = __byte_perm(w[2], w[3], 0x5140);
+      const uint32_t t2_ = __byte_perm(w[0], w[1], 0x7362), t3_ = __byte_perm(w[2], w[3], 0x7362);
+      const uint32_t y[4] = {__byte_perm(t0_, t1_, 0x5410), __byte_perm(t0_, t1_, 0x7632),
+                             __byte_perm(t2_, t3_, 0x5410), __byte_perm(t2_, t3_, 0x7632)};
+#pragma unroll
+      for (int k = 0; k < 4; k++)
+        asm volatile("st.shared.u32 [%0], %1;" ::"r"(s_wvt + vt_off(4 * dg + k, hh) + 4 * j), "r"(y[k]));
+    }
+  };
 
   if (warp >= ncw) {
     // ---- producers (as in attention_tc_kernel; FP8 rows staged in the sw8 layout, read in place as K)
@@ -1584,7 +1695,7 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
     }
     int page = page_of(kAhead);
     pdl_wait();
-    if (nmine - 1 < kAhead) issue(nmine - 1, 1, page_of(nmine - 1));
+    if (nmine > 0 && nmine - 1 < kAhead) issue(nmine - 1, 1, page_of(nmine - 1));
     cp_commit();
     for (int i = 0; i <= nmine; i++) {
       if (i < nmine) {
@@ -1629,6 +1740,23 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
       }
       __syncthreads();  // chunk i ready for the compute warps; chunk i - 1 consumed
     }
+    if constexpr (!kBatch) {
+      if (has_tail) {
+        load_tail_kv();
+        __syncthreads();
+        for (int c_tail = c_tail0; c_tail <= c_tail0 + 1; c_tail++) {
+          if (c_tail >= nchunks || c_tail % splits != split) continue;
+          const int c_base = c_tail * kTcChunk;
+          for (int tok = 0; tok < T; tok++) {
+            const int kt_tok = pos0 + int(tree->depth[tok]) + 1;
+            if (c_base >= kt_tok) continue;
+            stage_tail_tok(c_base, tok, kt_tok);
+            __syncthreads();
+            __syncthreads();
+          }
+        }
+      }
+    }
     return;
   }
 
@@ -1648,12 +1776,16 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
     const int r0 = lane / 4, c2 = 2 * (lane % 4);
     const int nrows = T * kGqa;
     const int ra = tile * kT8Rows + r0, rb = ra + 8;
-    auto row_kt = [&](int r) { return r < nrows ? pos0 + t0 + r / kGqa + 1 : 0; };  // keys row r sees
+    auto row_kt = [&](int r) {
+      if (r >= nrows) return 0;
+      const int tok = t0 + r / kGqa;
+      return pos0 + (tree ? int(tree->depth[tok]) : tok) + 1;
+    };  // keys row r sees
     auto row_q = [&](int r) { return q + (int64_t(t0 + r / kGqa) * kHeads + g * kGqa + r % kGqa) * kHeadDim; };
     const int kta = row_kt(ra), ktb = row_kt(rb);
     // (a batched lane with fewer rows than the launch's: its tiles past them compute nothing)
-    const int ktile = tile * kT8Rows < nrows ? row_kt(min(tile * kT8Rows + kT8Rows - 1, nrows - 1)) : 0;
-    const int kmin = row_kt(tile * kT8Rows);  // chunks below it need no mask
+    const int ktile = tile * kT8Rows < nrows ? (tree ? pos0 + T : row_kt(min(tile * kT8Rows + kT8Rows - 1, nrows - 1))) : 0;
+    const int kmin = tree ? pos0 : row_kt(tile * kT8Rows);  // chunks below it need no mask
     uint32_t qa[kHeadDim / 32][4];
     float sq[2];
     {
@@ -1802,12 +1934,133 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
       }
       __syncthreads();  // chunk i consumed, chunk i + 1 staged
     }
+    // Phase 2: bit-identical tree attention on the 1-2 tail chunks (c_tail0, c_tail0 + 1).
+    if constexpr (!kBatch) {
+      if (has_tail) {
+        load_tail_kv();
+        __syncthreads();
+        const uint32_t s_wk = sbase + 24576, s_wvt = sbase + 32768;
+        for (int c_tail = c_tail0; c_tail <= c_tail0 + 1; c_tail++) {
+          if (c_tail >= nchunks || c_tail % splits != split) continue;
+          const int c_base = c_tail * kTcChunk;
+          for (int tok = 0; tok < T; tok++) {
+            const int kt_tok = pos0 + int(tree->depth[tok]) + 1;
+            if (c_base >= kt_tok) continue;
+            stage_tail_tok(c_base, tok, kt_tok);
+            __syncthreads();
+            const bool match_a = ra < nrows && (t0 + ra / kGqa) == tok;
+            const bool match_b = rb < nrows && (t0 + rb / kGqa) == tok;
+            const bool warp_has =
+                kGrp ? (tok * kGqa < nrows)
+                     : (tile * kT8Rows < (tok + 1) * kGqa && (tile + 1) * kT8Rows > tok * kGqa);
+            if (warp_has) {
+              constexpr int kNt = kGrp ? 1 : 4;
+              float sc[kNt][4] = {};
+#pragma unroll
+              for (int kk = 0; kk < kHeadDim / 32; kk++)
+#pragma unroll
+                for (int p = 0; p < (kGrp ? 1 : 2); p++) {
+                  uint32_t b[4];
+                  ldsm_x4(b, s_wk + sw8(16 * (kGrp ? gw / 2 : p) + lr + 8 * (lm / 2), 2 * kk + lm % 2));
+                  if constexpr (kGrp) {
+                    const bool hi = gw % 2;
+                    const uint32_t bk[2] = {hi ? b[2] : b[0], hi ? b[3] : b[1]};
+                    mma_e4m3_16832(sc[0], qa[kk], bk);
+                  } else {
+                    mma_e4m3_16832(sc[2 * p], qa[kk], b);
+                    mma_e4m3_16832(sc[2 * p + 1], qa[kk], b + 2);
+                  }
+                }
+              float mx[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+              for (int n = 0; n < kNt; n++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                  sc[n][e] *= sq[e / 2];
+                  const int key = c_base + (kGrp ? gw : n) * 8 + c2 + (e & 1);
+                  if (key >= kt_tok) sc[n][e] = -INFINITY;
+                  mx[e / 2] = fmaxf(mx[e / 2], sc[n][e]);
+                }
+#pragma unroll
+              for (int x = 0; x < 2; x++) {
+                mx[x] = fmaxf(mx[x], __shfl_xor_sync(0xffffffffu, mx[x], 1));
+                mx[x] = fmaxf(mx[x], __shfl_xor_sync(0xffffffffu, mx[x], 2));
+              }
+              if constexpr (kGrp) {
+                x_mx[gw][lane][0] = mx[0], x_mx[gw][lane][1] = mx[1];
+                asm volatile("bar.sync 2, %0;" ::"n"(kT8Grp * 32));
+#pragma unroll
+                for (int x = 0; x < 2; x++)
+                  mx[x] = fmaxf(fmaxf(x_mx[0][lane][x], x_mx[1][lane][x]), fmaxf(x_mx[2][lane][x], x_mx[3][lane][x]));
+              }
+              float mn[2], corr[2];
+#pragma unroll
+              for (int x = 0; x < 2; x++) {
+                mn[x] = fmaxf(m[x], mx[x]);
+                corr[x] = mn[x] == -INFINITY ? 1.f : ex2_approx(m[x] - mn[x]);
+              }
+              uint32_t h[2][4];
+#pragma unroll
+              for (int x = 0; x < 2; x++) {
+                const float b = 8.f - (mn[x] == -INFINITY ? 0.f : mn[x]);
+#pragma unroll
+                for (int n = 0; n < kNt; n++) h[x][n] = exp2_e4m3x2(sc[n][2 * x] + b, sc[n][2 * x + 1] + b);
+              }
+              if constexpr (kGrp) {
+                x_p[gw][lane] = h[0][0] | h[1][0] << 16;
+                asm volatile("bar.sync 2, %0;" ::"n"(kT8Grp * 32));
+#pragma unroll
+                for (int n = 0; n < 4; n++) {
+                  const uint32_t w = x_p[n][lane];
+                  h[0][n] = w & 0xffffu, h[1][n] = w >> 16;
+                }
+              }
+              uint32_t pf[4];
+              float ps[2];
+#pragma unroll
+              for (int x = 0; x < 2; x++) {
+                pf[x] = h[x][0] | h[x][1] << 16;
+                pf[2 + x] = h[x][2] | h[x][3] << 16;
+                ps[x] = sum_e4m3x4(pf[x]) + sum_e4m3x4(pf[2 + x]);
+              }
+#pragma unroll
+              for (int x = 0; x < 2; x++) {
+                ps[x] += __shfl_xor_sync(0xffffffffu, ps[x], 1);
+                ps[x] += __shfl_xor_sync(0xffffffffu, ps[x], 2);
+              }
+              if (match_a) m[0] = mn[0], l[0] = l[0] * corr[0] + ps[0];
+              if (match_b) m[1] = mn[1], l[1] = l[1] * corr[1] + ps[1];
+#pragma unroll
+              for (int dp = 0; dp < kDp; dp++) {
+                float t[2][4] = {};
+                uint32_t b[4];
+                ldsm_x4(b, s_wvt + vt_off(16 * (dp0 + dp) + 8 * (lm / 2) + lr, lm % 2));
+                mma_e4m3_16832(t[0], pf, b);
+                mma_e4m3_16832(t[1], pf, b + 2);
+#pragma unroll
+                for (int x = 0; x < 2; x++) {
+                  if (match_a) {
+                    o[2 * dp + x][0] = o[2 * dp + x][0] * corr[0] + t[x][0];
+                    o[2 * dp + x][1] = o[2 * dp + x][1] * corr[0] + t[x][1];
+                  }
+                  if (match_b) {
+                    o[2 * dp + x][2] = o[2 * dp + x][2] * corr[1] + t[x][2];
+                    o[2 * dp + x][3] = o[2 * dp + x][3] * corr[1] + t[x][3];
+                  }
+                }
+              }
+            }
+            __syncthreads();
+          }
+        }
+      }
+    }
     // Partials of the rows with keys in this split (o and l carry the factor 256; m in natural units).
 #pragma unroll
     for (int x = 0; x < 2; x++) {
       const int r = x ? rb : ra, kt = x ? ktb : kta;
       if (r >= nrows || split * kTcChunk >= kt) continue;
-      const int64_t row = int64_t(t0 + r / kGqa) * kHeads + g * kGqa + r % kGqa;
+      const int64_t row = int64_t((local_part ? 0 : t0) + r / kGqa) * kHeads + g * kGqa + r % kGqa;
       float* dst = part.acc + (row * splits + split) * kHeadDim + dp0 * 16;
 #pragma unroll
       for (int dt = 0; dt < 2 * kDp; dt++)
@@ -1860,10 +2113,12 @@ template <bool kBatch = false>
 __global__ void attention_combine_kernel(const float* qg, int ldq, const int32_t* pos_dev, int splits, int min_keys,
                                          int chunk, DecPartial part, float* out, uint8_t* q8, float in_scale,
                                          const SpecTree* tree, SeqLanes lanes, uint8_t* q4 = nullptr,
-                                         uint8_t* sf4 = nullptr) {
+                                         uint8_t* sf4 = nullptr, int t0 = 0) {
   pdl_trigger();
-  const int64_t row = blockIdx.x;  // t * 24 + h
-  const int d = threadIdx.x, t = blockIdx.x / kHeads, h = blockIdx.x % kHeads;
+  const int64_t prow = blockIdx.x;  // local_t * 24 + h
+  const int d = threadIdx.x, lt = blockIdx.x / kHeads, h = blockIdx.x % kHeads;
+  const int t = t0 + lt;
+  const int64_t row = int64_t(t) * kHeads + h;
   int tl = t;
   if constexpr (kBatch) {
     const LaneRows lr = lanes.lr.live();
@@ -1876,13 +2131,13 @@ __global__ void attention_combine_kernel(const float* qg, int ldq, const int32_t
   const int per = chunk > 0 ? chunk : keys_per_split(keys, splits, min_keys);
   const int used = min(splits, (keys + per - 1) / per);
   float M = -INFINITY;
-  for (int s = 0; s < used; s++) M = fmaxf(M, part.ml[(row * splits + s) * 2]);
+  for (int s = 0; s < used; s++) M = fmaxf(M, part.ml[(prow * splits + s) * 2]);
   float a = 0.f, L = 0.f;
   for (int s = 0; s < used; s++) {
-    float ms = part.ml[(row * splits + s) * 2];
+    float ms = part.ml[(prow * splits + s) * 2];
     float c = ms == -INFINITY ? 0.f : __expf(ms - M);
-    a += c * part.acc[(row * splits + s) * kHeadDim + d];
-    L += c * part.ml[(row * splits + s) * 2 + 1];
+    a += c * part.acc[(prow * splits + s) * kHeadDim + d];
+    L += c * part.ml[(prow * splits + s) * 2 + 1];
   }
   float gate = qg[int64_t(t) * ldq + h * (2 * kHeadDim) + kHeadDim + d];
   float y = a / L * (1.f / (1.f + __expf(-gate)));
@@ -2107,16 +2362,23 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
   // (local patch: a copy step's chain of 17..32 rows (wide_chain) also runs on the FP8-MMA kernel, in 16-row launches
   // with the same splits, so its rows are bit-identical to those of shorter steps; prompt chunks of 17..32 rows keep
   // the CUDA-core kernel, as shipped)
-  const bool tc = tc_on && !tree && (T <= kT8MaxT || (wide_chain && tc_f8(kv_type) && T <= kCopyMaxT));
+  // Tree attention runs on the FP8-MMA kernel with ancestor bitmask (default ON; Q27_TREE_TC=0 disables).
+  const char* e_ttc = getenv("Q27_TREE_TC");
+  const bool tree_tc = !e_ttc || !*e_ttc || atoi(e_ttc) != 0;
+  const bool tc = tc_on && (tree ? (tree_tc && tc_f8(kv_type) && T <= kDecodeMaxT)
+                                 : (T <= kT8MaxT || (wide_chain && tc_f8(kv_type) && T <= kCopyMaxT)));
   const int tc_splits = getenv("Q27_ATTN_TC_SPLITS") ? atoi(getenv("Q27_ATTN_TC_SPLITS"))
                                                      : std::max(1, g_attn_sms / kKvHeads);
   const int splits = std::min(kDecodeMaxSplits,
                               tc ? tc_splits : std::max(1, int(ceil_div(waves * g_attn_sms, kKvHeads))));
+  // For tiled FP8-MMA (T > 16), combine runs per 16-row tile so workspace holds at most 16 rows (fits 128-row copy).
+  const bool tiled_tc8 = tc && tc_f8(kv_type) && T > kT8MaxT;
+  const int64_t ws_rows = int64_t(tiled_tc8 ? kT8MaxT : T) * kHeads;
   const int64_t rows = int64_t(T) * kHeads;
   DecPartial part;
   part.acc = static_cast<float*>(ws);
-  part.ml = part.acc + rows * splits * kHeadDim;
-  Q27_CHECK(size_t(rows * splits * (kHeadDim + 2)) * 4 <= ws_bytes, "attention_decode: workspace too small");
+  part.ml = part.acc + ws_rows * splits * kHeadDim;
+  Q27_CHECK(size_t(ws_rows * splits * (kHeadDim + 2)) * 4 <= ws_bytes, "attention_decode: workspace too small");
   dim3 grid(kKvHeads, splits);
   if (tc) {
     static bool init = [] {
@@ -2130,25 +2392,34 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
     }();
     (void)init;
     if (tc_f8(kv_type)) {
-      for (int t0 = 0; t0 < T; t0 += kT8MaxT) {  // (one launch for up to 16 rows, as shipped)
+      for (int t0 = 0; t0 < T; t0 += kT8MaxT) {  // (one launch for up to 16 rows, tiled for 17..128)
         const int n = std::min(kT8MaxT, T - t0);
         const dim3 block8(tc8_warps(n) * 32 + (tc8_warps(n) > kT8Grp ? kT8Prod<true> : kTcProd));
         if (kv_type == KvType::NVFP4 && tc8_warps(n) > kT8Grp)
           launch_pdl(attention_tc8_kernel<Fp4Kv, false, true>, grid, block8, kT8Smem<Fp4Kv>, s, q, pos_dev, n,
                      static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), page_table, splits, part,
-                     SeqLanes{}, t0);
+                     SeqLanes{}, t0, tree, tiled_tc8);
         else if (kv_type == KvType::FP8 && tc8_warps(n) > kT8Grp)
           launch_pdl(attention_tc8_kernel<uint8_t, false, true>, grid, block8, kT8Smem<uint8_t>, s, q, pos_dev, n,
                      static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), page_table, splits, part,
-                     SeqLanes{}, t0);
+                     SeqLanes{}, t0, tree, tiled_tc8);
         else if (kv_type == KvType::NVFP4)
           launch_pdl(attention_tc8_kernel<Fp4Kv>, grid, block8, kT8Smem<Fp4Kv>, s, q, pos_dev, n,
                      static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), page_table, splits, part,
-                     SeqLanes{}, t0);
+                     SeqLanes{}, t0, tree, tiled_tc8);
         else
           launch_pdl(attention_tc8_kernel<uint8_t>, grid, block8, kT8Smem<uint8_t>, s, q, pos_dev, n,
                      static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), page_table, splits, part,
-                     SeqLanes{}, t0);
+                     SeqLanes{}, t0, tree, tiled_tc8);
+        if (tiled_tc8) {
+          Q27_CUDA(cudaGetLastError());
+          launch_pdl(attention_combine_kernel<false>, dim3(unsigned(n * kHeads)), dim3(kHeadDim), 0, s, qg, ldq,
+                     pos_dev, splits, min_keys, kTcChunk, part, out, q8, in_scale, tree, SeqLanes{}, q4, sf4, t0);
+        }
+      }
+      if (tiled_tc8) {
+        Q27_CUDA(cudaGetLastError());
+        return;
       }
     } else {
     // Rows t0 .. t0 + n - 1 (at most 8: the launch bounds); more rows take two launches.
@@ -2188,7 +2459,7 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
                prefetch, part, tree);
   Q27_CUDA(cudaGetLastError());
   launch_pdl(attention_combine_kernel<false>, dim3(unsigned(rows)), dim3(kHeadDim), 0, s, qg, ldq, pos_dev, splits,
-             min_keys, tc ? kTcChunk : 0, part, out, q8, in_scale, tree, SeqLanes{}, q4, sf4);
+             min_keys, tc ? kTcChunk : 0, part, out, q8, in_scale, tree, SeqLanes{}, q4, sf4, 0);
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -2253,19 +2524,19 @@ void attention_decode_lanes(const float* q, const float* qg, int ldq, const SeqL
     if (wide && kv_type == KvType::NVFP4)
       launch_pdl(attention_tc8_kernel<Fp4Kv, true, true>, grid, block8, kT8Smem<Fp4Kv>, s, q, lanes.pos, T,
                  static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), lanes.page_table[0], splits, part,
-                 lanes, 0);
+                 lanes, 0, static_cast<const SpecTree*>(nullptr), false);
     else if (wide)
       launch_pdl(attention_tc8_kernel<uint8_t, true, true>, grid, block8, kT8Smem<uint8_t>, s, q, lanes.pos, T,
                  static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), lanes.page_table[0], splits,
-                 part, lanes, 0);
+                 part, lanes, 0, static_cast<const SpecTree*>(nullptr), false);
     else if (kv_type == KvType::NVFP4)
       launch_pdl(attention_tc8_kernel<Fp4Kv, true>, grid, block8, kT8Smem<Fp4Kv>, s, q, lanes.pos, T,
                  static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), lanes.page_table[0], splits, part,
-                 lanes, 0);
+                 lanes, 0, static_cast<const SpecTree*>(nullptr), false);
     else
       launch_pdl(attention_tc8_kernel<uint8_t, true>, grid, block8, kT8Smem<uint8_t>, s, q, lanes.pos, T,
                  static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), lanes.page_table[0], splits,
-                 part, lanes, 0);
+                 part, lanes, 0, static_cast<const SpecTree*>(nullptr), false);
   } else {
     for (int z = 0; z < lanes.n; z++)
       Q27_CHECK(lanes.lr.rows(z) == T && T <= kTcMaxT, "attention_decode_lanes: lanes of different rows need FP8 MMAs");
@@ -2286,7 +2557,7 @@ void attention_decode_lanes(const float* q, const float* qg, int ldq, const SeqL
   }
   Q27_CUDA(cudaGetLastError());
   launch_pdl(attention_combine_kernel<true>, dim3(unsigned(rows)), dim3(kHeadDim), 0, s, qg, ldq, lanes.pos, splits, 0,
-             kTcChunk, part, out, q8, in_scale, static_cast<const SpecTree*>(nullptr), lanes, q4, sf4);
+             kTcChunk, part, out, q8, in_scale, static_cast<const SpecTree*>(nullptr), lanes, q4, sf4, 0);
   Q27_CUDA(cudaGetLastError());
 }
 

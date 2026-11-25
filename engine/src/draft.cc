@@ -169,8 +169,8 @@ Draft::Draft(const std::string& dir, Pool& weights, Pool& act, Pool& host, int m
   }
 
   const int R = max_ctx_rows_;
-  // block rows of a (batched) step; (local patch) at least kTreeMax, a copy step's committed rows (append_ctx)
-  const int B = std::max({block_, batch_row_budget(lanes), int(kTreeMax)});
+  // block rows of a (batched) step; append_ctx chunks > 64 rows in slices of 64 so B stays 64.
+  const int B = std::max({block_, batch_row_budget(lanes), 64});
   auto f32 = [&](const char* what, int64_t n) { return act.add(std::string("draft ") + what, size_t(n) * 4); };
   auto b16 = [&](const char* what, int64_t n) { return act.add(std::string("draft ") + what, size_t(n) * 2); };
   const int BQ = attn_rows(B);
@@ -399,12 +399,12 @@ DLinear rows_of(const DLinear& l, DraftQuant q, int r0, int n) {
 void Draft::propose(const int32_t* block_ids, const int32_t* pos, const bf16* embed, const uint8_t* lm_w,
                     const uint8_t* lm_sf, float lm_in_scale, float lm_alpha, const SpecSampling& smp,
                     const uint64_t* rng, int32_t* ids_out, uint8_t* aq, uint8_t* asf, float* logits, void* ws,
-                    size_t ws_bytes, const Lookup& lk, cudaStream_t s, int rows) {
+                    size_t ws_bytes, const Lookup& lk, cudaStream_t s, int rows, int pos_add, SpecTree* tree_out) {
   if (dspine()) {
     Q27_CHECK(rows <= block_, "draft propose: more rows than the draft's block");
     propose_dspine(LaneRows::one(rows > 0 ? rows : block_), DraftLanes{1, pos, {ring_k_}, {ring_v_}}, block_ids, embed,
-                   lm_w, lm_sf, lm_in_scale, lm_alpha, &smp, nullptr, rng, ids_out, choice.tree, aq, asf, logits, ws,
-                   ws_bytes, s);
+                   lm_w, lm_sf, lm_in_scale, lm_alpha, &smp, nullptr, rng, ids_out, tree_out ? tree_out : choice.tree,
+                   aq, asf, logits, ws, ws_bytes, s, pos_add);
     return;
   }
   constexpr int T = kBlock;
@@ -520,18 +520,21 @@ void Draft::append_ctx(const bf16* cap, int rows, const int32_t* pos, int pos_ad
   if (rows == 0) return;
   Q27_CHECK(rows <= max_ctx_rows_, "draft append_ctx: too many rows");
   const ActOut ao = act();
-  // (local patch: a copy step's committed rows, up to 32 with their commit path, take the decode path too)
-  if (rows <= block_ || (rowmap && rows <= kTreeMax && rows <= max_ctx_rows_)) {  // decode step: skinny GEMMs on the draft's format
-    dmark("dctx_fc");
-    draft_quant_rows(cap, rows, kCtxFeatures * kHidden, ao, s, rowmap);
-    gemm(rows, fc_, ctx_, ws, ws_bytes, s);
-    draft_norm(ctx_, hidden_norm_, rows, nullptr, ao, nullptr, s);
-    dmark("dctx_qkv");
-    for (int l = 0; l < kLayers; l++) {
-      const auto& L = layers_[l];
-      gemm(rows, rows_of(L.qkv, quant_, kHeads * kHeadDim, 2 * kKvHeads * kHeadDim), kv_, ws, ws_bytes, s);
-      draft_ctx_write(kv_, rows, L.k_norm, pos, pos_add, n_dev, ring_k_ + ring_bytes_ / 2 * l,
-                      ring_v_ + ring_bytes_ / 2 * l, s, window_);
+  // Decode / copy step's committed rows (up to kTreeMax = 128) run on skinny GEMMs in <= 64-row slices.
+  if (rows <= block_ || (rowmap && rows <= kTreeMax && rows <= max_ctx_rows_)) {
+    for (int off = 0; off < rows; off += 64) {
+      const int chunk_r = std::min(64, rows - off);
+      dmark("dctx_fc");
+      draft_quant_rows(cap, chunk_r, kCtxFeatures * kHidden, ao, s, rowmap ? rowmap + off : nullptr);
+      gemm(chunk_r, fc_, ctx_, ws, ws_bytes, s);
+      draft_norm(ctx_, hidden_norm_, chunk_r, nullptr, ao, nullptr, s);
+      dmark("dctx_qkv");
+      for (int l = 0; l < kLayers; l++) {
+        const auto& L = layers_[l];
+        gemm(chunk_r, rows_of(L.qkv, quant_, kHeads * kHeadDim, 2 * kKvHeads * kHeadDim), kv_, ws, ws_bytes, s);
+        draft_ctx_write(kv_, chunk_r, L.k_norm, pos, pos_add, n_dev, ring_k_ + ring_bytes_ / 2 * l,
+                        ring_v_ + ring_bytes_ / 2 * l, s, window_, off);
+      }
     }
     return;
   }
@@ -582,7 +585,7 @@ void Draft::propose_dspine(const LaneRows& lr, const DraftLanes& lanes, const in
                            const uint8_t* lm_w, const uint8_t* lm_sf, float lm_in_scale, float lm_alpha,
                            const SpecSampling* smp, const SelectLanes* sl, const uint64_t* rng, int32_t* ids_out,
                            SpecTree* trees, uint8_t* aq, uint8_t* asf, float* logits, void* ws, size_t ws_bytes,
-                           cudaStream_t s) {
+                           cudaStream_t s, int pos_add) {
   const int R = lr.total(), T = lr.rows(0), nd = T - 1;  // (T, nd: one block's)
   const bool batched = sl != nullptr;
   const ActOut ao = act();
@@ -599,9 +602,9 @@ void Draft::propose_dspine(const LaneRows& lr, const DraftLanes& lanes, const in
       draft_qk_prep_lanes(lanes, qkv_, L.q_norm, L.k_norm, q_, kb_, vb_, s);
       draft_attention_lanes(ring_layer(lanes, ring_bytes_ / 2, l), q_, kb_, vb_, part_, o32_, s, window_, true);
     } else {
-      draft_qk_prep(qkv_, L.q_norm, L.k_norm, lanes.pos, q_, kb_, vb_, s, T);
+      draft_qk_prep(qkv_, L.q_norm, L.k_norm, lanes.pos, q_, kb_, vb_, s, T, pos_add);
       draft_attention(q_, kb_, vb_, ring_k_ + ring_bytes_ / 2 * l, ring_v_ + ring_bytes_ / 2 * l, lanes.pos, part_, o32_,
-                      s, T, window_, true);
+                      s, T, window_, true, pos_add);
     }
     dmark("d_o");
     draft_quant_rows(o32_, R, kHeads * kHeadDim, ao, s);

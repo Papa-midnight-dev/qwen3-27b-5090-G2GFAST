@@ -257,7 +257,7 @@ __device__ __forceinline__ float head_norm_rope(float x, const bf16* w, int pos,
 template <bool kBatch = false>
 __global__ void __launch_bounds__(kHeadDim) qk_prep_kernel(const float* qkv, const bf16* q_norm, const bf16* k_norm,
                                                            const int32_t* pos_dev, float* q, float* kb, float* vb,
-                                                           LaneRows lr_in) {
+                                                           LaneRows lr_in, int pos_add = 0) {
   pdl_trigger();
   __shared__ float xs[kHeadDim], red[4];
   const int t = blockIdx.x, slot = blockIdx.y, d = threadIdx.x;
@@ -267,7 +267,7 @@ __global__ void __launch_bounds__(kHeadDim) qk_prep_kernel(const float* qkv, con
     const int z = lr.lane(t);
     pos = pos_dev[z] + t - lr.first(z);
   } else {
-    pos = *pos_dev + t;
+    pos = *pos_dev + pos_add + t;
   }
   pdl_wait();
   const bool is_q = slot < kHeads;
@@ -391,7 +391,8 @@ __device__ __forceinline__ uint32_t pack_bf16x2(float a, float b) {
 template <bool kBatch = false, int kT = kBlock>
 __global__ void __launch_bounds__(kT * 8) attn_tc_kernel(const float* q, const float* kb, const float* vb,
                                                          const bf16* ring_k, const bf16* ring_v, const int32_t* pos_dev,
-                                                         float* part, DraftLanes lanes, int window, bool causal) {
+                                                         float* part, DraftLanes lanes, int window, bool causal,
+                                                         int pos_add = 0) {
   pdl_trigger();
   int tn = kT, tk = kT;  // rows written, block keys
   if constexpr (kBatch) {
@@ -413,7 +414,7 @@ __global__ void __launch_bounds__(kT * 8) attn_tc_kernel(const float* q, const f
   const int nch = k1 > k0 ? (k1 - k0 + kTcKeys - 1) / kTcKeys : 0;
   // The lane's rows: R0 = 16 w + r0 and R1 = R0 + 8 (tokens t0, t1).
   const int R0 = 16 * warp + r0, R1 = R0 + 8, t0 = R0 / 4, t1 = R1 / 4;
-  const int lo0 = pos + t0 - (window - 1), lo1 = pos + t1 - (window - 1);
+  const int lo0 = pos + pos_add + t0 - (window - 1), lo1 = pos + pos_add + t1 - (window - 1);
   pdl_wait();
   const float scale = rsqrtf(float(kHeadDim));
   uint32_t qa[kHeadDim / 16][4];
@@ -686,7 +687,7 @@ template <bool kBatch = false>
 __global__ void __launch_bounds__(kHeadDim) ctx_write_kernel(const float* kv, const bf16* k_norm,
                                                              const int32_t* pos_dev, int pos_add,
                                                              const int32_t* n_dev, bf16* ring_k, bf16* ring_v,
-                                                             DraftLanes lanes, int window) {
+                                                             DraftLanes lanes, int window, int row_off = 0) {
   pdl_trigger();
   __shared__ float xs[kHeadDim], red[4];
   const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
@@ -699,8 +700,8 @@ __global__ void __launch_bounds__(kHeadDim) ctx_write_kernel(const float* kv, co
     ring_k = const_cast<bf16*>(lane_sel(lanes.ring_k, z)), ring_v = const_cast<bf16*>(lane_sel(lanes.ring_v, z));
   }
   pdl_wait();
-  if (n_dev && rl >= *n_dev) return;
-  const int pos = *pos_dev + pos_add + rl;
+  if (n_dev && row_off + rl >= *n_dev) return;
+  const int pos = *pos_dev + pos_add + row_off + rl;
   const float* row = kv + int64_t(r) * 2 * kKvHeads * kHeadDim;
   const float x = head_norm_rope(row[h * kHeadDim + d], k_norm, pos, xs, red);
   const int64_t idx = (int64_t(pos % (window + kRingPad)) * kKvHeads + h) * kHeadDim + d;
@@ -794,6 +795,12 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
   // the paths are the smp.paths best of a beam search (one path: the argmax walk).
   SpecTree* tr = choice.tree;
   const int K = max(1, min(smp.paths, kTreePaths));
+  const bool use_bftree = kPre && !kBatch && smp.bftree > 0 && (smp.temperature <= 0.f || smp.bftree >= 2);
+  const int bf_budget = min(kSpecBlock, max(2, smp.bftree_nodes > 0 ? smp.bftree_nodes : nd + 1));
+  if (use_bftree)
+    nrows = bf_budget;
+  else if (!kBatch && K == 1)
+    nrows = nd + 1;
   __shared__ int8_t child[kTreeMax][kSelK];
   __shared__ int n_nodes;
   if (lane == 0) {
@@ -802,9 +809,11 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
     tr->depth[0] = 0;
     tr->path[0][0] = 0;
     tr->cidx[0] = 0;
-    for (int i = 0; i < kTreeMax; i++) tr->ndraws[i] = 0, tr->owner[i] = -1;
+    tr->dfs_n = 0;
+    for (int i = 0; i < nrows; i++) tr->ndraws[i] = 0, tr->owner[i] = -1;
   }
-  for (int i = lane; i < kTreeMax * kSelK; i += 32) child[i / kSelK][i % kSelK] = -1;
+  const int child_rows = nrows;
+  for (int i = lane; i < child_rows * kSelK; i += 32) child[i / kSelK][i % kSelK] = -1;
   __syncwarp();
   // Node of `parent` for candidate idx at position e (created when new); lane 0 only.
   auto node_of = [&](int parent, int idx, int e, float q_lane0_unused) {
@@ -854,7 +863,176 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
     for (int j = 0; j < e; j++) c += ptok[j] == t;
     return (c ? smp.pen.presence + smp.pen.frequency * float(c) : 0.f) - bias;
   };
-  if (smp.temperature > 0.f || K == 1) {
+  // Heavy-child-last DFS schedule for arbitrary trees (n <= 16 -> <= 3 live GDN snapshots); lane 0 only.
+  auto build_dfs = [&](int n) {
+    int8_t ch[kSpecBlock][kSpecBlock], nch[kSpecBlock], sz[kSpecBlock];
+    for (int u = 0; u < n; u++) nch[u] = 0, sz[u] = 1;
+    for (int v = 1; v < n; v++) {
+      const int p = tr->path[v][tr->depth[v] - 1];
+      ch[p][nch[p]++] = int8_t(v);
+    }
+    for (int u = n - 1; u >= 0; u--) {
+      for (int i = 0; i < nch[u]; i++) sz[u] = int8_t(sz[u] + sz[ch[u][i]]);
+      // Insertion sort children by descending subtree size (heaviest child first -> visited LAST).
+      for (int i = 1; i < nch[u]; i++) {
+        int8_t key = ch[u][i];
+        int j = i - 1;
+        while (j >= 0 && sz[ch[u][j]] < sz[key]) ch[u][j + 1] = ch[u][j], j--;
+        ch[u][j + 1] = key;
+      }
+    }
+    int8_t st_node[kSpecBlock], st_pop[kSpecBlock], st_free[kSpecBlock];
+    int sp = 0, out_n = 0;
+    unsigned live = 0u;
+    st_node[sp] = 0, st_pop[sp] = -1, st_free[sp] = 0, sp++;
+    while (sp > 0) {
+      sp--;
+      const int u = st_node[sp], pop = st_pop[sp], fr = st_free[sp];
+      tr->dfs_order[out_n] = int8_t(u);
+      tr->dfs_pop[out_n] = int8_t(pop);
+      if (fr && pop >= 0) live &= ~(1u << pop);
+      if (nch[u] == 0) {
+        tr->dfs_push[out_n] = -1;
+      } else if (nch[u] == 1) {
+        tr->dfs_push[out_n] = -1;
+        st_node[sp] = ch[u][0], st_pop[sp] = -1, st_free[sp] = 0, sp++;
+      } else {
+        int slot = 0;
+        while ((live >> slot) & 1u) slot++;
+        live |= (1u << slot);
+        tr->dfs_push[out_n] = int8_t(slot);
+        // Push heaviest first (visited LAST -> restores & frees slot).
+        st_node[sp] = ch[u][0], st_pop[sp] = int8_t(slot), st_free[sp] = 1, sp++;
+        // Push remaining children (last pushed is visited FIRST -> continues directly from current S).
+        for (int i = 1; i < nch[u]; i++) {
+          const bool first_vis = (i == nch[u] - 1);
+          st_node[sp] = ch[u][i], st_pop[sp] = first_vis ? int8_t(-1) : int8_t(slot), st_free[sp] = 0, sp++;
+        }
+      }
+      out_n++;
+    }
+    tr->dfs_n = int8_t(out_n);
+  };
+  if (use_bftree && smp.temperature <= 0.f) {
+    // Greedy Best-First Exact Probability Tree from DSpine's 16x16 lattice (100% bit-identical to plain greedy).
+    __shared__ float bf_node_lp[kSpecBlock], bf_child_lp[kSpecBlock][kSelK];
+    const float inv_t = 1.f / fmaxf(smp.bftree_temp, 0.05f);
+    auto fill_node = [&](int u) {
+      const int e = tr->depth[u];
+      if (e >= nd) {
+        if (lane < kSelK) bf_child_lp[u][lane] = -INFINITY;
+        return;
+      }
+      int32_t ptok[kMaxDraft];
+      if (pen)
+        for (int i = 0; i < e; i++) ptok[i] = tr->tok[tr->path[u][i + 1]];
+      const float sc = (row(e, e == 0 ? 0 : tr->cidx[u]) - penalty(e, ptok)) * inv_t;
+      float mx = sc;
+      for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+      const float ex = lane < kSelK ? expf(sc - mx) : 0.f;
+      float sum = ex;
+      for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+      if (lane < kSelK) bf_child_lp[u][lane] = bf_node_lp[u] + (sc - mx) - logf(sum);
+    };
+    if (lane == 0) bf_node_lp[0] = 0.f;
+    __syncwarp();
+    fill_node(0);
+    __syncwarp();
+    for (int step = 1; step < bf_budget; step++) {
+      const int cur_n = n_nodes;
+      float best_v = -INFINITY;
+      int best_i = -1;
+      for (int i = lane; i < cur_n * kSelK; i += 32) {
+        const float v = bf_child_lp[i / kSelK][i % kSelK];
+        if (v > best_v || (v == best_v && v > -INFINITY && (best_i < 0 || i < best_i))) best_v = v, best_i = i;
+      }
+      for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, best_v, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, best_i, o);
+        if (ov > best_v || (ov == best_v && ov > -INFINITY && oi >= 0 && (best_i < 0 || oi < best_i)))
+          best_v = ov, best_i = oi;
+      }
+      int new_c = -1;
+      if (lane == 0 && best_i >= 0 && best_v > -1e29f) {
+        const int u = best_i / kSelK, idx = best_i % kSelK;
+        new_c = node_of(u, idx, tr->depth[u], 0.f);
+        tr->draws[u][tr->ndraws[u]++] = int8_t(new_c);
+        bf_node_lp[new_c] = best_v;
+        bf_child_lp[u][idx] = -INFINITY;
+      }
+      new_c = __shfl_sync(0xffffffffu, new_c, 0);
+      if (new_c < 0) break;
+      __syncwarp();
+      fill_node(new_c);
+      __syncwarp();
+    }
+    for (int i = lane; i < bf_budget * kSelK; i += 32) tr->q[i / kSelK][i % kSelK] = 0.f;
+    __syncwarp();
+    if (lane == 0) build_dfs(n_nodes);
+  } else if (use_bftree && smp.temperature > 0.f) {
+    // Budget-capped exact lossless level-by-level stochastic tree (<= bf_budget nodes, K=4 walks).
+    // At every node u, the number of draws mdraw = min(walks_at[u], B - n_nodes) depends ONLY on earlier
+    // depths and earlier siblings, NEVER on draws at u, so draws at u are strictly i.i.d. from q[u].
+    constexpr int kSK = kTreePaths;
+    __shared__ int8_t w_node[kSK];
+    __shared__ int8_t done_mark[kSpecBlock];
+    if (lane < kSK) w_node[lane] = 0;
+    __syncwarp();
+    for (int e = 0; e < nd; e++) {
+      if (lane < bf_budget) done_mark[lane] = 0;
+      __syncwarp();
+      for (int k0 = 0; k0 < kSK; k0++) {
+        int u = -1, mdraw = 0;
+        int ws[kSK], m = 0;
+        if (lane == 0) {
+          const int cand_u = w_node[k0];
+          if (cand_u >= 0 && !done_mark[cand_u]) {
+            done_mark[cand_u] = 1;
+            u = cand_u;
+            for (int k = k0; k < kSK; k++)
+              if (w_node[k] == cand_u) ws[m++] = k;
+            mdraw = min(m, bf_budget - n_nodes);
+            for (int j = mdraw; j < m; j++) w_node[ws[j]] = -1;
+          }
+        }
+        u = __shfl_sync(0xffffffffu, u, 0);
+        mdraw = __shfl_sync(0xffffffffu, mdraw, 0);
+        if (u < 0 || mdraw <= 0) continue;
+        int32_t ptok[kMaxDraft];
+        if (pen)
+          for (int i = 0; i < e; i++) ptok[i] = tr->tok[tr->path[u][i + 1]];
+        const float sc = row(e, e == 0 ? 0 : tr->cidx[u]) - penalty(e, ptok);
+        const float x = sc / smp.temperature;
+        float mx = x;
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+        const float ex = lane < kSelK ? expf(x - mx) : 0.f;
+        float sum = ex;
+        for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+        const float prob = ex / sum;
+        if (lane < kSelK) tr->q[u][lane] = prob;
+        float cum = prob;
+        for (int o = 1; o < 32; o <<= 1) {
+          const float y = __shfl_up_sync(0xffffffffu, cum, o);
+          if (lane >= o) cum += y;
+        }
+        for (int j = 0; j < mdraw; j++) {
+          const int wk = __shfl_sync(0xffffffffu, lane == 0 ? ws[j] : 0, 0);
+          const float u_rng = rng_uniform(rng, 0x20000000u + 16 * wk + e);
+          const unsigned below = __ballot_sync(0xffffffffu, lane < kSelK && u_rng >= cum);
+          const int idx = min(__popc(below), kSelK - 1);
+          if (lane == 0) {
+            const int c = node_of(u, idx, e, 0.f);
+            tr->draws[u][tr->ndraws[u]++] = int8_t(c);
+            w_node[wk] = int8_t(c);
+          }
+          __syncwarp();
+        }
+      }
+      if (n_nodes >= bf_budget) break;
+    }
+    __syncwarp();
+    if (lane == 0) build_dfs(n_nodes);
+  } else if (smp.temperature > 0.f || K == 1) {
     for (int k = 0; k < K; k++) {
       int node = 0, prev = 0;
       int32_t ptok[kMaxDraft];
@@ -964,13 +1142,18 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
   if (lane == 0) {
     const int n = n_nodes;
     tr->n = n;
-    tr->npaths = K;
-    for (int p = 0; p < K; p++)  // owner: the first path through the node
-      for (int i = 0; i <= tr->depth[tr->leaf[p]]; i++) {
-        const int nd = tr->path[tr->leaf[p]][i];
-        if (tr->owner[nd] < 0) tr->owner[nd] = int8_t(p);
-      }
-    for (int t = n; t < kTreeMax; t++) {  // padding rows: depth-0 copies of the anchor
+    tr->npaths = use_bftree ? 2 : K;
+    if (!use_bftree) {
+      for (int p = 0; p < K; p++)  // owner: the first path through the node
+        for (int i = 0; i <= tr->depth[tr->leaf[p]]; i++) {
+          const int nd = tr->path[tr->leaf[p]][i];
+          if (tr->owner[nd] < 0) tr->owner[nd] = int8_t(p);
+        }
+    } else {
+      tr->leaf[0] = int8_t(n - 1);
+    }
+    const int pad_lim = nrows;
+    for (int t = n; t < pad_lim; t++) {  // padding rows: depth-0 copies of the anchor
       tr->tok[t] = tr->tok[0];
       tr->depth[t] = 0;
       tr->path[t][0] = int8_t(t);
@@ -1253,6 +1436,32 @@ __global__ void __launch_bounds__(kNormThreads) dspine_table_kernel(DsGeo geo_in
   }
 }
 
+__global__ void rollout_prep_kernel(const int32_t* ids_ver, int off, int mask_id, int rows, int32_t* block_ids2) {
+  pdl_trigger();
+  pdl_wait();
+  const int t = threadIdx.x;
+  if (t < rows) block_ids2[t] = t == 0 ? ids_ver[off] : mask_id;
+}
+
+__global__ void rollout_stitch_kernel(const int32_t* ids_ver, int off, int nd2, SpecTree* tr) {
+  pdl_trigger();
+  pdl_wait();
+  if (threadIdx.x != 0) return;
+  const int W = off + nd2 + 1;
+  tr->n = W;
+  tr->npaths = 1;
+  tr->dfs_n = 0;
+  for (int i = off; i < W; i++) {
+    tr->tok[i] = ids_ver[i];
+    tr->depth[i] = int8_t(i);
+    tr->owner[i] = 0;
+    tr->cidx[i] = -1;
+    tr->ndraws[i] = i + 1 < W ? 1 : 0;
+    if (i + 1 < W) tr->draws[i][0] = int8_t(i + 1);
+  }
+  tr->leaf[0] = int8_t(W - 1);
+}
+
 __global__ void round_bf16_kernel(const float* x, int64_t n, bf16* out) {
   const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i < n) out[i] = __float2bfloat16(x[i]);
@@ -1276,30 +1485,41 @@ void draft_conv_out_norm(const float* y, const float* coef, const bf16* base, in
 }
 
 void draft_qk_prep(const float* qkv, const bf16* q_norm, const bf16* k_norm, const int32_t* pos, float* q, float* kb,
-                   float* vb, cudaStream_t s, int T) {
+                   float* vb, cudaStream_t s, int T, int pos_add) {
   launch_pdl(qk_prep_kernel<false>, dim3(T, kHeads + kKvHeads), dim3(kHeadDim), 0, s, qkv, q_norm, k_norm, pos, q, kb,
-             vb, LaneRows{});
+             vb, LaneRows{}, pos_add);
   Q27_CUDA(cudaGetLastError());
 }
 
 size_t draft_attention_part_floats(int rows) { return size_t(rows) * kHeads * kAttnSplits * kPart; }
 
 void draft_attention(const float* q, const float* kb, const float* vb, const bf16* ring_k, const bf16* ring_v,
-                     const int32_t* pos, float* part, float* out, cudaStream_t s, int T, int window, bool causal) {
+                     const int32_t* pos, float* part, float* out, cudaStream_t s, int T, int window, bool causal,
+                     int pos_add) {
   // Blocks of other sizes (DSpine, causal) run on the kernel of the next size: the rows past T compute values nobody
   // reads, and their keys are masked for the real rows (finite: the buffers are zeroed at bind).
   Q27_CHECK(T >= 2 && T <= kMaxBlock && (causal || T == kBlock), "draft_attention: 2..16 rows (causal), or 8");
   if (T > kBlock)
     launch_pdl(attn_tc_kernel<false, kMaxBlock>, dim3(kKvHeads, kAttnSplits), dim3(kMaxBlock * 8), 0, s, q, kb, vb,
-               ring_k, ring_v, pos, part, DraftLanes{}, window, causal);
-  else if (draft_attn_tc() || window != kWindow || causal)
+               ring_k, ring_v, pos, part, DraftLanes{}, window, causal, pos_add);
+  else if (draft_attn_tc() || window != kWindow || causal || pos_add != 0)
     launch_pdl(attn_tc_kernel<false>, dim3(kKvHeads, kAttnSplits), dim3(64), 0, s, q, kb, vb, ring_k, ring_v, pos, part,
-               DraftLanes{}, window, causal);
+               DraftLanes{}, window, causal, pos_add);
   else
     launch_pdl(attn_kernel<false>, dim3(kKvHeads, kAttnSplits), dim3(kBlock * 32), 0, s, q, kb, vb, ring_k, ring_v, pos,
                part, DraftLanes{});
   Q27_CUDA(cudaGetLastError());
   launch_pdl(attn_combine_kernel, dim3(T * kHeads), dim3(kHeadDim), 0, s, static_cast<const float*>(part), out);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void draft_rollout_prep(const int32_t* ids_ver, int off, int mask_id, int rows, int32_t* block_ids2, cudaStream_t s) {
+  launch_pdl(rollout_prep_kernel, dim3(1), dim3(32), 0, s, ids_ver, off, mask_id, rows, block_ids2);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void draft_rollout_stitch(const int32_t* ids_ver, int off, int nd2, SpecTree* tree, cudaStream_t s) {
+  launch_pdl(rollout_stitch_kernel, dim3(1), dim3(32), 0, s, ids_ver, off, nd2, tree);
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -1344,10 +1564,10 @@ void draft_dequant_weight(const DLinear& l, DraftQuant fmt, int row0, int n, bf1
 }
 
 void draft_ctx_write(const float* kv, int rows, const bf16* k_norm, const int32_t* pos, int pos_add,
-                     const int32_t* n_dev, bf16* ring_k, bf16* ring_v, cudaStream_t s, int window) {
+                     const int32_t* n_dev, bf16* ring_k, bf16* ring_v, cudaStream_t s, int window, int row_off) {
   if (rows == 0) return;
   launch_pdl(ctx_write_kernel<false>, dim3(rows, kKvHeads), dim3(kHeadDim), 0, s, kv, k_norm, pos, pos_add, n_dev,
-             ring_k, ring_v, DraftLanes{}, window);
+             ring_k, ring_v, DraftLanes{}, window, row_off);
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -1363,7 +1583,7 @@ void draft_select(const float* cand_v, const int32_t* cand_i, const float* hp, c
 void draft_qk_prep_lanes(const DraftLanes& lanes, const float* qkv, const bf16* q_norm, const bf16* k_norm, float* q,
                          float* kb, float* vb, cudaStream_t s) {
   launch_pdl(qk_prep_kernel<true>, dim3(lanes.lr.total(), kHeads + kKvHeads), dim3(kHeadDim), 0, s, qkv, q_norm, k_norm,
-             lanes.pos, q, kb, vb, lanes.lr);
+             lanes.pos, q, kb, vb, lanes.lr, 0);
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -1375,10 +1595,10 @@ void draft_attention_lanes(const DraftLanes& lanes, const float* q, const float*
   for (int z = 0; z < lanes.n; z++) Q27_CHECK(causal || lanes.lr.rows(z) == kBlock, "draft_attention_lanes: 8 rows");
   if (T > kBlock)
     launch_pdl(attn_tc_kernel<true, kMaxBlock>, dim3(kKvHeads, kAttnSplits, lanes.n), dim3(kMaxBlock * 8), 0, s, q, kb,
-               vb, lanes.ring_k[0], lanes.ring_v[0], lanes.pos, part, lanes, window, causal);
+               vb, lanes.ring_k[0], lanes.ring_v[0], lanes.pos, part, lanes, window, causal, 0);
   else if (draft_attn_tc() || window != kWindow || causal)
     launch_pdl(attn_tc_kernel<true>, dim3(kKvHeads, kAttnSplits, lanes.n), dim3(64), 0, s, q, kb, vb, lanes.ring_k[0],
-               lanes.ring_v[0], lanes.pos, part, lanes, window, causal);
+               lanes.ring_v[0], lanes.pos, part, lanes, window, causal, 0);
   else
     launch_pdl(attn_kernel<true>, dim3(kKvHeads, kAttnSplits, lanes.n), dim3(kBlock * 32), 0, s, q, kb, vb,
                lanes.ring_k[0], lanes.ring_v[0], lanes.pos, part, lanes);
@@ -1391,7 +1611,7 @@ void draft_attention_lanes(const DraftLanes& lanes, const float* q, const float*
 void draft_ctx_write_lanes(const DraftLanes& lanes, const float* kv, const bf16* k_norm, const int32_t* n_dev,
                            cudaStream_t s, int window) {
   launch_pdl(ctx_write_kernel<true>, dim3(lanes.lr.total(), kKvHeads), dim3(kHeadDim), 0, s, kv, k_norm, lanes.pos, 0,
-             n_dev, const_cast<bf16*>(lanes.ring_k[0]), const_cast<bf16*>(lanes.ring_v[0]), lanes, window);
+             n_dev, const_cast<bf16*>(lanes.ring_k[0]), const_cast<bf16*>(lanes.ring_v[0]), lanes, window, 0);
   Q27_CUDA(cudaGetLastError());
 }
 

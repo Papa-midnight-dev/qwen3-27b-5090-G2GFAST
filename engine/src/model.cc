@@ -94,18 +94,19 @@ Model::Model(const Options& opt) : opt_(opt) {
   // Lanes of a batched step (P6-10; MAX_SEQS with a draft model).
   const int lanes = spec && opt.park_slots > 0 ? std::min(kMaxLanes, opt.park_slots + 1) : 1;
   if (spec) {
-    rep_rows_ = std::max(kVerifyMaxT, batch_row_budget(lanes));
+    const int copy_env = getenv("Q27_COPY_ROWS") && *getenv("Q27_COPY_ROWS") ? atoi(getenv("Q27_COPY_ROWS")) : 32;
+    rep_rows_ = std::max(copy_env > 64 ? kVerifyMaxT : 64, batch_row_budget(lanes));
     o_rep = state_.add("gdn verify inputs", 2 * kGdnLayers * rep_rows_ * kRepTokenFloats * sizeof(float));
     o_par = state_.add("spec parity", 4);
     o_nc = state_.add("spec commit count", 4);
     o_bud = state_.add("spec token budget", 4);
     o_rng = state_.add("spec rng", 16);
     o_idv = state_.add("spec verify ids", kTreeMax * 4);
-    o_tree = state_.add("spec tree", sizeof(SpecTree));
-    o_cpath = state_.add("spec commit path", kTreeMax * 4);  // (local patch: a copy step commits up to 32)
+    o_tree = state_.add("spec tree", 2 * sizeof(SpecTree));  // [0]: active tree, [1]: rollout scratch
+    o_cpath = state_.add("spec commit path", kTreeMax * 4);
     o_sbuf = state_.add("gdn state buffer", 4);
     o_kvl = state_.add("kv layer table", kAttnLayers * sizeof(KvLayer));
-    o_blk = state_.add("spec block ids", kSpecBlock * 4);
+    o_blk = state_.add("spec block ids", 2 * kSpecBlock * 4);  // [0..15]: block 1, [16..31]: rollout block 2
     o_hist = state_.add("token history", size_t(max_pages_) * kPageTokens * 4);
     o_lk = state_.add("lookup match", 4);
   }
@@ -432,13 +433,19 @@ void Model::configure() {
   // sampled single sequence verifies this many walks merged into a trie while its width is at most 8 rows, the
   // layout the trees' random numbers and rows use. 1: chains only (0.8.1 as shipped).
   adapt_paths_ = std::clamp(env_int("Q27_SPEC_ADAPT_PATHS", 1), 1, kTreePaths);
+  bftree_on_ = draft_ && draft_->dspine() ? std::clamp(env_int("Q27_SPEC_BFTREE", 0), 0, 2) : 0;
+  bftree_nodes_ = env_int("Q27_BFTREE_NODES", 0);
+  if (bftree_nodes_ > 0 && draft_) bftree_nodes_ = std::clamp(bftree_nodes_, 2, draft_->block());
+  bftree_temp_ = env_f("Q27_BFTREE_TEMP", 1.f);
+  rollout_on_ = draft_ && draft_->dspine() ? std::clamp(env_int("Q27_SPEC_ROLLOUT", 1), 1, 2) : 1;
+  rollout_thresh_ = env_f("Q27_ROLLOUT_THRESH", 13.f);
   // Copy steps (local patch, 25 Nov 2026): a greedy single sequence that is copying an earlier span (an edit, a rewrite)
   // gets its chain from that span instead of from the draft model. 0: off (0.8.1 as shipped).
   copy_on_ = draft_ && draft_->dspine() && env_int("Q27_COPY", 0) != 0;
   copy_min_ = std::clamp(env_int("Q27_COPY_MIN", 16), 4, 64);
-  {  // (research patch: 64 rows too)
+  {  // (16, 32, 64, or 128 rows; 128 requires rep_rows_ >= 128)
     const int r = env_int("Q27_COPY_ROWS", 32);
-    copy_rows_ = r > 32 ? kCopyMaxT : r > kSpecBlock ? 32 : kSpecBlock;
+    copy_rows_ = (r > 64 && rep_rows_ >= kCopyMaxT) ? kCopyMaxT : r > 32 ? 64 : r > kSpecBlock ? 32 : kSpecBlock;
   }
   // (32 rows only where a 32-row verify runs on the same FP8-MMA attention as decode: FP8 / NVFP4 KV, tensor cores on)
   if ((opt_.kv_type != KvType::FP8 && opt_.kv_type != KvType::NVFP4) || env_int("Q27_ATTN_TC", 1) == 0 ||
@@ -972,7 +979,8 @@ void Model::gemm_q(const char* what, const LinearFp4& l, int T, float* out, bool
     gemm_fp4(T, N, K, q1, sf1, l.w, l.sf, l.alpha.alpha[0], out, 1.f, out, s_);
     return;
   }
-  if (T <= kSkinnyMaxM && skinny_) {
+  const int skinny_lim = (verify_ && copy_verify_) ? kCopyMaxT : kSkinnyMaxM;
+  if (T <= skinny_lim && skinny_) {
     auto run = [&] {
       skinny_fp4(T, l.out, l.in, aq_, asf_, l.w, l.sf, l.alpha, c, beta, out, skinny_ws_, kSkinnyWsBytes, s_);
     };
@@ -1209,8 +1217,8 @@ void Model::mlp(int i, int T) {
     mark("mlp silu+quant");
     a2_row_ = 0;
     if (!skip("silu")) silu_mul_quant_fp4_glu(gu, T, kInter, ag, au, L.down.in_scale, aq_, asf_, s_);
-  } else if (mlp_fused_ && !act_a4x2_ && T <= kSkinnyMaxM && skinny_ && !skinny_check_ && !skip("gemm") &&
-             !skip("gemm4") && !skip("silu")) {
+  } else if (mlp_fused_ && !act_a4x2_ && T <= (verify_ && copy_verify_ ? kCopyMaxT : kSkinnyMaxM) && skinny_ &&
+             !skinny_check_ && !skip("gemm") && !skip("gemm4") && !skip("silu")) {
     auto* q = reinterpret_cast<uint8_t*>(big1_);
     auto* qsf = reinterpret_cast<uint8_t*>(big2_);
     mark("mlp gate_up+silu");
@@ -1729,6 +1737,8 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
   if (spec_smp_.masked) spec_smp_.paths = 1;  // (the host masks a chain's rows)
   // The full block first; the average starts between the thresholds.
   spec_smp_.block = spec_smp_.block_next = spec_smp_.block_due = draft_->block();
+  spec_smp_.rollout = spec_smp_.rollout_next = spec_smp_.rollout_due = 1;
+  spec_smp_.bftree = 0, spec_smp_.bftree_nodes = 0, spec_smp_.bftree_temp = bftree_temp_;
   spec_smp_.accept_ema = 0.5f * (adapt_up_ + adapt_down_);
   spec_smp_.lane_rows = std::min(ddims::kBlock, draft_->block()), spec_smp_.lane_ema = 4.25f, spec_smp_.lane_seen = 0;
   return first;
@@ -1741,11 +1751,13 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
   smp.pen.counts = smp.penalized() ? pen_ : nullptr;
   smp.bias = smp.biased ? bias_list() : nullptr;
   const auto& lm = w_.lm_head;
+  const int W = spec_rows(smp);
+  const bool is_tree = smp.paths > 1 || bftree_of(smp);
   if (part != 2) {
     if (smp.copy) {  // (local patch: the host's chain from the copied span; the draft model does not run)
       mark("copy");
       Q27_CUDA(cudaMemcpyAsync(tree_, copy_tree_host_, sizeof(SpecTree), cudaMemcpyHostToDevice, s_));
-      Q27_CUDA(cudaMemcpyAsync(ids_ver_ + 1, copy_ids_host_ + 1, size_t(spec_rows(smp) - 1) * sizeof(int32_t),
+      Q27_CUDA(cudaMemcpyAsync(ids_ver_ + 1, copy_ids_host_ + 1, size_t(W - 1) * sizeof(int32_t),
                                cudaMemcpyHostToDevice, s_));
       Q27_CUDA(cudaMemcpyAsync(draft_->choice.src, copy_ids_host_ + kTreeMax, sizeof(int32_t), cudaMemcpyHostToDevice, s_));
     } else {
@@ -1754,19 +1766,31 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
     mark("lookup");
     if (lk.on) spec_lookup(lk, ids_ver_, s_);
     mark("draft");
-    const int rows = std::max(spec_block_of(smp), spec_draft_rows_);
-    if (!skip("draft"))  // (Q27_SKIP=draft: timing only, the step verifies the previous step's tokens)
+    const int base_rows = bftree_of(smp) && smp.bftree_nodes > 0 ? std::max(spec_block_of(smp), smp.bftree_nodes)
+                                                                 : spec_block_of(smp);
+    const int rows = std::max(base_rows, spec_draft_rows_);
+    if (!skip("draft")) {  // (Q27_SKIP=draft: timing only, the step verifies the previous step's tokens)
       draft_->propose(block_ids_, pos_dev_, w_.embed, lm.w, lm.sf, lm.in_scale, lm.alpha.alpha[0], smp, rng_, ids_ver_,
                     aq_, asf_, logits_, skinny_ws_, kSkinnyWsBytes, lk, s_, rows);
-    if (rows > spec_rows(smp))  // (a cut step's test: the verify's rows of the draft)
-      lane_cut(LaneRows::one(rows), LaneRows::one(spec_rows(smp)), ids_ver_, tree_, s_);
+      if (smp.rollout > 1) {
+        const int off = rows - 1;
+        draft_rollout_prep(ids_ver_, off, ddims::kMaskId, rows, block_ids_ + kSpecBlock, s_);
+        SpecSampling smp2 = smp;
+        smp2.bftree = 0, smp2.paths = 1, smp2.rollout = 1;
+        draft_->propose(block_ids_ + kSpecBlock, pos_dev_, w_.embed, lm.w, lm.sf, lm.in_scale, lm.alpha.alpha[0], smp2,
+                        rng_, ids_ver_ + off, aq_, asf_, logits_, skinny_ws_, kSkinnyWsBytes, lk, s_, rows, off,
+                        tree_ + 1);
+        draft_rollout_stitch(ids_ver_, off, rows - 1, tree_, s_);
+      }
+    }
+    if (smp.rollout <= 1 && !bftree_of(smp) && rows > W)  // (a cut step's test: the verify's rows of the draft)
+      lane_cut(LaneRows::one(rows), LaneRows::one(W), ids_ver_, tree_, s_);
     }
     if (part == 1) return;
   }
-  const int W = spec_rows(smp);
-  verify_paths_ = smp.paths;
+  verify_paths_ = is_tree ? std::max(2, smp.paths) : 1;
   verify_ = true;
-  copy_verify_ = smp.copy > 0;  // (local patch: see attention_decode's wide_chain)
+  copy_verify_ = smp.copy > 0 || smp.rollout > 1;  // (wide_chain: attention_decode tiled FP8-MMA + kWide GDN)
   cap_ = cap_buf_;
   chunk(ids_ver_, W, false);
   verify_ = false;
@@ -1803,11 +1827,10 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
     spec_logprobs(LaneRows::one(W), logits_, kVocab, raw ? lpv_ : tv_, raw ? lpi_ : ti_, raw ? kMaxTopLogprobs : ld, ln, tree_,
                   cpath_, ncommit_, ids_ver_, lp_dev_, par_, s_);
   }
-  if (smp.paths > 1) kv_commit(kv_layers_dev_, kAttnLayers, opt_.kv_type, page_table_, pos_dev_, ncommit_, cpath_, s_);
+  if (is_tree) kv_commit(kv_layers_dev_, kAttnLayers, opt_.kv_type, page_table_, pos_dev_, ncommit_, cpath_, s_);
   mark("draft context");
   if (!skip("dctx"))
-    draft_->append_ctx(cap_buf_, smp.copy > 0 ? smp.copy : spec_block_of(smp), pos_dev_, 0, ncommit_, skinny_ws_,
-                       kSkinnyWsBytes, nullptr, 0, s_, cpath_);
+    draft_->append_ctx(cap_buf_, W, pos_dev_, 0, ncommit_, skinny_ws_, kSkinnyWsBytes, nullptr, 0, s_, cpath_);
   spec_advance(pos_dev_, ncommit_, par_, sbuf_, rng_, s_, budget_);
 }
 
@@ -1818,6 +1841,8 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   // ahead could only use that one, and the widths must not depend on it (SpecSampling).
   if (!spec_inflight_) {
     spec_smp_.block = spec_smp_.block_due;
+    spec_smp_.rollout = 1;
+    spec_smp_.bftree = 0, spec_smp_.bftree_nodes = 0, spec_smp_.bftree_temp = bftree_temp_;
     // (local patch: trees at the low width; the paths follow from block_due and fixed request settings only, so a
     // step launched ahead uses the same ones. Greedy sequences stay chains: their rows are bit-identical.)
     if (adapt_on_ && adapt_paths_ > 1 && draft_->block() > ddims::kBlock)
@@ -1831,11 +1856,24 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
       spec_smp_.copy = copy_last_ ? copy_w_ : 0;
       if (copy_last_) spec_smp_.paths = 1;
     }
+    if (spec_smp_.copy == 0 && !spec_smp_.masked && !spec_smp_.pinned && spec_smp_.logprobs < 0) {
+      if (rollout_on_ > 1 && spec_smp_.temperature <= 0.f && spec_smp_.rollout_due > 1 &&
+          pos_ + 2 * (1 + (spec_block_of(spec_smp_) - 1) * 2) <= max_pages_ * kPageTokens &&
+          step_capacity_ >= 1 + (spec_block_of(spec_smp_) - 1) * 2) {
+        spec_smp_.rollout = 2;
+        spec_smp_.paths = 1;
+      } else if (bftree_on_ > 0 && (spec_smp_.temperature <= 0.f || bftree_on_ >= 2)) {
+        spec_smp_.bftree = bftree_on_;
+        spec_smp_.bftree_nodes = bftree_nodes_ > 0 ? bftree_nodes_ : spec_block_of(spec_smp_);
+        spec_smp_.paths = 1;
+      }
+    }
   }
   const SpecSampling smp = spec_smp_;
-  Q27_CHECK(pos_ + spec_rows(smp) <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
-  // Pages for this step's rows and for the one launched ahead (the position advances by <= 8).
-  ensure_pages(pos_ + kSpecBlock + spec_rows(smp));
+  const int W_step = spec_rows(smp);
+  Q27_CHECK(pos_ + W_step <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
+  // Pages for this step's rows and for the one launched ahead.
+  ensure_pages(pos_ + std::max(kSpecBlock, W_step) + W_step);
   auto same = [](const SpecSampling& a, const SpecSampling& b) { return a.same(b); };
   static const char* trace = getenv("Q27_TRACE");  // debug timeline (build with -DQ27_TRACE)
   if (trace) trace_step_begin(s_);
@@ -1888,8 +1926,9 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   static const bool dbg_accept = getenv("Q27_DBG_ACCEPT") != nullptr;
   const bool ahead = allow_ahead && !smp.masked && spec_pipeline_ && graphs_ && spec_graph_ && spec_warm_ &&
                      same(smp, spec_key_) && !trace && smp.block_next == smp.block &&
+                     smp.rollout_next == smp.rollout &&
                      !prof_.on && !dbg_accept && smp.copy == 0 && !(copy_on_ && copy_hint_ && copy_eligible(smp)) &&
-                     pos_ + kSpecBlock + spec_rows(smp) <= max_pages_ * kPageTokens;  // (worst-case position)
+                     pos_ + 2 * std::max(kSpecBlock, W_step) <= max_pages_ * kPageTokens;  // (worst-case position)
   if (ahead) {
     Q27_CUDA(cudaEventRecord(spec_ev_[slot], s_));
     Q27_CUDA(cudaGraphLaunch(spec_graph_, s_));
@@ -1926,7 +1965,7 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
     }
   }
   stat_steps_++, stat_lookup_ += so.src, stat_tokens_ += n;
-  last_block_ = smp.copy > 0 ? smp.copy : spec_block_of(smp);  // (a width change waits for the step in flight: smp's is the returned step's)
+  last_block_ = W_step;  // (a width change waits for the step in flight: smp's is the returned step's)
   spec_adapt(spec_smp_, n);
   set_sbuf(sbuf_host_ ^ 1);  // (the device flipped it in spec_advance)
   for (int i = 0; i < n; i++) out[i] = so.tok[i];
@@ -2105,12 +2144,21 @@ void Model::copy_follow(const int32_t* out, int n) {
 void Model::spec_adapt(SpecSampling& smp, int n) const {
   if (!adapt_on_ || smp.masked || smp.pinned) return;
   smp.block_due = smp.block_next;
+  smp.rollout_due = smp.rollout_next;
   smp.accept_ema += adapt_alpha_ * (float(n) - smp.accept_ema);
   const int full = draft_->block();
   if (smp.block_next == full && smp.accept_ema < adapt_down_)
     smp.block_next = adapt_low_;
   else if (smp.block_next != full && smp.accept_ema >= adapt_up_)
     smp.block_next = full;
+  if (rollout_on_ > 1 && smp.temperature <= 0.f && smp.logprobs < 0) {
+    if (smp.rollout_next == 1 && smp.accept_ema >= rollout_thresh_)
+      smp.rollout_next = 2;
+    else if (smp.rollout_next > 1 && smp.accept_ema < rollout_thresh_ - 1.5f)
+      smp.rollout_next = 1;
+  } else {
+    smp.rollout_next = 1;
+  }
 }
 
 cudaGraphExec_t Model::capture(const std::function<void()>& body, cudaGraphExec_t update) {

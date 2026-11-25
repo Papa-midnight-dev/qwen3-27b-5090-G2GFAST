@@ -13,8 +13,9 @@ namespace q27 {
 constexpr int kSpecBlock = 16;  // the longest draft block: the anchor and up to 15 drafted tokens (the deepest path;
                                 // DFlash2 drafts 8, DSpine up to 16, Draft::block()). Batched steps: LaneRows
 constexpr int kSpecSelK = 16;  // selector candidates per position
-constexpr int kTreeMax = 64;   // verify rows: nodes of the draft tree (node 0 is the anchor)
-constexpr int kTreePaths = 4;  // root-to-leaf paths (draft walks)
+constexpr int kTreeMax = 128;  // verify rows: nodes of the draft tree / copy chain (node 0 is the anchor)
+constexpr int kTreePaths = 4;  // root-to-leaf paths (legacy multi-walk)
+constexpr int kTreeDraws = 16; // max child draws per tree node (best-first tree / multi-walk)
 static_assert(kSpecBlock == kLogprobTokens, "Logprobs holds one step's tokens");
 
 // The draft tree of a step (written by the selector, read by the verify, accept and commit kernels).
@@ -31,8 +32,13 @@ struct SpecTree {
   int8_t leaf[kTreePaths];                // last node of each path
   int8_t cidx[kTreeMax];                  // index of tok[i] among the candidates at its depth (root: 0)
   int8_t ndraws[kTreeMax];                // draws made from the node (one per walk through it)
-  int8_t draws[kTreeMax][kTreePaths];     // their child nodes, in draw order (duplicates repeat)
+  int8_t draws[kTreeMax][kTreeDraws];     // their child nodes, in draw order (duplicates repeat)
   float q[kTreeMax][kSpecSelK];           // the distribution the node's draws came from
+  // Heavy-child-last DFS schedule for arbitrary trees (n <= 16 uses <= 3 live GDN state snapshots).
+  int8_t dfs_n;                           // > 0: gdn_rec_kernel uses dfs_* instead of kTreePaths
+  int8_t dfs_order[32];                   // node index processed at DFS step s
+  int8_t dfs_pop[32];                     // >= 0: restore S = snap[dfs_pop[s]] before step s
+  int8_t dfs_push[32];                    // >= 0: save snap[dfs_push[s]] = S after step s
 };
 
 // Sampling of the request (the same distribution as the non-speculative sampler).
@@ -66,8 +72,13 @@ struct SpecSampling {
   bool pinned = false;  // the width stays (Model::spec_set_block)
   // Copy step (local patch, 25 Nov 2026, Q27_COPY): the host drafts the chain from an earlier span of the sequence that
   // the output is copying (Model::copy_prepare) instead of the draft model. Greedy single sequences only. The value is
-  // the step's rows (16 or 32; 0: a draft step).
+  // the step's rows (16, 32, 64, or 128; 0: a draft step).
   int copy = 0;
+  // Best-first probability tree (Q27_SPEC_BFTREE: 0=off, 1=greedy, 2=greedy+sampled) and 2-step rollout (Q27_SPEC_ROLLOUT).
+  int bftree = 0;
+  int bftree_nodes = 0;
+  float bftree_temp = 1.f;
+  int rollout = 1, rollout_next = 1, rollout_due = 1;
   // Batched steps (Model::batch_prepare): the lane's rows (4 / 8 / 12 / 16, DSpine) and the moving average of its tokens
   // per batched step at those rows. Past batched steps decide them, as the single width above.
   int lane_rows = 8;
@@ -81,7 +92,8 @@ struct SpecSampling {
     return temperature == o.temperature && top_k == o.top_k && top_p == o.top_p && paths == o.paths &&
            min_p == o.min_p && pen.presence == o.pen.presence && pen.frequency == o.pen.frequency &&
            logprobs == o.logprobs && masked == o.masked && stop[2] == o.stop[2] && biased == o.biased &&
-           ignore_eos == o.ignore_eos && block == o.block && copy == o.copy;
+           ignore_eos == o.ignore_eos && block == o.block && copy == o.copy && bftree == o.bftree &&
+           bftree_nodes == o.bftree_nodes && rollout == o.rollout;
   }
 };
 
@@ -123,7 +135,8 @@ struct SpecOut {
 // residual / bonus draw at node n: 160 + n.
 constexpr uint32_t kRngWalk = 0, kRngAccept = 32, kRngResidual = 160;
 __device__ __forceinline__ float rng_uniform(const uint64_t* rng, uint32_t idx) {
-  uint64_t z = rng[0] + (rng[1] * 256 + idx + 1) * 0x9E3779B97F4A7C15ull;
+  const uint64_t off = idx < 256 ? (rng[1] * 256 + idx + 1) : ((1ull << 62) | (rng[1] << 32) | uint64_t(idx));
+  uint64_t z = rng[0] + off * 0x9E3779B97F4A7C15ull;
   z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
   z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
   z ^= z >> 31;

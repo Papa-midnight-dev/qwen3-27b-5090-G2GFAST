@@ -1297,9 +1297,41 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
       __syncthreads();  // (the staging buffers are refilled by the next tile)
     }
   } else if constexpr (kTree) {
+    const SpecTree* tree = sp.tree + ln;
+    float snap[kTreePaths - 1][kRecRows];
+    if (tree->dfs_n > 0) {
+      // Heavy-child-last DFS schedule: arbitrary tree of n <= 16 nodes uses <= 3 live snapshots (constant-indexed -> registers).
+      const int dn = tree->dfs_n;
+      for (int s = 0; s < dn; s++) {
+        const int pop = tree->dfs_pop[s];
+        if (pop == 0) {
+#pragma unroll
+          for (int i = 0; i < kRecRows; i++) S[i] = snap[0][i];
+        } else if (pop == 1) {
+#pragma unroll
+          for (int i = 0; i < kRecRows; i++) S[i] = snap[1][i];
+        } else if (pop == 2) {
+#pragma unroll
+          for (int i = 0; i < kRecRows; i++) S[i] = snap[2][i];
+        }
+        const int t = tree->dfs_order[s];
+        const float o = gdn_step(S, sk[t], sq[t], sv[t][lcol], s_decay[t], s_beta[t]);
+        if (j == 4) so[t][lcol] = o;
+        const int push = tree->dfs_push[s];
+        if (push == 0) {
+#pragma unroll
+          for (int i = 0; i < kRecRows; i++) snap[0][i] = S[i];
+        } else if (push == 1) {
+#pragma unroll
+          for (int i = 0; i < kRecRows; i++) snap[1][i] = S[i];
+        } else if (push == 2) {
+#pragma unroll
+          for (int i = 0; i < kRecRows; i++) snap[2][i] = S[i];
+        }
+      }
+    } else {
     // Path k > 0 starts at its first own node (depth beg) from the state after its parent node par,
     // which an earlier path computed: that path saves S into snap[k - 1] right after computing par.
-    const SpecTree* tree = sp.tree + ln;
     const int np = min(tree->npaths, kTreePaths);
     int par[kTreePaths], beg[kTreePaths];
 #pragma unroll
@@ -1313,7 +1345,6 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
         beg[k] = b, par[k] = b <= dl ? tree->path[leaf][b - 1] : -1;
       }
     }
-    float snap[kTreePaths - 1][kRecRows];
 #pragma unroll
     for (int k = 0; k < kTreePaths; k++) {
       if (k >= np) break;
@@ -1334,6 +1365,7 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
             for (int i = 0; i < kRecRows; i++) snap[kk - 1][i] = S[i];
           }
       }
+    }
     }
   } else {
     for (int t = 0; t < n; t++) {

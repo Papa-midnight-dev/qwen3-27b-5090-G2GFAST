@@ -34,7 +34,7 @@ constexpr int kWindow = 2048;      // sliding window (window_left = 2047) and th
 // The context ring has kRingPad slots past the window: a step launched ahead and dropped (spec_flush) has
 // written up to a block of rows past the position, which must not land on the slots of positions still in
 // the window (position p is slot p % (window + kRingPad)).
-constexpr int kRingPad = 16;
+constexpr int kRingPad = 32;  // holds a dropped 16-row or 2-step rollout (31-row) ahead step
 constexpr int kGroups = 320;       // conv groups of 16 channels
 constexpr int kTaps = 2;
 constexpr int kCoef = 2 * kTaps * kGroups;  // kernel_projection outputs: [side][tap][group]
@@ -122,7 +122,8 @@ class Draft {
   void propose(const int32_t* block_ids, const int32_t* pos, const bf16* embed, const uint8_t* lm_w,
                const uint8_t* lm_sf, float lm_in_scale, float lm_alpha, const SpecSampling& smp, const uint64_t* rng,
                int32_t* ids_out, uint8_t* aq, uint8_t* asf, float* logits, void* ws, size_t ws_bytes,
-               const Lookup& lk, cudaStream_t s, int rows = 0);  // rows: DSpine's block rows (0: block())
+               const Lookup& lk, cudaStream_t s, int rows = 0, int pos_add = 0,
+               SpecTree* tree_out = nullptr);  // rows: DSpine's block rows (0: block()); pos_add: rollout offset
   // Context K/V for `rows` target rows whose BF16 features (layers 5..61) are in cap [rows][25600], at
   // positions *pos + pos_add + r; only rows < *n_dev (if n_dev) are written. More than 8 rows go through
   // the BF16 GEMM with the weights dequantized into `scratch` (BF16 slices).
@@ -192,7 +193,7 @@ class Draft {
                       const uint8_t* lm_w, const uint8_t* lm_sf, float lm_in_scale, float lm_alpha,
                       const SpecSampling* smp, const SelectLanes* sl, const uint64_t* rng, int32_t* ids_out,
                       SpecTree* trees, uint8_t* aq, uint8_t* asf, float* logits, void* ws, size_t ws_bytes,
-                      cudaStream_t s);
+                      cudaStream_t s, int pos_add = 0);
   std::vector<DraftLayer> layers_;
   const bf16 *hidden_norm_ = nullptr, *norm_ = nullptr;
   const bf16 *pred_cb_ = nullptr, *succ_cb_ = nullptr;
@@ -264,15 +265,18 @@ void draft_conv_in(const float* h, const float* coef, const bf16* base, int T, A
 // x += conv_side1(y) (residual), then h = RMSNorm(x) * w: fp32 h, GEMM input ao, BF16 copy hb (optional).
 void draft_conv_out_norm(const float* y, const float* coef, const bf16* base, int T, float* x, const bf16* w,
                          float* h, ActOut ao, bf16* hb, cudaStream_t s);
-// q / k norm + RoPE for the block at positions *pos + t: q [8][32][128] fp32, block K / V [8][8][128] fp32.
+// q / k norm + RoPE for the block at positions *pos + pos_add + t: q [T][32][128] fp32, block K / V [T][8][128] fp32.
 void draft_qk_prep(const float* qkv, const bf16* q_norm, const bf16* k_norm, const int32_t* pos, float* q, float* kb,
-                   float* vb, cudaStream_t s, int T = ddims::kBlock);
+                   float* vb, cudaStream_t s, int T = ddims::kBlock, int pos_add = 0);
 // Sliding-window attention of the T (8 or 16) block rows over the context ring (positions
 // max(0, pos - window + 1) .. pos - 1) and the block keys (all of them, or 0..t for row t when causal);
 // out fp32 [T][4096].
 void draft_attention(const float* q, const float* kb, const float* vb, const bf16* ring_k, const bf16* ring_v,
                      const int32_t* pos, float* part, float* out, cudaStream_t s, int T = ddims::kBlock,
-                     int window = ddims::kWindow, bool causal = false);
+                     int window = ddims::kWindow, bool causal = false, int pos_add = 0);
+// 2-step rollout helpers: prepare block 2 from ids_ver[off], and stitch block 2's chain onto tree[0..off].
+void draft_rollout_prep(const int32_t* ids_ver, int off, int mask_id, int rows, int32_t* block_ids2, cudaStream_t s);
+void draft_rollout_stitch(const int32_t* ids_ver, int off, int nd2, SpecTree* tree, cudaStream_t s);
 size_t draft_attention_part_floats(int rows);
 // Rows [T][K] (fp32 or BF16) into the next GEMM's input.
 void draft_quant_rows(const float* x, int T, int K, ActOut ao, cudaStream_t s);
@@ -285,7 +289,8 @@ void draft_silu_mul(const float* gu, int64_t ld, int T, int I, ActOut ao, cudaSt
 // Context K/V: k_norm + RoPE of kv [rows][2048] (k | v of 8 heads) at positions *pos + pos_add + r into
 // the ring (slot = position % 2048); rows >= *n_dev are skipped when n_dev is given.
 void draft_ctx_write(const float* kv, int rows, const bf16* k_norm, const int32_t* pos, int pos_add,
-                     const int32_t* n_dev, bf16* ring_k, bf16* ring_v, cudaStream_t s, int window = ddims::kWindow);
+                     const int32_t* n_dev, bf16* ring_k, bf16* ring_v, cudaStream_t s, int window = ddims::kWindow,
+                     int row_off = 0);
 // Lattice scores and the walk (one kernel): writes the drafted tokens to ids_out[1..7] and the choice.
 // lattice: [7][16][16] scratch, counter: one int, zero between calls.
 void draft_select(const float* cand_v, const int32_t* cand_i, const float* hp, const bf16* pred_cb,

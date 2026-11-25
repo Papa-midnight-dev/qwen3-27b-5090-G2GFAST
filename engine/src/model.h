@@ -245,8 +245,14 @@ class Model {
   void spec_flush();  // replays the last verify's commits into the GDN / conv states
   void set_sbuf(int b);  // host side of the GDN state buffer switch
   int spec_block_of(const SpecSampling& smp) const { return smp.block > 0 ? smp.block : draft_->block(); }
+  bool bftree_of(const SpecSampling& smp) const {
+    return smp.copy == 0 && smp.rollout <= 1 && smp.bftree > 0 && (smp.temperature <= 0.f || smp.bftree >= 2);
+  }
   int spec_rows(const SpecSampling& smp) const {
-    return smp.copy > 0 ? smp.copy : 1 + (spec_block_of(smp) - 1) * std::max(1, smp.paths);
+    if (smp.copy > 0) return smp.copy;
+    if (smp.rollout > 1) return 1 + (spec_block_of(smp) - 1) * smp.rollout;
+    if (bftree_of(smp)) return smp.bftree_nodes > 0 ? smp.bftree_nodes : spec_block_of(smp);
+    return 1 + (spec_block_of(smp) - 1) * std::max(1, smp.paths);
   }
   GdnSpec gdn_spec(int gdn_layer) const;
   bool fused(int T) const;
@@ -596,6 +602,11 @@ class Model {
   int last_block_ = 0;
   int adapt_low_ = 8;
   int adapt_paths_ = 1;     // Q27_SPEC_ADAPT_PATHS (local patch): tree walks at the low width, sampled only
+  int bftree_on_ = 0;       // Q27_SPEC_BFTREE: 0=off, 1=greedy best-first tree, 2=greedy+sampled budget-capped tree
+  int bftree_nodes_ = 0;    // Q27_BFTREE_NODES: tree node budget (0: use spec_block_of(smp), else 2..16)
+  float bftree_temp_ = 1.f; // Q27_BFTREE_TEMP: softmax temperature for greedy best-first tree ranking
+  int rollout_on_ = 1;      // Q27_SPEC_ROLLOUT: 1=off, 2=2-step autoregressive DSpine rollout (31 rows)
+  float rollout_thresh_ = 13.f;  // Q27_ROLLOUT_THRESH: accept_ema threshold to trigger 2-step rollout
   // Copy steps (local patch, Q27_COPY): host-drafted chains from an earlier span the output is copying.
   bool copy_on_ = false;
   int copy_min_ = 16;                    // Q27_COPY_MIN: tokens that must match to lock onto a source span
