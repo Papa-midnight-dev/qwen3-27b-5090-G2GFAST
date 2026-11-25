@@ -1,5 +1,13 @@
 # Qwen3.8-27B on one RTX 5090 *(Moonshot Community Fork)*
 
+> **Update, 25 Nov 2026 (evening): the recommended branch is now [`copy-steps-0.8.1`](../../tree/copy-steps-0.8.1).**
+> It is upstream v0.8.1 with copy steps: a greedy request that repeats earlier text (an edit, a quote) verifies up to
+> 32 copied tokens a step, with outputs identical to the unpatched engine. On one RTX 5090 at 450 W: greedy code edits
+> 1,108 -> 1,937 tok/s, JSONL edits 1,135 -> 2,034, quotes from a 25K-token document 3.7-4.7x faster; other rows
+> level. On an abliterated NVFP4 pack, `Q27_LM_HEAD_A4X2=0` gave 12% more accepted draft tokens than 0.8.1's two-term
+> head (code +19%, prose +17%) with the same tool-call and needle results, and `Q27_DRAFT_WINDOW=8192` lets DSpine see
+> a whole 4,700-token file. Details, checks and limits: `LOCAL-PATCHES.md` on that branch.
+
 > **Status, 25 Nov 2026: use upstream v0.8.1 instead of this branch.** A measured review compared this fork with
 > upstream on the same card, weights and power limit (one run per build, plus a repeat of the first):
 >
