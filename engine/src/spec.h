@@ -64,6 +64,9 @@ struct SpecSampling {
   int block = 0, block_next = 0, block_due = 0;
   float accept_ema = 0.f;
   bool pinned = false;  // the width stays (Model::spec_set_block)
+  // Copy step (local patch, 25 Nov 2026, Q27_COPY): the host drafts the chain from an earlier span of the sequence that
+  // the output is copying (Model::copy_prepare) instead of the draft model. Greedy single sequences only.
+  int copy = 0;
   // Batched steps (Model::batch_prepare): the lane's rows (4 / 8 / 12 / 16, DSpine) and the moving average of its tokens
   // per batched step at those rows. Past batched steps decide them, as the single width above.
   int lane_rows = 8;
@@ -77,7 +80,7 @@ struct SpecSampling {
     return temperature == o.temperature && top_k == o.top_k && top_p == o.top_p && paths == o.paths &&
            min_p == o.min_p && pen.presence == o.pen.presence && pen.frequency == o.pen.frequency &&
            logprobs == o.logprobs && masked == o.masked && stop[2] == o.stop[2] && biased == o.biased &&
-           ignore_eos == o.ignore_eos && block == o.block;
+           ignore_eos == o.ignore_eos && block == o.block && copy == o.copy;
   }
 };
 

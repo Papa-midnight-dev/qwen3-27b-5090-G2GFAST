@@ -382,6 +382,10 @@ Model::Model(const Options& opt) : opt_(opt) {
   Q27_CUDA(cudaHostGetDevicePointer(reinterpret_cast<void**>(&lp_dev_), lp_, 0));
   // Grammar masks (2 MiB each; outside the plan like the sampler's scratch).
   Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&mask_host_), size_t(kMaskRows) * kMaskWords * 4, cudaHostAllocDefault));
+  Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&copy_tree_host_), sizeof(SpecTree), cudaHostAllocDefault));
+  Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&copy_ids_host_), (kSpecBlock + 1) * sizeof(int32_t), cudaHostAllocDefault));
+  memset(copy_tree_host_, 0, sizeof(SpecTree));
+  memset(copy_ids_host_, 0, (kSpecBlock + 1) * sizeof(int32_t));
   memset(mask_host_, 0xff, size_t(kMaskRows) * kMaskWords * 4);
   Q27_CUDA(cudaMalloc(reinterpret_cast<void**>(&mask_dev_), size_t(kMaskRows) * kMaskWords * 4));
   Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&draft_host_), size_t(kMaxLanes) * kSpecBlock * 4, cudaHostAllocDefault));
@@ -427,6 +431,10 @@ void Model::configure() {
   // sampled single sequence verifies this many walks merged into a trie while its width is at most 8 rows, the
   // layout the trees' random numbers and rows use. 1: chains only (0.8.1 as shipped).
   adapt_paths_ = std::clamp(env_int("Q27_SPEC_ADAPT_PATHS", 1), 1, kTreePaths);
+  // Copy steps (local patch, 25 Nov 2026): a greedy single sequence that is copying an earlier span (an edit, a rewrite)
+  // gets its chain from that span instead of from the draft model. 0: off (0.8.1 as shipped).
+  copy_on_ = draft_ && draft_->dspine() && env_int("Q27_COPY", 0) != 0;
+  copy_min_ = std::clamp(env_int("Q27_COPY_MIN", 16), 4, 64);
   adapt_up_ = env_f("Q27_SPEC_ADAPT_UP", 4.5f);
   adapt_down_ = env_f("Q27_SPEC_ADAPT_DOWN", 4.0f);
   adapt_alpha_ = std::clamp(env_f("Q27_SPEC_ADAPT_ALPHA", 0.125f), 0.f, 1.f);
@@ -461,6 +469,8 @@ Model::~Model() {
       if (x) cudaGraphExecDestroy(x);
   if (spec_out_) cudaFreeHost(spec_out_);
   if (mask_host_) cudaFreeHost(mask_host_);
+  if (copy_tree_host_) cudaFreeHost(copy_tree_host_);
+  if (copy_ids_host_) cudaFreeHost(copy_ids_host_);
   if (mask_dev_) cudaFree(mask_dev_);
   if (draft_host_) cudaFreeHost(draft_host_);
   if (b_out_) cudaFreeHost(b_out_);
@@ -581,6 +591,7 @@ void Model::release_seq() {
   if (!seq_pages_.empty()) Q27_CUDA(cudaMemsetAsync(page_table_, 0, seq_pages_.size() * 4, s_));
   seq_pages_.clear();
   seq_ids_.clear();
+  copy_reset();
 }
 
 void Model::upload_pages(int32_t* table, const int32_t* pages, size_t n) {
@@ -1618,6 +1629,7 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
                           int max_new) {
   Q27_CHECK(draft_, "spec_begin: no draft model loaded");
   spec_flush();
+  copy_reset();
   cap_ = cap_buf_;
   int32_t first = 0;
   try {
@@ -1662,6 +1674,13 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
   smp.bias = smp.biased ? bias_list() : nullptr;
   const auto& lm = w_.lm_head;
   if (part != 2) {
+    if (smp.copy) {  // (local patch: the host's chain from the copied span; the draft model does not run)
+      mark("copy");
+      Q27_CUDA(cudaMemcpyAsync(tree_, copy_tree_host_, sizeof(SpecTree), cudaMemcpyHostToDevice, s_));
+      Q27_CUDA(cudaMemcpyAsync(ids_ver_ + 1, copy_ids_host_ + 1, size_t(spec_rows(smp) - 1) * sizeof(int32_t),
+                               cudaMemcpyHostToDevice, s_));
+      Q27_CUDA(cudaMemcpyAsync(draft_->choice.src, copy_ids_host_ + kSpecBlock, sizeof(int32_t), cudaMemcpyHostToDevice, s_));
+    } else {
     Lookup lk = lookup_;
     lk.hist = hist_, lk.pos = pos_dev_, lk.best = lk_best_;
     mark("lookup");
@@ -1673,6 +1692,7 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
                     aq_, asf_, logits_, skinny_ws_, kSkinnyWsBytes, lk, s_, rows);
     if (rows > spec_rows(smp))  // (a cut step's test: the verify's rows of the draft)
       lane_cut(LaneRows::one(rows), LaneRows::one(spec_rows(smp)), ids_ver_, tree_, s_);
+    }
     if (part == 1) return;
   }
   const int W = spec_rows(smp);
@@ -1734,6 +1754,12 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
                                 spec_smp_.block <= ddims::kBlock
                             ? adapt_paths_
                             : 1;
+    // (local patch: a copy step takes the full block as a chain; the adaptive width is kept for the draft's steps)
+    if (copy_on_) {
+      copy_last_ = copy_prepare();
+      spec_smp_.copy = copy_last_ ? 1 : 0;
+      if (copy_last_) spec_smp_.block = draft_->block(), spec_smp_.paths = 1;
+    }
   }
   const SpecSampling smp = spec_smp_;
   Q27_CHECK(pos_ + spec_rows(smp) <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
@@ -1791,7 +1817,7 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   static const bool dbg_accept = getenv("Q27_DBG_ACCEPT") != nullptr;
   const bool ahead = allow_ahead && !smp.masked && spec_pipeline_ && graphs_ && spec_graph_ && spec_warm_ &&
                      same(smp, spec_key_) && !trace && smp.block_next == smp.block &&
-                     !prof_.on && !dbg_accept &&
+                     !prof_.on && !dbg_accept && !(copy_on_ && copy_eligible(smp)) &&
                      pos_ + kSpecBlock + spec_rows(smp) <= max_pages_ * kPageTokens;  // (worst-case position)
   if (ahead) {
     Q27_CUDA(cudaEventRecord(spec_ev_[slot], s_));
@@ -1843,7 +1869,95 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   seq_ids_.push_back(spec_last_);
   seq_ids_.insert(seq_ids_.end(), out, out + n - 1);
   spec_last_ = out[n - 1];
+  if (copy_on_) copy_follow(out, n);
   return n;
+}
+
+// ---- Copy steps (local patch, 25 Nov 2026, Q27_COPY) ----
+// The sequence S = seq_ids_ + spec_last_ (L tokens; the last one is the next step's anchor). An index maps the hash of
+// every window of copy_min_ tokens that ends before the anchor to the latest position where it ends. When the window
+// ending at the anchor was seen before (at p), the output is taken to copy the span after p: the next step verifies the
+// chain anchor, S[p + 1], S[p + 2], ... (a span that reaches the anchor repeats: periodic text). The target's verify
+// keeps the output exactly that of plain greedy decoding; a wrong chain only costs accepted tokens. The lock follows
+// the source while the output matches it, drops at the first difference and is found again copy_min_ tokens later.
+// A lock that fails on its first step (repeated structure, not a copy) backs off for copy_backoff_ steps (16 -> 256).
+bool Model::copy_eligible(const SpecSampling& smp) const {
+  return smp.temperature <= 0.f && !smp.masked && !smp.pinned && !smp.penalized() && !smp.biased && smp.logprobs < 0 &&
+         batch_n_ == 0;
+}
+
+bool Model::copy_prepare() {
+  if (!copy_eligible(spec_smp_) || spec_last_ < 0) return false;
+  const int64_t L = int64_t(seq_ids_.size()) + 1, K = copy_min_;
+  if (L < K + 2) return false;
+  auto S = [&](int64_t i) { return i + 1 < L ? seq_ids_[size_t(i)] : spec_last_; };
+  auto hash = [&](int64_t end) {
+    uint64_t h = 1469598103934665603ull;
+    for (int64_t j = end - K + 1; j <= end; j++) h = (h ^ uint32_t(S(j))) * 1099511628211ull;
+    return h;
+  };
+  if (copy_len_ > size_t(L)) copy_reset();  // (another sequence)
+  for (int64_t i = std::max<int64_t>(int64_t(copy_len_), K - 1); i <= L - 2; i++) copy_index_[hash(i)] = int32_t(i);
+  copy_len_ = size_t(std::max<int64_t>(L - 1, int64_t(copy_len_)));
+  if (copy_cool_ > 0) {
+    copy_cool_--;
+    return false;
+  }
+  bool fresh = false;
+  if (copy_src_ < 0) {
+    auto it = copy_index_.find(hash(L - 1));
+    if (it == copy_index_.end()) return false;
+    const int64_t p = it->second;
+    for (int64_t j = 0; j < K; j++)
+      if (S(p - j) != S(L - 1 - j)) return false;  // (a hash collision)
+    copy_src_ = p + 1, fresh = true;
+  }
+  const int W = draft_->block();
+  int32_t d[kSpecBlock];  // d[m]: the output token expected at position L + m
+  for (int m = 0; m < W - 1; m++) {
+    const int64_t j = copy_src_ + m;
+    d[m] = j < L ? S(j) : d[j - L];
+  }
+  SpecTree& t = *copy_tree_host_;
+  memset(&t, 0, sizeof t);
+  t.n = W, t.npaths = 1;
+  for (int i = 0; i < kTreeMax; i++) t.owner[i] = -1;
+  for (int i = 0; i < W; i++) {  // a chain, laid out as the draft's selector lays one out
+    t.tok[i] = i == 0 ? spec_last_ : d[i - 1];
+    t.depth[i] = int8_t(i);
+    for (int k = 0; k <= i; k++) t.path[i][k] = int8_t(k);
+    t.owner[i] = 0;
+    t.ndraws[i] = i + 1 < W ? 1 : 0;
+    if (i + 1 < W) t.draws[i][0] = int8_t(i + 1);
+  }
+  for (int p = 0; p < kTreePaths; p++) t.leaf[p] = int8_t(W - 1);
+  for (int i = W; i < kTreeMax; i++) t.tok[i] = t.tok[0], t.depth[i] = 0, t.path[i][0] = int8_t(i);
+  for (int i = 0; i < W; i++) copy_ids_host_[i] = t.tok[i];
+  copy_ids_host_[kSpecBlock] = 1;  // (choice.src: counted with the lookup steps in spec_stats)
+  copy_fresh_ = fresh;
+  return true;
+}
+
+void Model::copy_follow(const int32_t* out, int n) {
+  // seq_ids_ / spec_last_ already hold the step's n tokens, at positions L0 .. L0 + n - 1.
+  const int64_t L = int64_t(seq_ids_.size()) + 1, L0 = L - n;
+  auto S = [&](int64_t i) { return i + 1 < L ? seq_ids_[size_t(i)] : spec_last_; };
+  if (copy_last_) {
+    copy_steps_++, copy_tokens_ += n;
+    if (n - 1 < 4 && copy_fresh_) {  // a fresh lock that failed at once: repeated structure, not a copy
+      copy_cool_ = copy_backoff_, copy_backoff_ = std::min(copy_backoff_ * 2, 256), copy_src_ = -1;
+      return;
+    }
+    if (n - 1 >= 12) copy_backoff_ = 16;
+  }
+  if (copy_src_ < 0) return;
+  for (int m = 0; m < n; m++)
+    if (S(copy_src_ + m) != out[m]) {
+      copy_src_ = -1;
+      return;
+    }
+  copy_src_ += n;
+  (void)L0;
 }
 
 // The adaptive verify width: the moving average of the tokens per step picks the next block (with hysteresis).
@@ -2018,6 +2132,7 @@ void Model::seq_take(SeqState& st) {
   st.ring_valid = ring_valid_;
   st.smp = spec_smp_;
   seq_pages_.clear(), seq_ids_.clear(), plan_.clear(), mm_spans_.clear();
+  copy_reset();
   pos_ = 0;
   spec_last_ = -1;
   ring_valid_ = false;
@@ -2028,6 +2143,7 @@ void Model::seq_give(SeqState& st) {
   pos_ = st.pos;
   seq_pages_ = std::move(st.pages);
   seq_ids_ = std::move(st.ids);
+  copy_reset();
   plan_ = std::move(st.plan);
   mm_spans_ = std::move(st.mm);
   spec_last_ = st.spec_last;

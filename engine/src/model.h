@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "common.h"
@@ -590,6 +591,23 @@ class Model {
   int last_block_ = 0;
   int adapt_low_ = 8;
   int adapt_paths_ = 1;     // Q27_SPEC_ADAPT_PATHS (local patch): tree walks at the low width, sampled only
+  // Copy steps (local patch, Q27_COPY): host-drafted chains from an earlier span the output is copying.
+  bool copy_on_ = false;
+  int copy_min_ = 16;                    // Q27_COPY_MIN: tokens that must match to lock onto a source span
+  SpecTree* copy_tree_host_ = nullptr;   // pinned: the chain tree of the next copy step
+  int32_t* copy_ids_host_ = nullptr;     // pinned: [kSpecBlock] its verify ids; [kSpecBlock] = 1 (choice.src)
+  std::unordered_map<uint64_t, int32_t> copy_index_;  // hash of copy_min_ tokens ending at i -> the latest such i
+  size_t copy_len_ = 0;                  // tokens of the sequence whose windows are indexed (positions < copy_len_)
+  uint64_t copy_pow_ = 1;                // kCopyBase ^ copy_min_
+  int64_t copy_src_ = -1;                // position of the source token that the next output token should equal
+  int copy_cool_ = 0, copy_backoff_ = 16;
+  bool copy_last_ = false;               // the last step was a copy step
+  bool copy_fresh_ = false;              // the lock of the last copy step was found for it
+  int64_t copy_steps_ = 0, copy_tokens_ = 0;
+  bool copy_eligible(const SpecSampling& smp) const;
+  bool copy_prepare();                   // decide and fill the host chain for the next step (no step in flight)
+  void copy_follow(const int32_t* out, int n);
+  void copy_reset() { copy_index_.clear(), copy_len_ = 0, copy_src_ = -1, copy_cool_ = 0, copy_backoff_ = 16, copy_last_ = false; }
   float adapt_up_ = 4.5f, adapt_down_ = 4.0f, adapt_alpha_ = 0.125f;
   void spec_adapt(SpecSampling& smp, int n) const;
   bool spec_pending_ = false;  // a verify ran since the last flush / reset
