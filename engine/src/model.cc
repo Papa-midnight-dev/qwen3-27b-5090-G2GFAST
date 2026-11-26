@@ -428,10 +428,17 @@ void Model::configure() {
   // (trees: blocks of up to 8 rows; their walks' random numbers and rows are laid out for that)
   if (draft_ && draft_->block() > ddims::kBlock) spec_paths_ = 1;
   // (kit4b, Astra round 1: multi-path trees over 16 rows reach the tree-tile ancestry defect of climb4; chains only)
-  if (spec_paths_ > 1) { log("[q27] Q27_SPEC_PATHS=%d is not supported in this build: 1", spec_paths_); spec_paths_ = 1; }
+  if (spec_paths_ > 2) { log("[q27] Q27_SPEC_PATHS=%d is not supported in this build: 2", spec_paths_); spec_paths_ = 2; }  // (2 paths: 15 rows, as v3)
   // (kit4b: two kernel overrides that the climb4 review found unsafe with this build are dropped before any kernel runs)
-  for (const char* v : {"Q27_ATTN_TC_SPLITS", "Q27_SKINNY_EXACT"})
-    if (getenv(v)) { log("[q27] %s is not supported in this build: ignored", v); unsetenv(v); }
+  for (const char* v : {"Q27_ATTN_TC_SPLITS", "Q27_SKINNY_EXACT", "Q27_SKINNY_FIT"})
+    if (getenv(v)) {
+      log("[q27] %s is not supported in this build: ignored", v);
+#ifdef _WIN32
+      _putenv_s(v, "");
+#else
+      unsetenv(v);
+#endif
+    }
   if (draft_ && draft_->dspine()) lookup_.on = 0;  // (the selector's lookup chains are DFlash2's 7 rows)
   // Adaptive verify width: on by default when the draft's block is longer than 8 (DSpine). A sequence verifies
   // Q27_SPEC_ADAPT_LOW rows while the moving average of its tokens per step is below Q27_SPEC_ADAPT_DOWN, the full block
@@ -2007,9 +2014,9 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   const int W_step = spec_rows(smp);
   Q27_CHECK(pos_ + W_step <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
   // Pages for this step's rows and for the one launched ahead. A copy step is never launched ahead, so it reserves
-  // only kSpecBlock beyond its rows, as v3 did. (kit4b fix: climb4 asked for pos_ + 2 * 128 on a 128-row copy step,
-  // which can evict a checkpoint or raise KvFull under shared KV pressure. Astra review of climb4.)
-  ensure_pages(pos_ + W_step + (smp.copy ? kSpecBlock : std::max(kSpecBlock, W_step)));
+  // only its own rows (kit4b, Astra rounds 1-2: climb4 asked for pos_ + 2 x 128; v3's rows + 16 still asks a 128-row
+  // step for a page its verify does not use, which can evict a checkpoint or raise KvFull under shared KV pressure).
+  ensure_pages(pos_ + W_step + (smp.copy ? 0 : std::max(kSpecBlock, W_step)));
   auto same = [](const SpecSampling& a, const SpecSampling& b) { return a.same(b); };
   static const char* trace = getenv("Q27_TRACE");  // debug timeline (build with -DQ27_TRACE)
   if (trace) trace_step_begin(s_);
@@ -2741,7 +2748,6 @@ void Model::batch_enter(const int32_t* lanes, int n) {
   wait_ring_h2d();
   Q27_CHECK(n >= 1 && n <= max_lanes(), "spec_step_lanes: more lanes than MAX_SEQS");
   Q27_CHECK(spec_paths_ == 1, "spec_step_lanes: chains only (Q27_SPEC_PATHS=1)");
-  copy_full_ = false;  // (kit4b: a batched step ends the running copy run's promotion)
   for (int z = 0; z < n; z++) {
     const int a = lanes[z];
     Q27_CHECK(a == -1 || (a >= 0 && a < int(parked_.size()) && parked_[a].used), "spec_step_lanes: no such sequence");
@@ -3088,7 +3094,7 @@ void Model::batch_rows(int n, int* w) {
 }
 
 // batch_enter, the lanes' rows (see above) and the pages for them (the KV of lane z's verify block at pos ..).
-void Model::batch_prepare(const int32_t* lanes, int n) {
+void Model::batch_prepare(const int32_t* lanes, int n, const int* keep_w) {
   Q27_CHECK(draft_ && max_lanes() > 1, "spec_step_lanes: batched steps need a draft model and MAX_SEQS > 1");
   batch_enter(lanes, n);
   // Lanes of different rows need DSpine (DFlash2's blocks are 8) and the FP8-MMA verify; else every lane has 8.
@@ -3099,6 +3105,8 @@ void Model::batch_prepare(const int32_t* lanes, int n) {
   int w[kMaxLanes];
   if (!vary) {
     std::fill(w, w + n, ddims::kBlock);
+  } else if (keep_w) {  // (kit4b: the rows this masked batch was drafted with; planning again would move them)
+    std::copy(keep_w, keep_w + n, w);
   } else if (bft) {
     const int full = std::min(draft_->block(), kSpecBlock);
     const int per = std::clamp(batch_rows_ / n, 2, full);
@@ -3229,6 +3237,8 @@ void Model::spec_draft_lanes(const int32_t* lanes, int n, int32_t* chain) {
   }
   batch_prepare(lanes, n);
   Q27_CHECK(batch_masked(), "spec_draft_lanes: no masked lane");
+  b_draft_n_ = n;
+  for (int z = 0; z < n; z++) b_draft_w_[z] = blr_.rows(z), b_draft_lanes_[z] = lanes[z];
   batch_part(n, 1);
   Q27_CUDA(cudaMemcpyAsync(draft_host_, b_ids_, size_t(blr_.total()) * 4, cudaMemcpyDeviceToHost, s_));
   Q27_CUDA(cudaStreamSynchronize(s_));
@@ -3239,7 +3249,11 @@ void Model::spec_draft_lanes(const int32_t* lanes, int n, int32_t* chain) {
 }
 
 void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* counts) {
-  batch_prepare(lanes, n);
+  // (kit4b, Astra round 2: the adaptive planner's first call changes what its second returns, so a masked batch's
+  // verify could read rows planned differently from its draft (in v3 too). The verify reuses the drafted rows.)
+  const bool keep = b_drafted_ && n == b_draft_n_ && std::equal(lanes, lanes + n, b_draft_lanes_);
+  Q27_CHECK(!b_drafted_ || keep, "spec_step_lanes: a drafted masked batch is verified with other lanes");
+  batch_prepare(lanes, n, keep ? b_draft_w_ : nullptr);
   static const char* trace = getenv("Q27_TRACE");  // debug timeline (build with -DQ27_TRACE)
   if (trace) trace_step_begin(s_);
   cudaGraphExec_t exec = nullptr;
@@ -3357,6 +3371,7 @@ void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* 
   }
   bpar_ ^= 1;
   bstep_++;
+  copy_full_ = false;  // (kit4b: a completed batched step ends the running copy run's promotion)
 }
 
 }  // namespace q27

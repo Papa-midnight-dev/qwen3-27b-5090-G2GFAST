@@ -486,7 +486,11 @@ class Model {
   BatchGraph& batch_graph(int n, int tag = 0);
   bool cut_part(int n, int part);    // a cut step's part (as batch_part's); returns whether a graph ran
   bool cut_rows(int n);              // the verify rows of a cut step (blr_) from b_conf_; false: none cut
-  void batch_prepare(const int32_t* lanes, int n);
+  void batch_prepare(const int32_t* lanes, int n, const int* keep_w = nullptr);
+  // (kit4b, Astra round 2: a masked batch is planned once, at its draft; the verify reuses those rows)
+  int b_draft_w_[kMaxLanes] = {};
+  int32_t b_draft_lanes_[kMaxLanes] = {};
+  int b_draft_n_ = 0;
   void batch_rows(int n, int* rows);  // the lanes' rows of a batched step (DSpine)
   void lane_note(SpecSampling& m, int rows, int tokens) const;
   bool batch_adapt_ = false;
