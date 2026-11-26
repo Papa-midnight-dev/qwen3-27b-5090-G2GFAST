@@ -358,10 +358,10 @@ class Model {
   char* stage_ = nullptr;            // device copy of one checkpoint on its way to the host
   cudaEvent_t stage_ev_ = nullptr, stage_in_ev_ = nullptr;  // staging free again / filled
   cudaEvent_t ring_ready_ev_ = nullptr;  // async draft ring H2D done on cs_
-  cudaEvent_t ring_prior_ev_ = nullptr;
+  cudaEvent_t ring_prior_ev_ = nullptr;  // (kit4b fix: the ring restore on cs_ waits for earlier work on s_)
   bool copy_full_ = false;   // (kit4b) the last step was a copy step that accepted every row: the next may use 128
   int drafted_rows_ = 0;     // (kit4b) the rows spec_draft drafted for a masked step; spec_step verifies the same chain
-  bool drafted_tree_ = false;  // (kit4b fix: the ring restore on cs_ waits for earlier work on s_)
+  bool drafted_tree_ = false;  // (kit4b) whether spec_draft drafted a tree (never, for a masked step)
   bool ring_h2d_pending_ = false;
   void wait_ring_h2d();              // stream-wait s_ on ring_ready_ev_ before draft accesses ring
   void sync_ring_h2d();              // host-sync cs_ before touching checkpoint slots

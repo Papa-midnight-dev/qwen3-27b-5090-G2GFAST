@@ -427,6 +427,11 @@ void Model::configure() {
   spec_paths_ = std::clamp(env_int("Q27_SPEC_PATHS", 1), 1, kTreePaths);
   // (trees: blocks of up to 8 rows; their walks' random numbers and rows are laid out for that)
   if (draft_ && draft_->block() > ddims::kBlock) spec_paths_ = 1;
+  // (kit4b, Astra round 1: multi-path trees over 16 rows reach the tree-tile ancestry defect of climb4; chains only)
+  if (spec_paths_ > 1) { log("[q27] Q27_SPEC_PATHS=%d is not supported in this build: 1", spec_paths_); spec_paths_ = 1; }
+  // (kit4b: two kernel overrides that the climb4 review found unsafe with this build are dropped before any kernel runs)
+  for (const char* v : {"Q27_ATTN_TC_SPLITS", "Q27_SKINNY_EXACT"})
+    if (getenv(v)) { log("[q27] %s is not supported in this build: ignored", v); unsetenv(v); }
   if (draft_ && draft_->dspine()) lookup_.on = 0;  // (the selector's lookup chains are DFlash2's 7 rows)
   // Adaptive verify width: on by default when the draft's block is longer than 8 (DSpine). A sequence verifies
   // Q27_SPEC_ADAPT_LOW rows while the moving average of its tokens per step is below Q27_SPEC_ADAPT_DOWN, the full block
@@ -457,10 +462,10 @@ void Model::configure() {
   {  // (16, 32, 64, or 128 rows; 128 requires rep_rows_ >= 128)
     const int r = env_int("Q27_COPY_ROWS", 32);
     copy_rows_ = (r > 64 && rep_rows_ >= kCopyMaxT) ? kCopyMaxT : r > 32 ? 64 : r > kSpecBlock ? 32 : kSpecBlock;
-    // (kit4b: with decode-only W4A4x2 activations a 128-row copy step would drop the second term that a 64-row step
-    // keeps (review of climb4); such steps stay at 64 rows.)
-    if (act_a4x2_small_ && copy_rows_ > 64) {
-      log("[q27] Q27_ACT_A4X2=decode: copy steps of 64 rows (not %d)", copy_rows_);
+    // (kit4b: with W4A4x2 activations a 128-row copy step would drop the second term ('decode') or reach a path that
+    // needs the skinny GEMM ('all'); such steps stay at 64 rows.)
+    if (act_a4x2_ && copy_rows_ > 64) {  // (kit4b, Astra round 1: 'all' too; its two-term fused GEMMs stop at 64 rows)
+      log("[q27] Q27_ACT_A4X2 on: copy steps of 64 rows (not %d)", copy_rows_);
       copy_rows_ = 64;
     }
   }
@@ -2189,6 +2194,7 @@ bool Model::copy_prepare() {
     for (int64_t j = 0; j < K; j++)
       if (S(p - j) != S(L - 1 - j)) return false;  // (a hash collision)
     copy_src_ = p + 1, fresh = true;
+    if (W > 64) W = 64;  // (kit4b: a new copy run starts at 64 rows)
   }
   for (int m = 0; m < W - 1; m++) {
     const int64_t j = copy_src_ + m;
@@ -2271,7 +2277,7 @@ void Model::copy_follow(const int32_t* out, int n) {
   if (copy_src_ < 0) return;
   for (int m = 0; m < n; m++)
     if (S(copy_src_ + m) != out[m]) {
-      copy_src_ = -1;
+      copy_src_ = -1, copy_full_ = false;  // (kit4b: a broken run starts again at 64 rows)
       return;
     }
   copy_src_ += n;
@@ -2735,6 +2741,7 @@ void Model::batch_enter(const int32_t* lanes, int n) {
   wait_ring_h2d();
   Q27_CHECK(n >= 1 && n <= max_lanes(), "spec_step_lanes: more lanes than MAX_SEQS");
   Q27_CHECK(spec_paths_ == 1, "spec_step_lanes: chains only (Q27_SPEC_PATHS=1)");
+  copy_full_ = false;  // (kit4b: a batched step ends the running copy run's promotion)
   for (int z = 0; z < n; z++) {
     const int a = lanes[z];
     Q27_CHECK(a == -1 || (a >= 0 && a < int(parked_.size()) && parked_[a].used), "spec_step_lanes: no such sequence");
@@ -3132,7 +3139,9 @@ bool Model::batch_part(int n, int part) {
   if (x && !(lr == blr_)) x = capture([&] { batch_body(n, part); }, x);  // (other rows: updated in place)
   if (!x) x = capture([&] { batch_body(n, part); });
   lr = blr_;
-  stage_rows();
+  // (kit4b, Astra round 1: a cached part-1 graph reads b_lrh_p1_ (climb4's batch pipeline staging); refresh the buffer
+  // that the part's graph reads, as cut_part does, or a masked batch drafts with another batch's lane rows.)
+  if (part == 1) stage_rows_p1(); else stage_rows();
   Q27_CUDA(cudaGraphLaunch(x, s_));
   return true;
 }

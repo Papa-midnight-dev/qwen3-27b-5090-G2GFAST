@@ -600,7 +600,9 @@ class Generation:
         try:
             # (kit4b: only a 4-byte 'i' array goes as raw bytes; any other type converts by value. Astra review.)
             ok_raw = isinstance(ids, array.array) and ids.typecode == "i" and ids.itemsize == 4
-            ids_bytes = ids.tobytes() if ok_raw else array.array("i", ids).tobytes()
+            # (kit4b, Astra round 1: bytes or bytearray are not packed ids; convert them by value as v3 did)
+            vals = list(ids) if isinstance(ids, (bytes, bytearray)) else ids
+            ids_bytes = ids.tobytes() if ok_raw else array.array("i", vals).tobytes()
             req = dict(ids_bytes=ids_bytes, max_new=max_new, images=images, force=force, **(grammar or {}), **sampling)
         except (TypeError, OverflowError):
             req = dict(ids=ids, max_new=max_new, images=images, force=force, **(grammar or {}), **sampling)
