@@ -694,10 +694,90 @@ __global__ void __launch_bounds__(256) skinny_reduce_kernel(Params p) {
   }
 }
 
+__device__ __forceinline__ float skinny_block_sum(float v) {
+  __shared__ float red[32];
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  __syncthreads();
+  if (lane == 0) red[warp] = v;
+  __syncthreads();
+  const int nw = blockDim.x / 32;
+  v = lane < nw ? red[lane] : 0.f;
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+  return v;
+}
+
+// Fused split-K reduce + residual add + zero-centered RMSNorm + NVFP4 quant (+ optional BF16 capture & fp32 h_out).
+// Block per token (grid = M), 320 threads (one 16-channel group per thread, D = 5120): bit-identical to
+// skinny_reduce_kernel followed by rmsnorm_quant_kernel, saving 128 launches + 128 x_ reads per step!
+__global__ void __launch_bounds__(dims::kHidden / 16) skinny_reduce_norm_kernel(Params p, SkinnyNorm sn) {
+  pdl_trigger();
+  constexpr int D = dims::kHidden;
+  const int tok = blockIdx.x, kb = threadIdx.x;
+  const int col0 = kb * 16;
+  uint4 wraw[2];
+  wraw[0] = __ldg(reinterpret_cast<const uint4*>(sn.w + col0));
+  wraw[1] = __ldg(reinterpret_cast<const uint4*>(sn.w + col0 + 8));
+  const bf16* wv = reinterpret_cast<const bf16*>(wraw);
+  const int64_t o0 = int64_t(tok) * D + col0;
+  const int64_t stride = int64_t(p.M) * D;
+  pdl_wait();
+  float v[16];
+  const float4* cp = reinterpret_cast<const float4*>(p.c + o0);
+  float4* dp = reinterpret_cast<float4*>(p.d + o0);
+#pragma unroll
+  for (int q = 0; q < 4; q++) {
+    const int64_t at = o0 + q * 4;
+    float s[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int sp0 = 0; sp0 < p.splits; sp0 += 8) {
+      float4 x[8];
+#pragma unroll
+      for (int u = 0; u < 8; u++)
+        x[u] = sp0 + u < p.splits ? __ldcg(reinterpret_cast<const float4*>(p.part + (sp0 + u) * stride + at))
+                                  : make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+      for (int u = 0; u < 8; u++)
+        if (sp0 + u < p.splits) s[0] += x[u].x, s[1] += x[u].y, s[2] += x[u].z, s[3] += x[u].w;
+    }
+    const float4 cv = cp[q];
+    const float c4[4] = {cv.x, cv.y, cv.z, cv.w};
+#pragma unroll
+    for (int e = 0; e < 4; e++) {
+      const float a = alpha_of(p.alpha, col0 + q * 4 + e);
+      v[q * 4 + e] = __fmaf_rn(p.beta, c4[e], __fmul_rn(a, s[e]));
+    }
+    dp[q] = make_float4(v[q * 4], v[q * 4 + 1], v[q * 4 + 2], v[q * 4 + 3]);
+  }
+  if (sn.cap) {
+    uint32_t packed[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+      const __nv_bfloat162 b2 = __floats2bfloat162_rn(v[2 * j], v[2 * j + 1]);
+      packed[j] = *reinterpret_cast<const uint32_t*>(&b2);
+    }
+    uint4* o = reinterpret_cast<uint4*>(sn.cap + int64_t(tok) * sn.cap_ld + col0);
+    o[0] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+    o[1] = make_uint4(packed[4], packed[5], packed[6], packed[7]);
+  }
+  float ss = 0.f;
+#pragma unroll
+  for (int j = 0; j < 16; j++) ss += v[j] * v[j];
+  const float r = rsqrtf(skinny_block_sum(ss) / D + sn.eps);
+#pragma unroll
+  for (int j = 0; j < 16; j++) v[j] = v[j] * r * (1.f + __bfloat162float(wv[j]));
+  if (sn.h_out) {
+    float4* o = reinterpret_cast<float4*>(sn.h_out + o0);
+#pragma unroll
+    for (int j = 0; j < 4; j++) o[j] = make_float4(v[4 * j], v[4 * j + 1], v[4 * j + 2], v[4 * j + 3]);
+  }
+  skinny_quant_block16(v, sn.in_scale, tok, kb, D, sn.q4, sn.sf4);
+}
+
 template <Fmt kFmt>
-void launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
+bool launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
             const AlphaSegments& alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes,
-            cudaStream_t s, const float* wscale = nullptr, const float* ascale = nullptr, int x2 = 0, int a2row = -1) {
+            cudaStream_t s, const float* wscale = nullptr, const float* ascale = nullptr, int x2 = 0, int a2row = -1,
+            const SkinnyNorm* norm = nullptr) {
   if (a2row < 0) a2row = x2;
   // W4A4x2 with the second terms elsewhere (a2row != x2): x2 <= 64 tokens, M = 2 x2 partial rows (kX2)
   const bool x2far = x2 && a2row != x2;
@@ -765,11 +845,18 @@ void launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const ui
   p.wscale = wscale, p.ascale = ascale;
   // Split-K sums in their own kernel above Q27_SKINNY_EXT_REDUCE_M rows (default 8: in-kernel last-CTA reduce
   // wins by +1.5% on M <= 8 at 450 W, external skinny_reduce_kernel wins on M >= 16).
+  // When fused reduce+residual+rmsnorm+quant is requested (M >= Q27_FUSE_REDUCE_NORM_M, default 1), force
+  // ext_reduce so skinny_kernel exits cleanly and skinny_reduce_norm_kernel fuses reduce + norm + NVFP4 quant.
   const char* e_ext = getenv("Q27_SKINNY_EXT_REDUCE_M");
+  const char* e_fn = getenv("Q27_FUSE_REDUCE_NORM_M");
+  const int fn_min = e_fn && *e_fn ? atoi(e_fn) : 9;
+  const bool fuse_norm = kFp4 && norm && norm->w && !x2 && !wscale && p.c && p.beta == 1.f && p.N == dims::kHidden &&
+                         p.splits > 1 && fn_min > 0 && M >= fn_min;
   // (W4A4x2: decided by the tokens, x2, as for a one-term call of x2 rows; with one split and more than one token
   // the partials go through the reduce kernel, which sums the two terms of a token)
   p.x2 = x2, p.a2row = a2row;
-  p.ext_reduce = (splits > 1 && (x2 ? x2 : M) > (e_ext ? atoi(e_ext) : 8)) || (x2 > 1 && splits == 1) || x2far;
+  p.ext_reduce = fuse_norm || (splits > 1 && (x2 ? x2 : M) > (e_ext ? atoi(e_ext) : 8)) ||
+                 (x2 > 1 && splits == 1) || x2far;
   p.counters = static_cast<int*>(ws);
   p.part = reinterpret_cast<float*>(static_cast<uint8_t*>(ws) + cnt_bytes);
   const dim3 grid(tiles, splits), block(kWarps * 32);
@@ -790,9 +877,12 @@ void launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const ui
     launch_pdl(skinny_kernel<kFmt, kStages, 8>, grid, block, kSmem8, s, p);
   else if constexpr (kFp4)  // M = 65..128: two 64-token passes per weight chunk (bit-identical to M = 1)
     launch_pdl(skinny_kernel<kFmt, kStages, 8, false, false, false, true>, grid, block, kSmemX2, s, p);
-  if (p.ext_reduce)
+  if (fuse_norm)
+    launch_pdl(skinny_reduce_norm_kernel, dim3(unsigned(M)), dim3(dims::kHidden / 16), 0, s, p, *norm);
+  else if (p.ext_reduce)
     launch_pdl(skinny_reduce_kernel, dim3(unsigned(ceil_div(int64_t(M) * N / 4, 256))), dim3(256), 0, s, p);
   Q27_CUDA(cudaGetLastError());
+  return fuse_norm;
 }
 
 }  // namespace
@@ -801,6 +891,13 @@ void skinny_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, cons
                 const AlphaSegments& alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes,
                 cudaStream_t s, int x2, int a2row) {
   launch<Fmt::kFp4>(M, N, K, a, a_sf, w, w_sf, alpha, c, beta, d, ws, ws_bytes, s, nullptr, nullptr, x2, a2row);
+}
+
+bool skinny_fp4_norm(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
+                     const AlphaSegments& alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes,
+                     cudaStream_t s, const SkinnyNorm& norm) {
+  return launch<Fmt::kFp4>(M, N, K, a, a_sf, w, w_sf, alpha, c, beta, d, ws, ws_bytes, s, nullptr, nullptr, 0, -1,
+                           &norm);
 }
 
 void skinny_fp4_glu(int M, int I, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* gate_up,

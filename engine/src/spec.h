@@ -78,6 +78,7 @@ struct SpecSampling {
   int bftree = 0;
   int bftree_nodes = 0;
   float bftree_temp = 1.f;
+  int bftree_walks = 0, bftree_walks_next = 0, bftree_walks_due = 0;
   int rollout = 1, rollout_next = 1, rollout_due = 1;
   // Batched steps (Model::batch_prepare): the lane's rows (4 / 8 / 12 / 16, DSpine) and the moving average of its tokens
   // per batched step at those rows. Past batched steps decide them, as the single width above.
@@ -93,7 +94,7 @@ struct SpecSampling {
            min_p == o.min_p && pen.presence == o.pen.presence && pen.frequency == o.pen.frequency &&
            logprobs == o.logprobs && masked == o.masked && stop[2] == o.stop[2] && biased == o.biased &&
            ignore_eos == o.ignore_eos && block == o.block && copy == o.copy && bftree == o.bftree &&
-           bftree_nodes == o.bftree_nodes && rollout == o.rollout;
+           bftree_nodes == o.bftree_nodes && bftree_walks == o.bftree_walks && rollout == o.rollout;
   }
 };
 

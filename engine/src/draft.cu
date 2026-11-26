@@ -795,8 +795,8 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
   // the paths are the smp.paths best of a beam search (one path: the argmax walk).
   SpecTree* tr = choice.tree;
   const int K = max(1, min(smp.paths, kTreePaths));
-  const bool use_bftree = kPre && !kBatch && smp.bftree > 0 && (smp.temperature <= 0.f || smp.bftree >= 2);
-  const int bf_budget = min(kSpecBlock, max(2, smp.bftree_nodes > 0 ? smp.bftree_nodes : nd + 1));
+  const bool use_bftree = kPre && smp.bftree > 0 && (smp.temperature <= 0.f || smp.bftree >= 2);
+  const int bf_budget = kBatch ? nrows : min(kSpecBlock, max(2, smp.bftree_nodes > 0 ? smp.bftree_nodes : nd + 1));
   if (use_bftree)
     nrows = bf_budget;
   else if (!kBatch && K == 1)
@@ -970,20 +970,21 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
     __syncwarp();
     if (lane == 0) build_dfs(n_nodes);
   } else if (use_bftree && smp.temperature > 0.f) {
-    // Budget-capped exact lossless level-by-level stochastic tree (<= bf_budget nodes, K=4 walks).
+    // Budget-capped exact lossless level-by-level stochastic tree (<= bf_budget nodes, kSK <= 4 walks).
     // At every node u, the number of draws mdraw = min(walks_at[u], B - n_nodes) depends ONLY on earlier
     // depths and earlier siblings, NEVER on draws at u, so draws at u are strictly i.i.d. from q[u].
-    constexpr int kSK = kTreePaths;
-    __shared__ int8_t w_node[kSK];
+    const int kSK = max(1, min(smp.bftree_walks > 0 ? smp.bftree_walks : kTreePaths, kTreePaths));
+    __shared__ int8_t w_node[kTreePaths], next_w[kTreePaths];
     __shared__ int8_t done_mark[kSpecBlock];
     if (lane < kSK) w_node[lane] = 0;
     __syncwarp();
     for (int e = 0; e < nd; e++) {
+      if (lane < kSK) next_w[lane] = -1;
       if (lane < bf_budget) done_mark[lane] = 0;
       __syncwarp();
       for (int k0 = 0; k0 < kSK; k0++) {
         int u = -1, mdraw = 0;
-        int ws[kSK], m = 0;
+        int ws[kTreePaths], m = 0;
         if (lane == 0) {
           const int cand_u = w_node[k0];
           if (cand_u >= 0 && !done_mark[cand_u]) {
@@ -992,7 +993,6 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
             for (int k = k0; k < kSK; k++)
               if (w_node[k] == cand_u) ws[m++] = k;
             mdraw = min(m, bf_budget - n_nodes);
-            for (int j = mdraw; j < m; j++) w_node[ws[j]] = -1;
           }
         }
         u = __shfl_sync(0xffffffffu, u, 0);
@@ -1023,11 +1023,13 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
           if (lane == 0) {
             const int c = node_of(u, idx, e, 0.f);
             tr->draws[u][tr->ndraws[u]++] = int8_t(c);
-            w_node[wk] = int8_t(c);
+            next_w[wk] = int8_t(c);
           }
           __syncwarp();
         }
       }
+      if (lane < kSK) w_node[lane] = next_w[lane];
+      __syncwarp();
       if (n_nodes >= bf_budget) break;
     }
     __syncwarp();

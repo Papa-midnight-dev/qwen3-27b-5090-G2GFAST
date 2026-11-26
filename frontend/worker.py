@@ -35,6 +35,7 @@ import collections
 import ctypes
 import os
 import random
+import struct
 import sys
 import time
 import traceback
@@ -69,7 +70,15 @@ class Seq:
 
     def __init__(self, rid, req, now):
         self.rid = rid
-        self.prompt = list(req["ids"])
+        raw = req.get("ids_bytes")
+        if raw is not None:
+            self._bytes = raw
+            p = array.array("i")
+            p.frombytes(raw)
+            self.prompt = p
+        else:
+            self.prompt = array.array("i", req["ids"])
+            self._bytes = self.prompt.tobytes()
         self.max_new = req["max_new"]
         self.temperature, self.top_k, self.top_p = req["temperature"], req["top_k"], req["top_p"]
         self.min_p = req.get("min_p", 0.0)
@@ -97,7 +106,9 @@ class Seq:
         self.force, self.unsent = req.get("force"), []
         if self.force is not None and self.force[0] is None:
             self.out, self.force = list(self.force[1]), None
-            self.eng_ids, self.unsent = self.prompt + self.out, list(self.out)
+            self.eng_ids = array.array("i", self.prompt)
+            self.eng_ids.extend(self.out)
+            self.unsent = list(self.out)
         # Structured output: the llguidance grammar, and the token after which it applies (the end of the
         # reasoning; None: from the start). matcher: made on arrival (Scheduler.submit); gm: the same once the grammar
         # applies (every output token after that goes through it, and the engine masks the logits by it).
@@ -117,7 +128,6 @@ class Seq:
         self.dead = False
         self.share_with, self.share_len = None, 0  # an earlier request still computing a prefix this one shares
         self.held = False        # kept waiting by the admission (counted once)
-        self._bytes = None
         self.begun = None        # time of the first prefix_begin
         self.computed = 0        # prompt tokens prefilled (not restored from the cache)
         self.prefill_s = self.decode_s = 0.0  # time in its prefill turns / decode turns (a batched turn counts for each)
@@ -168,6 +178,8 @@ class Scheduler:
         self.quantum = cfg["quantum_ms"] / 1000.0
         self.eos = set(cfg["eos"])
         self.im_start = cfg["im_start"]
+        self._im_start_bytes = struct.pack("i", self.im_start)
+        self._batch_out = None
         self.user = cfg.get("user")
         self.breaks = frozenset(cfg.get("breaks", ()))
         self.waiting = collections.deque()
@@ -216,7 +228,6 @@ class Scheduler:
         # (the server checks the request; a malformed one that gets past it fails alone, not the engine)
         try:
             s = Seq(rid, req, time.time())
-            array.array("i", s.prompt)  # (integers that fit int32)
             # (an image's positions hold ids above the vocabulary: image_tokens.image_token_ids)
             if s.prompt and (min(s.prompt) < 0 or (max(s.prompt) >= VOCAB and not s.images)):
                 raise ValueError(f"a prompt token id is out of the vocabulary (0..{VOCAB - 1})")
@@ -232,14 +243,14 @@ class Scheduler:
             s.gm = s.matcher if s.grammar_after is None else None
             self.m["q27:structured_requests_total"] += 1
         _t_sub0 = time.perf_counter() if os.environ.get("Q27_TIMING") else 0.0
-        s.reusable = self.reusable(s.prompt)
+        p = s.ids_bytes()
+        s.reusable = self.reusable(p)
         _t_sub1 = time.perf_counter() if _t_sub0 else 0.0
         # Requests that arrive together (an agent and its sub-agents) often share a long prefix (the system
         # prompt and tools) that no checkpoint holds yet: the later one waits until the earlier one has run
         # past it (with a checkpoint planned there) instead of computing it again.
-        p = array.array("i", s.prompt).tobytes()
         for o in list(self.alive) + list(self.waiting):
-            n = lcp_bytes(p, array.array("i", o.eng_ids).tobytes())
+            n = lcp_bytes(p, o.ids_bytes())
             n = min(n, len(s.prompt) - 1) // 64 * 64
             if n > max(s.reusable, s.share_len) + 256 and not (o.started and o.fed >= n):
                 s.share_with, s.share_len = o, n
@@ -249,10 +260,21 @@ class Scheduler:
                 o.at = sorted(set(o.at) | {s.share_len})
             s.reusable = s.share_len
         _t_sub2 = time.perf_counter() if _t_sub0 else 0.0
-        s.at = self.checkpoints(s.prompt, s.reusable)
+        # C-level 4-byte-aligned scan for im_start (<0.05 ms at 129K tokens vs 5-10 ms Python loop)
+        needle = self._im_start_bytes
+        starts, pos = [], 0
+        while True:
+            idx = p.find(needle, pos)
+            if idx < 0:
+                break
+            if (idx & 3) == 0:
+                starts.append(idx >> 2)
+                pos = idx + 4
+            else:
+                pos = (idx + 3) & ~3
+        s.at = self.checkpoints(s.prompt, s.reusable, starts=starts)
         _t_sub3 = time.perf_counter() if _t_sub0 else 0.0
         # (stats: where the first message ends, the last message and the generation prompt start)
-        starts = [i for i, t in enumerate(s.prompt) if t == self.im_start]
         s.marks = (starts[1:2] or [0]) + (starts[-2:-1] or [0]) + (starts[-1:] or [0])
         if _t_sub0 and len(s.prompt) >= 1000:
             _t_sub4 = time.perf_counter()
@@ -445,7 +467,8 @@ class Scheduler:
     def reusable(self, prompt):
         """Tokens of the prompt an ideal prefix cache could reuse: the longest common prefix with a recent
         prompt + output (the rest is new to the server). cached / reusable measures the cache itself."""
-        p = array.array("i", prompt).tobytes()
+        p = prompt if isinstance(prompt, (bytes, bytearray)) else array.array("i", prompt).tobytes()
+        n_tok = len(p) // 4
         best = 0
         for h in self.history:
             lo, hi = best, min(len(p), len(h)) // 4  # binary search on memcmp'd slices
@@ -455,16 +478,17 @@ class Scheduler:
                 mid = (lo + hi + 1) // 2
                 lo, hi = (mid, hi) if p[4 * lo:4 * mid] == h[4 * lo:4 * mid] else (lo, mid - 1)
             best = lo
-        return max(0, min(best, len(prompt) - 1))  # (the engine always runs the last prompt token)
+        return max(0, min(best, n_tok - 1))  # (the engine always runs the last prompt token)
 
-    def checkpoints(self, prompt, reusable):
+    def checkpoints(self, prompt, reusable, starts=None):
         """Checkpoints of a prompt (docs/architecture.md §9): the end of the first message (the shared system prompt
         and tools), the starts of the last message and of the generation prompt (a retried request, or a
         client that rewrites the last turn), and where the prompt leaves the longest earlier sequence (a
         prefix shared inside a message), and after the last blank line of a final user message (a document followed
         by a question: the next question about it shares the document). The end of the generation is saved
         after it."""
-        starts = [i for i, t in enumerate(prompt) if t == self.im_start]
+        if starts is None:
+            starts = [i for i, t in enumerate(prompt) if t == self.im_start]
         at = set(starts[1:2] + starts[-2:])
         if len(starts) >= 2 and starts[-2] + 1 < len(prompt) and prompt[starts[-2] + 1] == self.user:
             # (positions are rounded down to 64 in the engine: the generation prompt's start can land past the end of
@@ -838,10 +862,15 @@ class Scheduler:
             new = self.engine.spec_step_lanes(lanes)
             self.m["q27:spec_verify_calls_total"] += len(seqs)
             self.m["q27:batched_steps_total"] += 1
-            for z, (s, toks) in enumerate(zip(seqs, new)):
-                s.steps += 1
-                self.count_draft(s, toks, max(1, self.engine.last_lane_block(z) or 8) - 1)
-                self.emit(s, toks, self.engine.logprobs(z) if s.logprobs >= 0 else None)
+            self._batch_out = []
+            try:
+                for z, (s, toks) in enumerate(zip(seqs, new)):
+                    s.steps += 1
+                    self.count_draft(s, toks, max(1, self.engine.last_lane_block(z) or 8) - 1)
+                    self.emit(s, toks, self.engine.logprobs(z) if s.logprobs >= 0 else None)
+                self._flush_batch()
+            finally:
+                self._batch_out = None
             if (any(s.dead or s.phase != DECODE for s in seqs) or time.time() >= t0 + turn or self.conn.poll(0)
                     or self.returns):
                 break
@@ -853,6 +882,11 @@ class Scheduler:
         if has_prefill:
             self.credit -= dt
 
+    def _flush_batch(self):
+        if self._batch_out:
+            self.send("batch_out", self._batch_out)
+            self._batch_out = []
+
     def count_draft(self, s, toks, drafted=7):
         """A verify step's tokens are the accepted drafts and the bonus token. The server gets the counts so far too
         (the timings of a request a stop string ends before the engine reports it)."""
@@ -860,7 +894,11 @@ class Scheduler:
             return
         s.drafted += drafted
         s.draft_accepted += len(toks) - 1
-        self.send("drafts", s.rid, s.drafted, s.draft_accepted)
+        msg = ("drafts", s.rid, s.drafted, s.draft_accepted)
+        if self._batch_out is not None:
+            self._batch_out.append(msg)
+        else:
+            self.send(*msg)
 
     def emit(self, s, toks, logprobs=None):
         """Tokens of a step: stops at EOS and at max_new, and at the token a forced output follows (force); the rest goes
@@ -892,8 +930,10 @@ class Scheduler:
         if out or s.unsent:
             self.send_toks(s, out, logprobs)
         if finish:
+            self._flush_batch()
             self.finish(s, finish)
         elif force is not None:
+            self._flush_batch()
             self.force_output(s, force)
         elif cut:
             # The engine holds tokens past the grammar's: s runs its prompt + output again from the prefix cache.
@@ -907,9 +947,13 @@ class Scheduler:
         """Sends output tokens, after the forced ones not sent yet (their logprob: 0, no top entries)."""
         forced, s.unsent = s.unsent, []
         if s.logprobs < 0:
-            self.send("tok", s.rid, forced + out)
+            msg = ("tok", s.rid, forced + out)
         else:
-            self.send("tok", s.rid, forced + out, [(0.0, [])] * len(forced) + list((logprobs or [])[:len(out)]))
+            msg = ("tok", s.rid, forced + out, [(0.0, [])] * len(forced) + list((logprobs or [])[:len(out)]))
+        if self._batch_out is not None:
+            self._batch_out.append(msg)
+        else:
+            self.send(*msg)
 
     def force_output(self, s, ids):
         """The output continues with ids (the forced start of a tool call after the reasoning, tool_choice): s's state
@@ -952,7 +996,8 @@ class Scheduler:
         elif v.area is not None:
             self.engine.seq_suspend(v.area)
             v.area = None
-        v.eng_ids = v.prompt + v.out  # (ids_bytes follows the new length)
+        v.eng_ids = array.array("i", v.prompt)
+        v.eng_ids.extend(v.out)  # (ids_bytes follows the new length)
         v.started, v.fed, v.phase = False, 0, PREFILL
 
     def finish(self, s, reason, save=True, notify=True):
@@ -973,7 +1018,7 @@ class Scheduler:
         elif s is self.cur and end:
             self.engine.checkpoint()
         if s.started or s.out:
-            self.history.append(array.array("i", s.prompt + s.out).tobytes())
+            self.history.append(s.prompt.tobytes() + array.array("i", s.out).tobytes())
         now = time.time()
         info = {"prompt_tokens": len(s.prompt), "completion_tokens": len(s.out), "cached_tokens": s.cached or 0,
                 "ttft": (s.first_token - s.arrival) if s.first_token else None, "total": now - s.arrival,

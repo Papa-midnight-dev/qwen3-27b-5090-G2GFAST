@@ -19,6 +19,7 @@ Requests are cancelled when the client disconnects or a stop string matches.
 """
 
 import argparse
+import array
 import base64
 import json
 import math
@@ -393,6 +394,12 @@ class EngineClient:
                         self.wanted, self.refused = False, (time.monotonic(), msg[1])
                         self.on_demand = "unloaded"
                         HUB.engine_state_set("stopped", msg[1])
+                elif kind == "batch_out":
+                    with self.lock:
+                        targets = [(self.handles.get(sub[1]), sub) for sub in msg[1]]
+                    for q, sub in targets:
+                        if q is not None:
+                            q.put(sub)
                 else:
                     rid = msg[1]
                     if kind == "done":
@@ -590,7 +597,11 @@ class Generation:
         # For _stopped_timings: the last "prefilled" info, (arrival time, tokens) of the prefill's "tok" and those after
         # it, and when the first token came.
         self.prefilled, self.toks, self.first_tok, self.drafts = None, [], None, None
-        req = dict(ids=ids, max_new=max_new, images=images, force=force, **(grammar or {}), **sampling)
+        try:
+            ids_bytes = ids.tobytes() if isinstance(ids, array.array) else array.array("i", ids).tobytes()
+            req = dict(ids_bytes=ids_bytes, max_new=max_new, images=images, force=force, **(grammar or {}), **sampling)
+        except (TypeError, OverflowError):
+            req = dict(ids=ids, max_new=max_new, images=images, force=force, **(grammar or {}), **sampling)
         self.sampling_logprobs = sampling.get("logprobs", -1)
         # (ignore_eos: the end-of-sequence tokens count and have logprobs, but their text is left out, as vLLM's
         # skip_special_tokens does)
@@ -810,6 +821,8 @@ class Server:
                 opts = options_of(video, proc.video.max_frames)
             except ValueError as e:
                 raise ApiError(400, str(e)) from e
+            if isinstance(ids, array.array):
+                ids = ids.tolist()
             ids, spans, srcs, videos = proc.prepare(ids, media, self.pads, self.encode, opts)
             images = (spans, srcs, videos)
         return ids, images
@@ -1653,7 +1666,8 @@ class Handler(BaseHTTPRequestHandler):
                                      body.get("mm_processor_kwargs"))
         else:
             ids = self.srv.encode(body.get("prompt", ""))
-        self._json(200, {"tokens": ids, "count": len(ids), "max_model_len": self.srv.max_tokens})
+        self._json(200, {"tokens": ids.tolist() if isinstance(ids, array.array) else ids, "count": len(ids),
+                         "max_model_len": self.srv.max_tokens})
 
     def detokenize(self, body):
         with self.srv.tok_lock:

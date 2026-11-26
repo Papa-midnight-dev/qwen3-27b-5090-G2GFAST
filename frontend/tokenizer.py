@@ -133,6 +133,8 @@ class Tokenizer:
         self._seg_cache = collections.OrderedDict()
         self._seg_chars = 0
         self._seg_limit = int(float(os.environ.get("Q27_TOKEN_CACHE_MB", "0")) * 1e6)
+        self._esc_cache = collections.OrderedDict()
+        self._esc_chars = 0
         self._marked_re = re.compile(ESC + "(.)", re.S)
 
     def encode(self, text):
@@ -188,6 +190,19 @@ class Tokenizer:
     def _escape(self, x):
         """x (strings, lists and mappings of them, keys too) with the added tokens' strings marked."""
         if isinstance(x, str):
+            if self._seg_limit and len(x) > 32:
+                got = self._esc_cache.get(x)
+                if got is not None:
+                    self._esc_cache.move_to_end(x)
+                    return got
+                y = x.replace(ESC, ESC + ESC) if ESC in x else x
+                y = self._added_re.sub(lambda m: self._mark[m.group()], y)
+                self._esc_cache[x] = y
+                self._esc_chars += len(x)
+                while self._esc_chars > self._seg_limit and self._esc_cache:
+                    k, _ = self._esc_cache.popitem(last=False)
+                    self._esc_chars -= len(k)
+                return y
             if ESC in x:
                 x = x.replace(ESC, ESC + ESC)
             return self._added_re.sub(lambda m: self._mark[m.group()], x)
@@ -254,18 +269,21 @@ class Tokenizer:
         tokens, the text between them is encoded without added tokens, with the marked strings put back."""
         if ESC not in text and not self._seg_limit:
             return self.encode(text)
-        out, parts, at = [], [], 0
+        added_ids, raw_segs, at = [], [], 0
         for m in self._added_re.finditer(text):
-            parts.append((len(out), text[at:m.start()]))
-            out.append(self._added_id[m.group()])
+            raw_segs.append(text[at:m.start()])
+            added_ids.append(self._added_id[m.group()])
             at = m.end()
-        parts.append((len(out), text[at:]))
+        raw_segs.append(text[at:])
         unmark = lambda m: self._unmark[m.group(1)]  # noqa: E731
-        segs = [self._marked_re.sub(unmark, s) if ESC in s else s for _, s in parts]
+        segs = [self._marked_re.sub(unmark, s) if ESC in s else s for s in raw_segs]
         if self._seg_limit:
             encs = self._encode_segments(segs)
         else:
             encs = [e.ids for e in self.plain.encode_batch(segs, add_special_tokens=False)]
-        for (pos, _), ids in reversed(list(zip(parts, encs))):
-            out[pos:pos] = ids
+        out = array.array("i")
+        for ids, aid in zip(encs, added_ids):
+            out.extend(ids)
+            out.append(aid)
+        out.extend(encs[-1])
         return out

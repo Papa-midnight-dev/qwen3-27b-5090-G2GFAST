@@ -1187,10 +1187,11 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
   }
   namespace cg = cooperative_groups;
   cg::cluster_group cluster = cg::this_cluster();
-  // Rows of a call (kWide, local patch: a single sequence's chain of up to kTreeMax = 64 rows, a copy step; trees hold
-  // at most 32 nodes) and rows staged at once (kStage: 16 for kWide so smem fits 2 CTAs/SM -> 1 wave on 170 SMs!)
-  constexpr int kRows = kWide ? kTreeMax : kTree ? 32 : kSpecBlock;
-  constexpr int kStage = kWide ? 16 : (kRows < 32 ? kRows : 32);
+  // Rows of a call: kWide && !kTree = copy chain up to kTreeMax=128 (staged 16 at a time);
+  // kTree && !kWide = compact tree <= 16 nodes (BF-Tree -> SHARED 21.7 KiB -> 2x SM occupancy across 48 layers!);
+  // kTree && kWide = legacy >16-node tree (32 nodes).
+  constexpr int kRows = (kWide && !kTree) ? kTreeMax : (kTree && kWide) ? 32 : kSpecBlock;
+  constexpr int kStage = (kWide && !kTree) ? 16 : (kRows < 32 ? kRows : 32);
   const int h = blockIdx.x / kRecSplit, part = blockIdx.x % kRecSplit, kh = h / (kVHeads / kKHeads);
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, j = lane % 8;
   const int lcol = kRecCols * warp + lane / 8;  // the lane's column in the CTA
@@ -1276,7 +1277,7 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
       const int leaf = tree->leaf[0];
       n = tree->depth[leaf] + 1;
       // (kWide: rows in order, as in every chain; the tree's paths hold 16 nodes)
-      if (tid < n) s_rows[tid] = kWide ? tid : tree->path[leaf][tid];
+      if (tid < n) s_rows[tid] = (kWide && !kTree) ? tid : tree->path[leaf][tid];
     }
   } else {
     pdl_wait();
@@ -1284,9 +1285,9 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
   }
   __syncthreads();
   GDN_PROBE(1);
-  if constexpr (!kWide) stage(in, n, s_rows);
+  if constexpr (!(kWide && !kTree)) stage(in, n, s_rows);
   GDN_PROBE(2);
-  if constexpr (kWide) {  // (research patch: tiles of kStage rows; S carries over, row order unchanged)
+  if constexpr (kWide && !kTree) {  // (research patch: tiles of kStage rows; S carries over, row order unchanged)
     for (int b0 = 0; b0 < n; b0 += kStage) {
       const int m = min(kStage, n - b0);
       stage(in, m, s_rows + b0);
@@ -1504,11 +1505,15 @@ void gdn_verify_prep(const float* qkv, int ld, int T, float* conv_state, const b
   Q27_CHECK(T <= kVerifyMaxT, "gdn_verify_prep: T must be <= 32");
   // T = 0 (flush): one column of blocks that only replays the conv state.
   // A chain (one path) needs no tree lookups: row t is at depth t.
-  if (sp.lanes > 0) {  // batched chain verify: T rows per lane (P6-10)
-    Q27_CHECK(sp.paths <= 1 && sp.lanes <= kMaxLanes && sp.lr.n == sp.lanes && sp.prow0, "gdn_verify_prep: batched chains only");
+  if (sp.lanes > 0) {  // batched verify: T rows per lane (chains or BF-Tree)
+    Q27_CHECK(sp.lanes <= kMaxLanes && sp.lr.n == sp.lanes && sp.prow0, "gdn_verify_prep: invalid batched spec");
     T = T > 0 ? sp.lr.max_rows() : 0;  // (each lane runs its own rows)
-    launch_pdl(gdn_prep_kernel<true, false, true>, dim3(prep_blocks<true>(T), sp.lanes), dim3(kPrepThreads), 0, s, qkv,
-               ld, T, conv_state, conv_w, h, wa, wb, PrepOut{q, nullptr, nullptr, nullptr}, sp);
+    if (sp.paths > 1)
+      launch_pdl(gdn_prep_kernel<true, true, true>, dim3(prep_blocks<true>(T), sp.lanes), dim3(kPrepThreads), 0, s, qkv,
+                 ld, T, conv_state, conv_w, h, wa, wb, PrepOut{q, nullptr, nullptr, nullptr}, sp);
+    else
+      launch_pdl(gdn_prep_kernel<true, false, true>, dim3(prep_blocks<true>(T), sp.lanes), dim3(kPrepThreads), 0, s, qkv,
+                 ld, T, conv_state, conv_w, h, wa, wb, PrepOut{q, nullptr, nullptr, nullptr}, sp);
   } else if (sp.paths > 1)
     launch_pdl(gdn_prep_kernel<true, true>, dim3(prep_blocks<true>(T)), dim3(kPrepThreads), 0, s, qkv, ld, T, conv_state, conv_w,
                h, wa, wb, PrepOut{q, nullptr, nullptr, nullptr}, sp);
@@ -1526,15 +1531,25 @@ void gdn_verify(const float* q, int T, const bf16* A_log, const bf16* dt_bias, f
                 cudaStream_t s, uint8_t* q4, uint8_t* sf4) {
   Q27_CHECK(T <= kVerifyMaxT, "gdn_verify: T must be <= 32");
   if (sp.lanes > 0) {
-    Q27_CHECK(sp.paths <= 1 && sp.lanes <= kMaxLanes && sp.lr.n == sp.lanes && sp.prow0, "gdn_verify: batched chains only");
-    launch_pdl_cluster(gdn_rec_kernel<true, false, true>, dim3(kVHeads * kRecSplit, sp.lanes), dim3(kRecWarps * 32), 0,
-                       s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w,
-                       eps, out, q8, in_scale, sp, q4, sf4);
-  } else if (sp.paths > 1)
-    launch_pdl_cluster(gdn_rec_kernel<true, true>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s, kRecSplit,
-                       RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w, eps, out, q8,
-                       in_scale, sp, q4, sf4);
-  else if (T > kSpecBlock)  // (local patch: a copy step's chain of 17..64 rows)
+    Q27_CHECK(sp.lanes <= kMaxLanes && sp.lr.n == sp.lanes && sp.prow0, "gdn_verify: invalid batched spec");
+    if (sp.paths > 1)
+      launch_pdl_cluster(gdn_rec_kernel<true, true, true>, dim3(kVHeads * kRecSplit, sp.lanes), dim3(kRecWarps * 32), 0,
+                         s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w,
+                         eps, out, q8, in_scale, sp, q4, sf4);
+    else
+      launch_pdl_cluster(gdn_rec_kernel<true, false, true>, dim3(kVHeads * kRecSplit, sp.lanes), dim3(kRecWarps * 32), 0,
+                         s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w,
+                         eps, out, q8, in_scale, sp, q4, sf4);
+  } else if (sp.paths > 1) {
+    if (T <= kSpecBlock)
+      launch_pdl_cluster(gdn_rec_kernel<true, true, false, false>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s,
+                         kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w, eps,
+                         out, q8, in_scale, sp, q4, sf4);
+    else
+      launch_pdl_cluster(gdn_rec_kernel<true, true, false, true>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s,
+                         kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w, eps,
+                         out, q8, in_scale, sp, q4, sf4);
+  } else if (T > kSpecBlock)  // (local patch: a copy step's chain of 17..64 rows)
     launch_pdl_cluster(gdn_rec_kernel<true, false, false, true>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s,
                        kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w, eps,
                        out, q8, in_scale, sp, q4, sf4);

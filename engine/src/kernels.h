@@ -266,9 +266,25 @@ struct AlphaSegments {
 // two terms' products (+ c, beta 1), each product rounded, then (c + first) + second.
 // a2row >= 0 (with x2 <= 64): the second term of token t is row a2row + t instead (a multiple of 128, its scales in
 // the same swizzled array), still one pass over the weights; M = 2 x2.
+// Optional fused epilogue for skinny_fp4_norm (split-K reduce + residual add + zero-centered RMSNorm + NVFP4 quant):
+// eliminates 128 kernel launches + 128 full x_ reads per decode/verify step (bit-identical to reduce + rmsnorm_quant).
+struct SkinnyNorm {
+  const bf16* w = nullptr;
+  float eps = 1e-6f;
+  float* h_out = nullptr;
+  float in_scale = 1.f;
+  uint8_t* q4 = nullptr;
+  uint8_t* sf4 = nullptr;
+  bf16* cap = nullptr;
+  int cap_ld = 0;
+};
 void skinny_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
                 const AlphaSegments& alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes,
                 cudaStream_t s, int x2 = 0, int a2row = -1);
+// Returns true if the fused reduce+residual+rmsnorm+quant ran (caller skips the subsequent rmsnorm_quant).
+bool skinny_fp4_norm(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
+                     const AlphaSegments& alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes,
+                     cudaStream_t s, const SkinnyNorm& norm);
 void skinny_fp4_glu(int M, int I, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* gate_up,
                     const uint8_t* gate_up_sf, float alpha_gate, float alpha_up, float out_scale, uint8_t* q,
                     uint8_t* q_sf, void* ws, size_t ws_bytes, cudaStream_t s);
@@ -422,10 +438,11 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
 // rotary delta), each computed exactly as attn_prep / attention_decode of that lane alone.
 void attn_prep_lanes(const float* qg, int ldq, const float* k, const float* v, int ldkv, const bf16* q_norm,
                      const bf16* k_norm, const SeqLanes& lanes, KvLayer kv, KvType kv_type, float* q_out,
-                     cudaStream_t s);
+                     cudaStream_t s, const SpecTree* trees = nullptr);
 void attention_decode_lanes(const float* q, const float* qg, int ldq, const SeqLanes& lanes, KvLayer kv,
                             KvType kv_type, float* out, void* ws, size_t ws_bytes, cudaStream_t s,
-                            uint8_t* q8 = nullptr, float in_scale = 1.f, uint8_t* q4 = nullptr, uint8_t* sf4 = nullptr);
+                            uint8_t* q8 = nullptr, float in_scale = 1.f, uint8_t* q4 = nullptr, uint8_t* sf4 = nullptr,
+                            const SpecTree* trees = nullptr);
 // Whether the lanes of a batched verify may have different rows (the FP8-MMA verify of FP8 / NVFP4 KV; read per call,
 // Q27_ATTN_TC_F8). Otherwise every lane has 8.
 bool attention_lanes_vary(KvType kv_type);
@@ -433,6 +450,8 @@ bool attention_lanes_vary(KvType kv_type);
 // slots pos + row) moves to pos + i in all nlayers attention layers (layers_dev: device array).
 void kv_commit(KvLayer* layers_dev, int nlayers, KvType kv_type, const int32_t* page_table, const int32_t* pos_dev,
                const int32_t* ncommit, const int32_t* cpath, cudaStream_t s);
+void kv_commit_lanes(KvLayer* layers_dev, int nlayers, KvType kv_type, const SeqLanes& lanes,
+                     const int32_t* ncommit, const int32_t* cpath, cudaStream_t s);
 
 // ---------------------------------------------------------------- sampling (sampling.cu)
 

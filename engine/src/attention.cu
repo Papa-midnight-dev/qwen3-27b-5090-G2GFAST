@@ -116,6 +116,7 @@ __global__ void attn_prep_kernel(const float* qg, int ldq, const float* k, const
     const int z = lr.lane(t);
     tl = t - lr.first(z);
     pos_dev = lanes.pos + z, page_table = lane_sel(lanes.page_table, z), rope.delta = lanes.rope_delta + z;
+    if (tree) tree += z;
   }
   bool is_q = slot < kHeads;
   int head = is_q ? slot : slot - kHeads;
@@ -140,7 +141,7 @@ __global__ void attn_prep_kernel(const float* qg, int ldq, const float* k, const
   };
   if (!tree) rotation(pos + delta);
   pdl_wait();
-  if (tree) rotation(*pos_dev + tree->depth[t] + delta);
+  if (tree) rotation(*pos_dev + tree->depth[tl] + delta);
   __shared__ float xs[kHeadDim];
   __shared__ float red[kHeadDim / 32];
   float x = src[d];
@@ -974,7 +975,7 @@ __device__ __forceinline__ uint32_t sw8(int row, int unit) { return row * kHeadD
 // (8 consecutive dim groups of 4) and for ldmatrix (8 consecutive dims).
 __device__ __forceinline__ uint32_t vt_off(int d, int hh) { return uint32_t((2 * d + hh) ^ ((d >> 2) & 7)) << 4; }
 
-// Splits of the block ending at bend (absolute, a multiple of kFaQ); the second starts at bend / 2.
+// Splits of the block ending at bend (absolute, a multiple of kFaQ).
 __host__ __device__ constexpr int fa_splits(int bend) { return bend > kFaSplitMin ? kFaSplits : 1; }
 
 template <class KV, int kF8 = 0>
@@ -1423,6 +1424,233 @@ __global__ void __launch_bounds__(kFaWarps * 32, 1) attention_fa_kernel(const fl
   }
 }
 
+// 8-warp (16 tokens x 2 query heads of one KV group, 256 threads) FP8-MMA flash attention for short warm tails
+// after long contexts (T <= 192, pos0 >= 4096): keeps the exact 64-token block end bend = (w0 | 63) + 1 and
+// kFaSplits = 2 split point bend/2 of attention_fa_kernel<uint8_t, 2>. For T=64 launches 96 CTAs (<= 170 SMs ->
+// 1 single wave, zero 2-CTA tail!), sharing KV cp.async and V^T across both heads (2x less KV/V^T work vs 1-head),
+// with 4 cooperating warps per head (only 32 output regs -> STACK:0, 100% bit-identical to v3!).
+constexpr int kFaSmallHeads = 2, kFaSmallGrp = 4, kFaSmallWarps = kFaSmallHeads * kFaSmallGrp;  // 8 warps = 256 threads
+static_assert(kGqa % kFaSmallHeads == 0, "heads of a small-FA CTA share one KV group");
+__global__ void __launch_bounds__(kFaSmallWarps * 32, 1) attention_fa_small_kernel(
+    const float* q, const float* qg, int T, int pos0, const uint8_t* kc, const uint8_t* vc,
+    const int32_t* page_table, float* out, float* part) {
+  constexpr int kRowBytes = kHeadDim;
+  constexpr int kStageBytes = 2 * kFaK * kRowBytes;
+  constexpr int kUnits = kFaK * (kRowBytes / 16);
+  constexpr int kThreads = kFaSmallWarps * 32;
+  constexpr int kDp = kHeadDim / 16 / kFaSmallGrp;  // 4 dim-tiles (64 dims) per warp
+  extern __shared__ __align__(128) uint8_t fa_smem[];
+  __shared__ float x_mx[kFaSmallHeads][kFaSmallGrp][32][2];
+  __shared__ uint32_t x_p[kFaSmallHeads][kFaSmallGrp][32];
+  const uint32_t sbase = uint32_t(__cvta_generic_to_shared(fa_smem));
+  const uint32_t vtbase = sbase + 2 * kStageBytes;
+  const int lead16 = pos0 % 16;
+  const int hp_per_g = kGqa / kFaSmallHeads;  // 3 head-pairs per KV head
+  const int tile16 = int(blockIdx.x) / hp_per_g, hp = int(blockIdx.x) % hp_per_g;
+  const int g = int(blockIdx.y) / kFaSplits, split = int(blockIdx.y) % kFaSplits;
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const int lh = warp / kFaSmallGrp, gw = warp % kFaSmallGrp, dp0 = gw * kDp;
+  const int h = g * kGqa + hp * kFaSmallHeads + lh;
+  const int q0 = tile16 * 16 - lead16;
+  const int w0 = pos0 + q0;  // multiple of 16; all 16 tokens share the same 64-token block
+  const int bend = (w0 | (kFaQ - 1)) + 1, nsplit = fa_splits(bend);
+  if (split >= nsplit) return;
+  const int rend = min(bend, pos0 + T);
+  const int kbeg = split ? bend / 2 : 0, kend = nsplit > 1 && !split ? bend / 2 : rend;
+  const int cbeg = kbeg / kFaK, cend = kend > kbeg ? (kend + kFaK - 1) / kFaK : cbeg;
+
+  auto issue = [&](int c) {
+    const uint32_t st = sbase + (c % 2) * kStageBytes;
+#pragma unroll
+    for (int j = 0; j < kUnits / kThreads; j++) {
+      const int u = threadIdx.x + j * kThreads, r = u / (kRowBytes / 16), col = u % (kRowBytes / 16);
+      const int key = c * kFaK + r;
+      const bool ok = key < kend;
+      const int64_t row = ok ? kv_row(page_table, key, g) : 0;
+      const uint32_t off = sw8(r, col);
+      cp_async16z(st + off, kc + row * kHeadDim + col * 16, ok);
+      cp_async16z(st + kFaK * kRowBytes + off, vc + row * kHeadDim + col * 16, ok);
+    }
+  };
+  if (cbeg < cend) issue(cbeg);
+  cp_commit();
+  if (cend - cbeg > 1) issue(cbeg + 1);
+  cp_commit();
+
+  const int r0 = lane / 4, c2 = 2 * (lane % 4);
+  const int ta = r0, tb = r0 + 8;
+  uint32_t qa[kHeadDim / 32][4];
+  float sq[2] = {1.f, 1.f};
+  {
+    auto ld4 = [&](int t, int d) {
+      if (q0 + t < 0 || q0 + t >= T) return make_float4(0.f, 0.f, 0.f, 0.f);
+      return *reinterpret_cast<const float4*>(q + (int64_t(q0 + t) * kHeads + h) * kHeadDim + d);
+    };
+    float inv[2];
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+      float mx = 0.f;
+#pragma unroll
+      for (int kk = 0; kk < kHeadDim / 16; kk++) {
+        const float4 v = ld4(r ? tb : ta, kk * 16 + 2 * c2);
+        mx = fmaxf(mx, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+      }
+      mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+      mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+      inv[r] = mx > 0.f ? 448.f / mx : 0.f;
+      sq[r] = mx * (1.f / (448.f * 16.f)) * kLog2e;
+    }
+#pragma unroll
+    for (int kk = 0; kk < kHeadDim / 32; kk++)
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        const int r = i % 2;
+        const float4 v = ld4(r ? tb : ta, kk * 32 + 16 * (i / 2) + 2 * c2);
+        qa[kk][i] = pack_e4m3x4(v.x * inv[r], v.y * inv[r], v.z * inv[r], v.w * inv[r]);
+      }
+  }
+  const int pa = w0 + ta, pb = w0 + tb;
+  const int wend = min(w0 + 16, kend);
+  float o[2 * kDp][4];
+#pragma unroll
+  for (int i = 0; i < 2 * kDp; i++) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
+  float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
+  const int lm = lane / 8, lr = lane % 8;
+
+  for (int c = cbeg; c < cend; c++) {
+    cp_wait<1>();
+    __syncthreads();
+    const uint32_t ks = sbase + (c % 2) * kStageBytes;
+    const uint32_t vraw = ks + kFaK * kRowBytes;
+#pragma unroll
+    for (int x = 0; x < kHeadDim / 4 * 4 * 2 / kThreads; x++) {
+      const int u = threadIdx.x + x * kThreads, j = u & 3, rest = u >> 5;
+      const int dg = (rest & 7) * 8 + (u >> 2 & 7), hh = rest >> 3;
+      uint32_t w[4];
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        const int key = 16 * hh + 2 * j + (i & 1) + 8 * (i >> 1);
+        asm volatile("ld.shared.u32 %0, [%1];" : "=r"(w[i]) : "r"(vraw + sw8(key, dg / 4) + 4 * (dg % 4)));
+      }
+      const uint32_t t0 = __byte_perm(w[0], w[1], 0x5140), t1 = __byte_perm(w[2], w[3], 0x5140);
+      const uint32_t t2 = __byte_perm(w[0], w[1], 0x7362), t3 = __byte_perm(w[2], w[3], 0x7362);
+      const uint32_t y[4] = {__byte_perm(t0, t1, 0x5410), __byte_perm(t0, t1, 0x7632), __byte_perm(t2, t3, 0x5410),
+                             __byte_perm(t2, t3, 0x7632)};
+#pragma unroll
+      for (int i = 0; i < 4; i++)
+        asm volatile("st.shared.u32 [%0], %1;" ::"r"(vtbase + vt_off(4 * dg + i, hh) + 4 * j), "r"(y[i]));
+    }
+    __syncthreads();
+    if (c * kFaK < wend) {
+      float sc[4] = {};
+#pragma unroll
+      for (int kk = 0; kk < kHeadDim / 32; kk++) {
+        uint32_t b[4];
+        ldsm_x4(b, ks + sw8(16 * (gw / 2) + lr + 8 * (lm / 2), 2 * kk + lm % 2));
+        const bool hi = gw & 1;
+        const uint32_t bk[2] = {hi ? b[2] : b[0], hi ? b[3] : b[1]};
+        mma_e4m3_16832(sc, qa[kk], bk);
+      }
+      const bool diag = c * kFaK + kFaK - 1 > w0;
+      float mx[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+      for (int e = 0; e < 4; e++) {
+        sc[e] *= sq[e / 2];
+        const int key = c * kFaK + gw * 8 + c2 + (e & 1);
+        if (diag && key > (e < 2 ? pa : pb)) sc[e] = -INFINITY;
+        mx[e / 2] = fmaxf(mx[e / 2], sc[e]);
+      }
+#pragma unroll
+      for (int r = 0; r < 2; r++) {
+        mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 1));
+        mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 2));
+      }
+      x_mx[lh][gw][lane][0] = mx[0], x_mx[lh][gw][lane][1] = mx[1];
+      __syncthreads();
+#pragma unroll
+      for (int r = 0; r < 2; r++)
+        mx[r] = fmaxf(fmaxf(x_mx[lh][0][lane][r], x_mx[lh][1][lane][r]),
+                      fmaxf(x_mx[lh][2][lane][r], x_mx[lh][3][lane][r]));
+      float corr[2];
+#pragma unroll
+      for (int r = 0; r < 2; r++) {
+        const float mn = fmaxf(m[r], mx[r]);
+        corr[r] = mn == -INFINITY ? 1.f : ex2_approx(m[r] - mn);
+        m[r] = mn;
+      }
+      const float b0 = 8.f - (m[0] == -INFINITY ? 0.f : m[0]);
+      const float b1 = 8.f - (m[1] == -INFINITY ? 0.f : m[1]);
+      const uint32_t hw0 = exp2_e4m3x2(sc[0] + b0, sc[1] + b0);
+      const uint32_t hw1 = exp2_e4m3x2(sc[2] + b1, sc[3] + b1);
+      x_p[lh][gw][lane] = hw0 | (hw1 << 16);
+      __syncthreads();
+      uint32_t hh4[2][4];
+#pragma unroll
+      for (int nt = 0; nt < 4; nt++) {
+        const uint32_t w = x_p[lh][nt][lane];
+        hh4[0][nt] = w & 0xffffu, hh4[1][nt] = w >> 16;
+      }
+      uint32_t pf[4];
+      float ps[2];
+#pragma unroll
+      for (int r = 0; r < 2; r++) {
+        pf[r] = hh4[r][0] | (hh4[r][1] << 16);
+        pf[2 + r] = hh4[r][2] | (hh4[r][3] << 16);
+        ps[r] = sum_e4m3x4(pf[r]) + sum_e4m3x4(pf[2 + r]);
+      }
+#pragma unroll
+      for (int r = 0; r < 2; r++) {
+        ps[r] += __shfl_xor_sync(0xffffffffu, ps[r], 1);
+        ps[r] += __shfl_xor_sync(0xffffffffu, ps[r], 2);
+        l[r] = l[r] * corr[r] + ps[r];
+      }
+#pragma unroll
+      for (int dp = 0; dp < kDp; dp++) {
+        float t[2][4] = {};
+        uint32_t b[4];
+        ldsm_x4(b, vtbase + vt_off(16 * (dp0 + dp) + 8 * (lm / 2) + lr, lm % 2));
+        mma_e4m3_16832(t[0], pf, b);
+        mma_e4m3_16832(t[1], pf, b + 2);
+#pragma unroll
+        for (int x = 0; x < 2; x++)
+#pragma unroll
+          for (int e = 0; e < 4; e++) o[2 * dp + x][e] = o[2 * dp + x][e] * corr[e / 2] + t[x][e];
+      }
+    }
+    __syncthreads();
+    if (c + 2 < cend) issue(c + 2);
+    cp_commit();
+  }
+#pragma unroll
+  for (int r = 0; r < 2; r++) {
+    const int t = q0 + (r ? tb : ta);
+    if (t < 0 || t >= T) continue;
+    const int64_t row = int64_t(t) * kHeads + h;
+    if (nsplit > 1) {
+      float* po = part + (row * kFaSplits + split) * kHeadDim + dp0 * 16;
+#pragma unroll
+      for (int dt = 0; dt < 2 * kDp; dt++)
+        *reinterpret_cast<float2*>(po + dt * 8 + c2) = make_float2(o[dt][2 * r], o[dt][2 * r + 1]);
+      if (c2 == 0 && gw == 0)
+        *reinterpret_cast<float2*>(part + int64_t(T) * kHeads * kFaSplits * kHeadDim + (row * kFaSplits + split) * 2) =
+            make_float2(m[r] * kLn2, l[r]);
+      continue;
+    }
+    const float inv = 1.f / l[r];
+    const float* gate = qg + row * (2 * kHeadDim) + kHeadDim + dp0 * 16;
+    float* dst = out + row * kHeadDim + dp0 * 16;
+#pragma unroll
+    for (int dt = 0; dt < 2 * kDp; dt++) {
+      const int d = dt * 8 + c2;
+      const float2 gv = *reinterpret_cast<const float2*>(gate + d);
+      float2 v;
+      v.x = o[dt][2 * r] * inv * (1.f / (1.f + expf(-gv.x)));
+      v.y = o[dt][2 * r + 1] * inv * (1.f / (1.f + expf(-gv.y)));
+      *reinterpret_cast<float2*>(dst + d) = v;
+    }
+  }
+}
+
 // Block per (token, 4 heads), 4 dims per thread: merge the key splits of the rows whose
 // block was split, normalize, apply sigmoid(gate).
 constexpr int kFaCombineHeads = 4;
@@ -1521,7 +1749,7 @@ constexpr int kT8MaxT = 16, kT8WideWarps = kT8MaxT * 6 / kT8Rows;
 // Producer threads: kWide has 2 producer warps (8 warps, 2 per SMSP: the full 255 registers, no spill).
 template <bool kWide>
 constexpr int kT8Prod = kWide ? Q27_X_T8WPROD * 32 : kTcProd;
-template <class KV, bool kBatch = false, bool kWide = false>
+template <class KV, bool kBatch = false, bool kWide = false, bool kTree = false>
 __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod<kWide>, 1) attention_tc8_kernel(const float* q, const int32_t* pos_dev, int T,
                                                                           const KV* kc, const KV* vc,
                                                                           const int32_t* page_table, int splits,
@@ -1540,6 +1768,7 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
     q += rows * kHeadDim, pos_dev = lanes.pos + z, page_table = lane_sel(lanes.page_table, z);
     part.acc += rows * splits * kHeadDim, part.ml += rows * splits * 2;
     T = lr.rows(z);
+    if constexpr (kTree) tree += z;
   }
   constexpr bool kFp4 = kKvFp4<KV>;
   constexpr int kRowBytes = kKvRowBytes<KV>;
@@ -1558,16 +1787,13 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
   if (split >= nchunks) return;
   const int c_tail0 = pos0 / kTcChunk;
   const int nmine_all = (nchunks - split + splits - 1) / splits;
-  const int nmine = (!kBatch && tree) ? (c_tail0 > split ? (c_tail0 - split + splits - 1) / splits : 0) : nmine_all;
-  const bool has_tail = !kBatch && tree != nullptr &&
+  const int nmine = kTree ? (c_tail0 > split ? (c_tail0 - split + splits - 1) / splits : 0) : nmine_all;
+  const bool has_tail = kTree &&
                         ((c_tail0 < nchunks && c_tail0 % splits == split) ||
                          (c_tail0 + 1 < nchunks && (c_tail0 + 1) % splits == split));
   // Phase 2 helpers for bit-identical tree attention on the 1-2 tail chunks (c_tail0, c_tail0 + 1).
-  // All chunks c < c_tail0 run untouched at full speed (40/42 splits never touch Phase 2).
-  // Shared memory layout in Phase 2 (40 KiB <= kT8Smem for both uint8_t and Fp4Kv):
-  //   [0..8192) past K, [8192..16384) past V, [16384..20480) tree K, [20480..24576) tree V,
-  //   [24576..32768) per-tok packed K (sw8), [32768..40960) per-tok packed V^T (vt_off).
-  auto load_tail_kv = [&]() {
+  // Templated on kTree: completely compiled out when kTree == false (zero register spill on chains!).
+  auto load_tail_kv = [&](auto) {
     const int tid = threadIdx.x;
     const int tail_off = pos0 - c_tail0 * kTcChunk;
     const bool need_past = (c_tail0 < nchunks && c_tail0 % splits == split) && tail_off > 0;
@@ -1621,7 +1847,7 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
     if (need_past) load_kv_rows(tail_off, c_tail0 * kTcChunk, true, p_past_k, p_past_v);
     load_kv_rows(T, pos0, false, p_tree_k, p_tree_v);
   };
-  auto stage_tail_tok = [&](int c_base, int tok, int kt_tok) {
+  auto stage_tail_tok = [&](auto, int c_base, int tok, int kt_tok) {
     const int tid = threadIdx.x;
     const uint8_t* p_past_k = tc_smem;
     const uint8_t* p_past_v = tc_smem + 8192;
@@ -1740,18 +1966,29 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
       }
       __syncthreads();  // chunk i ready for the compute warps; chunk i - 1 consumed
     }
-    if constexpr (!kBatch) {
+    if constexpr (kTree) {
       if (has_tail) {
-        load_tail_kv();
+        load_tail_kv(0);
         __syncthreads();
+        const int n_nodes = min(T, int(tree->n));
+        uint32_t has_child = 0u;
+        for (int t = 1; t < n_nodes; t++) has_child |= (1u << int(tree->path[t][int(tree->depth[t]) - 1]));
         for (int c_tail = c_tail0; c_tail <= c_tail0 + 1; c_tail++) {
           if (c_tail >= nchunks || c_tail % splits != split) continue;
           const int c_base = c_tail * kTcChunk;
-          for (int tok = 0; tok < T; tok++) {
-            const int kt_tok = pos0 + int(tree->depth[tok]) + 1;
-            if (c_base >= kt_tok) continue;
-            stage_tail_tok(c_base, tok, kt_tok);
+          uint32_t done_mask = 0u;
+          for (int lf = n_nodes - 1; lf >= 0; lf--) {
+            if ((has_child >> lf) & 1u) continue;
+            const int dlf = int(tree->depth[lf]);
+            uint32_t path_mask = 0u;
+            for (int a = 0; a <= dlf; a++) {
+              const int u = int(tree->path[lf][a]);
+              if (!((done_mask >> u) & 1u) && c_base < pos0 + a + 1) path_mask |= (1u << u);
+            }
+            if (!path_mask) continue;
+            stage_tail_tok(0, c_base, lf, pos0 + dlf + 1);
             __syncthreads();
+            done_mask |= path_mask;
             __syncthreads();
           }
         }
@@ -1779,13 +2016,16 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
     auto row_kt = [&](int r) {
       if (r >= nrows) return 0;
       const int tok = t0 + r / kGqa;
-      return pos0 + (tree ? int(tree->depth[tok]) : tok) + 1;
+      if constexpr (kTree)
+        return pos0 + int(tree->depth[tok]) + 1;
+      else
+        return pos0 + tok + 1;
     };  // keys row r sees
     auto row_q = [&](int r) { return q + (int64_t(t0 + r / kGqa) * kHeads + g * kGqa + r % kGqa) * kHeadDim; };
     const int kta = row_kt(ra), ktb = row_kt(rb);
     // (a batched lane with fewer rows than the launch's: its tiles past them compute nothing)
-    const int ktile = tile * kT8Rows < nrows ? (tree ? pos0 + T : row_kt(min(tile * kT8Rows + kT8Rows - 1, nrows - 1))) : 0;
-    const int kmin = tree ? pos0 : row_kt(tile * kT8Rows);  // chunks below it need no mask
+    const int ktile = tile * kT8Rows < nrows ? (kTree ? pos0 + T : row_kt(min(tile * kT8Rows + kT8Rows - 1, nrows - 1))) : 0;
+    const int kmin = kTree ? pos0 : row_kt(tile * kT8Rows);  // chunks below it need no mask
     uint32_t qa[kHeadDim / 32][4];
     float sq[2];
     {
@@ -1934,25 +2174,40 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
       }
       __syncthreads();  // chunk i consumed, chunk i + 1 staged
     }
-    // Phase 2: bit-identical tree attention on the 1-2 tail chunks (c_tail0, c_tail0 + 1).
-    if constexpr (!kBatch) {
+    // Phase 2: leaf-batched bit-identical tree attention on the 1-2 tail chunks (c_tail0, c_tail0 + 1).
+    // Loops only over tree leaves (1 on chains, ~3-5 on BF-Tree) instead of all T nodes -> 4-16x faster!
+    if constexpr (kTree) {
       if (has_tail) {
-        load_tail_kv();
+        load_tail_kv(0);
         __syncthreads();
         const uint32_t s_wk = sbase + 24576, s_wvt = sbase + 32768;
+        const int n_nodes = min(T, int(tree->n));
+        uint32_t has_child = 0u;
+        for (int t = 1; t < n_nodes; t++) has_child |= (1u << int(tree->path[t][int(tree->depth[t]) - 1]));
+        uint32_t warp_toks = 0u;
+        if constexpr (!kGrp) {
+          const int t_lo = (tile * kT8Rows) / kGqa;
+          const int t_hi = min(nrows - 1, (tile + 1) * kT8Rows - 1) / kGqa;
+          for (int t = t_lo; t <= t_hi && tile * kT8Rows < nrows; t++) warp_toks |= (1u << (t0 + t));
+        }
         for (int c_tail = c_tail0; c_tail <= c_tail0 + 1; c_tail++) {
           if (c_tail >= nchunks || c_tail % splits != split) continue;
           const int c_base = c_tail * kTcChunk;
-          for (int tok = 0; tok < T; tok++) {
-            const int kt_tok = pos0 + int(tree->depth[tok]) + 1;
-            if (c_base >= kt_tok) continue;
-            stage_tail_tok(c_base, tok, kt_tok);
+          uint32_t done_mask = 0u;
+          for (int lf = n_nodes - 1; lf >= 0; lf--) {
+            if ((has_child >> lf) & 1u) continue;
+            const int dlf = int(tree->depth[lf]);
+            uint32_t path_mask = 0u;
+            for (int a = 0; a <= dlf; a++) {
+              const int u = int(tree->path[lf][a]);
+              if (!((done_mask >> u) & 1u) && c_base < pos0 + a + 1) path_mask |= (1u << u);
+            }
+            if (!path_mask) continue;
+            stage_tail_tok(0, c_base, lf, pos0 + dlf + 1);
             __syncthreads();
-            const bool match_a = ra < nrows && (t0 + ra / kGqa) == tok;
-            const bool match_b = rb < nrows && (t0 + rb / kGqa) == tok;
-            const bool warp_has =
-                kGrp ? (tok * kGqa < nrows)
-                     : (tile * kT8Rows < (tok + 1) * kGqa && (tile + 1) * kT8Rows > tok * kGqa);
+            const bool match_a = ra < nrows && ((path_mask >> (t0 + ra / kGqa)) & 1u);
+            const bool match_b = rb < nrows && ((path_mask >> (t0 + rb / kGqa)) & 1u);
+            const bool warp_has = kGrp ? true : ((path_mask & warp_toks) != 0u);
             if (warp_has) {
               constexpr int kNt = kGrp ? 1 : 4;
               float sc[kNt][4] = {};
@@ -1978,7 +2233,7 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
                 for (int e = 0; e < 4; e++) {
                   sc[n][e] *= sq[e / 2];
                   const int key = c_base + (kGrp ? gw : n) * 8 + c2 + (e & 1);
-                  if (key >= kt_tok) sc[n][e] = -INFINITY;
+                  if (key >= (e < 2 ? kta : ktb)) sc[n][e] = -INFINITY;
                   mx[e / 2] = fmaxf(mx[e / 2], sc[n][e]);
                 }
 #pragma unroll
@@ -2050,6 +2305,7 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
                 }
               }
             }
+            done_mask |= path_mask;
             __syncthreads();
           }
         }
@@ -2124,10 +2380,11 @@ __global__ void attention_combine_kernel(const float* qg, int ldq, const int32_t
     const LaneRows lr = lanes.lr.live();
     const int z = lr.lane(t);
     pos_dev = lanes.pos + z, tl = t - lr.first(z);
+    if (tree) tree += z;
   }
   const int pos0 = *pos_dev;
   pdl_wait();
-  const int keys = pos0 + (tree ? tree->depth[t] : tl) + 1;
+  const int keys = pos0 + (tree ? tree->depth[tl] : tl) + 1;
   const int per = chunk > 0 ? chunk : keys_per_split(keys, splits, min_keys);
   const int used = min(splits, (keys + per - 1) / per);
   float M = -INFINITY;
@@ -2166,6 +2423,27 @@ __global__ void kv_commit_kernel(KvLayer* layers, const int32_t* page_table, con
 #pragma unroll
   for (int i = 0; i < kSpecBlock; i++)
     if (on && i < n && cpath[i] != i) base[kv_row(page_table, pos + i, head) * kElems + d] = val[i];
+}
+
+template <class KV>
+__global__ void kv_commit_lanes_kernel(KvLayer* layers, SeqLanes lanes, const int32_t* ncommit, const int32_t* cpath) {
+  pdl_trigger();
+  pdl_wait();
+  const int layer = blockIdx.x, head = blockIdx.y / 2, z = blockIdx.z, d = threadIdx.x;
+  KV* base = static_cast<KV*>(blockIdx.y % 2 ? layers[layer].v : layers[layer].k);
+  const int32_t* page_table = lane_sel(lanes.page_table, z);
+  const int pos = lanes.pos[z], n = ncommit[z];
+  const int32_t* cp = cpath + int64_t(kLaneSlot) * z;
+  constexpr int kElems = kKvFp4<KV> ? kKvRowBytes<KV> : kHeadDim;
+  const bool on = d < kElems;
+  KV val[kSpecBlock];
+#pragma unroll
+  for (int i = 0; i < kSpecBlock; i++)
+    if (on && i < n && cp[i] != i) val[i] = base[kv_row(page_table, pos + cp[i], head) * kElems + d];
+  __syncthreads();
+#pragma unroll
+  for (int i = 0; i < kSpecBlock; i++)
+    if (on && i < n && cp[i] != i) base[kv_row(page_table, pos + i, head) * kElems + d] = val[i];
 }
 
 int g_attn_sms = 0;
@@ -2219,6 +2497,8 @@ void attention(const float* q, const float* qg, int T, int pos0, KvLayer kv, KvT
                                     kFaSmemF8[1]));
       Q27_CUDA(cudaFuncSetAttribute(attention_fa_kernel<uint8_t, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     kFaSmemF8[2]));
+      Q27_CUDA(cudaFuncSetAttribute(attention_fa_small_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    kFaSmemF8[2]));
       Q27_CUDA(cudaFuncSetAttribute(attention_fa_kernel<Fp4Kv>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     kFaSmemFp4));
       Q27_CUDA(cudaFuncSetAttribute(attention_fa_kernel<Fp4Kv, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -2230,7 +2510,9 @@ void attention(const float* q, const float* qg, int T, int pos0, KvLayer kv, KvT
     (void)init;
     Q27_CHECK(ws_bytes >= attention_prefill_ws_bytes(T), "attention: workspace too small");
     float* part = static_cast<float*>(ws);
-    const dim3 grid(unsigned(ceil_div(pos0 % kFaQ + T, kFaQ) * kFaSplits), kHeads / kFaHeads);
+    const int ntiles = ceil_div(pos0 % kFaQ + T, kFaQ);
+    const dim3 grid(unsigned(ntiles * kFaSplits), kHeads / kFaHeads);
+    static const bool fa_small = !getenv("Q27_FA_SMALL") || atoi(getenv("Q27_FA_SMALL")) != 0;
     if (kv_type == KvType::BF16)
       attention_fa_kernel<bf16><<<grid, kFaWarps * 32, kFaSmem, s>>>(
           q, qg, T, pos0, static_cast<const bf16*>(kv.k), static_cast<const bf16*>(kv.v), page_table, out, part);
@@ -2260,27 +2542,39 @@ void attention(const float* q, const float* qg, int T, int pos0, KvLayer kv, KvT
           attention_fa_kernel<Fp4Kv, 3><<<grid, kFaWarps * 32, kFaSmemFp4Q4, s>>>(
               q, qg, T, pos0, kc, vc, page_table, out, part, v8, ident);
         else
-          attention_fa_kernel<uint8_t, 2><<<grid, kFaWarps * 32, kFaSmemF8[2], s>>>(q, qg, T, pos0, k8, v8, ident, out, part);
+          attention_fa_kernel<uint8_t, 2><<<grid, kFaWarps * 32, kFaSmemF8[2], s>>>(
+              q, qg, T, pos0, k8, v8, ident, out, part);
       } else if (f8 == 2)
-        attention_fa_kernel<Fp4Kv, 2><<<grid, kFaWarps * 32, kFaSmemFp4F8, s>>>(q, qg, T, pos0, kc, vc, page_table, out, part);
+        attention_fa_kernel<Fp4Kv, 2><<<grid, kFaWarps * 32, kFaSmemFp4F8, s>>>(
+            q, qg, T, pos0, kc, vc, page_table, out, part);
       else
-        attention_fa_kernel<Fp4Kv><<<grid, kFaWarps * 32, kFaSmemFp4, s>>>(q, qg, T, pos0, kc, vc, page_table, out, part);
+        attention_fa_kernel<Fp4Kv><<<grid, kFaWarps * 32, kFaSmemFp4, s>>>(
+            q, qg, T, pos0, kc, vc, page_table, out, part);
     }
     else {
       // FP8 MMAs (FP8 KV): Q27_ATTN_FP8 = 2 (Q K^T and P V, the default), 1 (P V) or 0 (BF16), read per call.
       const int f8 = attention_prefill_mode(kv_type, false);
       const auto* kc = static_cast<const uint8_t*>(kv.k);
       const auto* vc = static_cast<const uint8_t*>(kv.v);
-      if (f8 == 2)
-        attention_fa_kernel<uint8_t, 2><<<grid, kFaWarps * 32, kFaSmemF8[2], s>>>(q, qg, T, pos0, kc, vc, page_table, out, part);
+      if (f8 == 2 && fa_small && T <= 192 && pos0 >= 4096) {
+        const int ntiles16 = ceil_div(pos0 % 16 + T, 16);
+        attention_fa_small_kernel<<<dim3(unsigned(ntiles16 * (kGqa / kFaSmallHeads)), kKvHeads * kFaSplits),
+                                    kFaSmallWarps * 32, kFaSmemF8[2], s>>>(q, qg, T, pos0, kc, vc, page_table, out,
+                                                                            part);
+      } else if (f8 == 2)
+        attention_fa_kernel<uint8_t, 2><<<grid, kFaWarps * 32, kFaSmemF8[2], s>>>(
+            q, qg, T, pos0, kc, vc, page_table, out, part);
       else if (f8 == 1)
-        attention_fa_kernel<uint8_t, 1><<<grid, kFaWarps * 32, kFaSmemF8[1], s>>>(q, qg, T, pos0, kc, vc, page_table, out, part);
+        attention_fa_kernel<uint8_t, 1><<<grid, kFaWarps * 32, kFaSmemF8[1], s>>>(
+            q, qg, T, pos0, kc, vc, page_table, out, part);
       else
-        attention_fa_kernel<uint8_t><<<grid, kFaWarps * 32, kFaSmemFp8, s>>>(q, qg, T, pos0, kc, vc, page_table, out, part);
+        attention_fa_kernel<uint8_t><<<grid, kFaWarps * 32, kFaSmemFp8, s>>>(
+            q, qg, T, pos0, kc, vc, page_table, out, part);
     }
     Q27_CUDA(cudaGetLastError());
     if (fa_splits(((pos0 + T - 1) | (kFaQ - 1)) + 1) > 1)
-      attention_fa_combine_kernel<<<dim3(T, kHeads / kFaCombineHeads), kFaCombineHeads * kHeadDim / 4, 0, s>>>(qg, T, pos0, part, out);
+      attention_fa_combine_kernel<<<dim3(T, kHeads / kFaCombineHeads), kFaCombineHeads * kHeadDim / 4, 0, s>>>(
+          qg, T, pos0, part, out);
     Q27_CUDA(cudaGetLastError());
     return;
   }
@@ -2321,18 +2615,30 @@ static int tc8_warps(int T) {
 // with NVFP4 KV; with FP8 KV, the 16-row verify is one launch instead of two), 0 = off.
 static bool tc_f8(KvType kv_type) {
   static const bool init = [] {
-    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<uint8_t>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  kT8Smem<uint8_t>));
-    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<Fp4Kv>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  kT8Smem<Fp4Kv>));
-    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<uint8_t, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  kT8Smem<uint8_t>));
-    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<Fp4Kv, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  kT8Smem<Fp4Kv>));
-    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<uint8_t, false, true>,
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<uint8_t, false, false, false>,
                                   cudaFuncAttributeMaxDynamicSharedMemorySize, kT8Smem<uint8_t>));
-    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<Fp4Kv, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  kT8Smem<Fp4Kv>));
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<Fp4Kv, false, false, false>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kT8Smem<Fp4Kv>));
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<uint8_t, false, false, true>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kT8Smem<uint8_t>));
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<Fp4Kv, false, false, true>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kT8Smem<Fp4Kv>));
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<uint8_t, true, false, false>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kT8Smem<uint8_t>));
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<Fp4Kv, true, false, false>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kT8Smem<Fp4Kv>));
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<uint8_t, true, false, true>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kT8Smem<uint8_t>));
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<Fp4Kv, true, false, true>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kT8Smem<Fp4Kv>));
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<uint8_t, false, true, false>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kT8Smem<uint8_t>));
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<Fp4Kv, false, true, false>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kT8Smem<Fp4Kv>));
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<uint8_t, false, true, true>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kT8Smem<uint8_t>));
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<Fp4Kv, false, true, true>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kT8Smem<Fp4Kv>));
     return true;
   }();
   (void)init;
@@ -2394,23 +2700,31 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
     if (tc_f8(kv_type)) {
       for (int t0 = 0; t0 < T; t0 += kT8MaxT) {  // (one launch for up to 16 rows, tiled for 17..128)
         const int n = std::min(kT8MaxT, T - t0);
-        const dim3 block8(tc8_warps(n) * 32 + (tc8_warps(n) > kT8Grp ? kT8Prod<true> : kTcProd));
-        if (kv_type == KvType::NVFP4 && tc8_warps(n) > kT8Grp)
-          launch_pdl(attention_tc8_kernel<Fp4Kv, false, true>, grid, block8, kT8Smem<Fp4Kv>, s, q, pos_dev, n,
-                     static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), page_table, splits, part,
-                     SeqLanes{}, t0, tree, tiled_tc8);
-        else if (kv_type == KvType::FP8 && tc8_warps(n) > kT8Grp)
-          launch_pdl(attention_tc8_kernel<uint8_t, false, true>, grid, block8, kT8Smem<uint8_t>, s, q, pos_dev, n,
-                     static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), page_table, splits, part,
-                     SeqLanes{}, t0, tree, tiled_tc8);
-        else if (kv_type == KvType::NVFP4)
-          launch_pdl(attention_tc8_kernel<Fp4Kv>, grid, block8, kT8Smem<Fp4Kv>, s, q, pos_dev, n,
-                     static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), page_table, splits, part,
-                     SeqLanes{}, t0, tree, tiled_tc8);
+        const bool wide = tc8_warps(n) > kT8Grp;
+        const dim3 block8(tc8_warps(n) * 32 + (wide ? kT8Prod<true> : kTcProd));
+        auto launch_t8 = [&](auto is_tree) {
+          constexpr bool kTr = decltype(is_tree)::value;
+          if (kv_type == KvType::NVFP4 && wide)
+            launch_pdl(attention_tc8_kernel<Fp4Kv, false, true, kTr>, grid, block8, kT8Smem<Fp4Kv>, s, q, pos_dev, n,
+                       static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), page_table, splits, part,
+                       SeqLanes{}, t0, tree, tiled_tc8);
+          else if (kv_type == KvType::FP8 && wide)
+            launch_pdl(attention_tc8_kernel<uint8_t, false, true, kTr>, grid, block8, kT8Smem<uint8_t>, s, q, pos_dev, n,
+                       static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), page_table, splits, part,
+                       SeqLanes{}, t0, tree, tiled_tc8);
+          else if (kv_type == KvType::NVFP4)
+            launch_pdl(attention_tc8_kernel<Fp4Kv, false, false, kTr>, grid, block8, kT8Smem<Fp4Kv>, s, q, pos_dev, n,
+                       static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), page_table, splits, part,
+                       SeqLanes{}, t0, tree, tiled_tc8);
+          else
+            launch_pdl(attention_tc8_kernel<uint8_t, false, false, kTr>, grid, block8, kT8Smem<uint8_t>, s, q, pos_dev, n,
+                       static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), page_table, splits, part,
+                       SeqLanes{}, t0, tree, tiled_tc8);
+        };
+        if (tree)
+          launch_t8(std::true_type{});
         else
-          launch_pdl(attention_tc8_kernel<uint8_t>, grid, block8, kT8Smem<uint8_t>, s, q, pos_dev, n,
-                     static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), page_table, splits, part,
-                     SeqLanes{}, t0, tree, tiled_tc8);
+          launch_t8(std::false_type{});
         if (tiled_tc8) {
           Q27_CUDA(cudaGetLastError());
           launch_pdl(attention_combine_kernel<false>, dim3(unsigned(n * kHeads)), dim3(kHeadDim), 0, s, qg, ldq,
@@ -2465,21 +2779,21 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
 
 void attn_prep_lanes(const float* qg, int ldq, const float* k, const float* v, int ldkv, const bf16* q_norm,
                      const bf16* k_norm, const SeqLanes& lanes, KvLayer kv, KvType kv_type, float* q_out,
-                     cudaStream_t s) {
+                     cudaStream_t s, const SpecTree* trees) {
   Q27_CHECK(lanes.n >= 1 && lanes.n <= kMaxLanes && lanes.lr.n == lanes.n, "attn_prep_lanes: 1..8 lanes");
   const dim3 grid(lanes.lr.total(), kHeads + kKvHeads);
   if (kv_type == KvType::BF16)
     launch_pdl(attn_prep_kernel<bf16, true>, grid, dim3(kHeadDim), 0, s, qg, ldq, k, v, ldkv, q_norm, k_norm,
                lanes.pos, static_cast<bf16*>(kv.k), static_cast<bf16*>(kv.v), lanes.page_table[0], q_out,
-               static_cast<const SpecTree*>(nullptr), RopePos{}, lanes);
+               trees, RopePos{}, lanes);
   else if (kv_type == KvType::NVFP4)
     launch_pdl(attn_prep_kernel<Fp4Kv, true>, grid, dim3(kHeadDim), 0, s, qg, ldq, k, v, ldkv, q_norm, k_norm,
                lanes.pos, static_cast<Fp4Kv*>(kv.k), static_cast<Fp4Kv*>(kv.v), lanes.page_table[0], q_out,
-               static_cast<const SpecTree*>(nullptr), RopePos{}, lanes);
+               trees, RopePos{}, lanes);
   else
     launch_pdl(attn_prep_kernel<uint8_t, true>, grid, dim3(kHeadDim), 0, s, qg, ldq, k, v, ldkv, q_norm, k_norm,
                lanes.pos, static_cast<uint8_t*>(kv.k), static_cast<uint8_t*>(kv.v), lanes.page_table[0], q_out,
-               static_cast<const SpecTree*>(nullptr), RopePos{}, lanes);
+               trees, RopePos{}, lanes);
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -2491,7 +2805,7 @@ bool attention_lanes_vary(KvType kv_type) { return tc_f8(kv_type); }
 // FP8 MMAs only (attention_lanes_vary); otherwise every lane has the same rows (<= 8).
 void attention_decode_lanes(const float* q, const float* qg, int ldq, const SeqLanes& lanes, KvLayer kv,
                             KvType kv_type, float* out, void* ws, size_t ws_bytes, cudaStream_t s, uint8_t* q8,
-                            float in_scale, uint8_t* q4, uint8_t* sf4) {
+                            float in_scale, uint8_t* q4, uint8_t* sf4, const SpecTree* trees) {
   Q27_CHECK(lanes.n >= 1 && lanes.n <= kMaxLanes && lanes.lr.n == lanes.n, "attention_decode_lanes: 1..8 lanes");
   if (!g_attn_sms) Q27_CUDA(cudaDeviceGetAttribute(&g_attn_sms, cudaDevAttrMultiProcessorCount, 0));
   const int T = lanes.lr.max_rows();
@@ -2510,10 +2824,14 @@ void attention_decode_lanes(const float* q, const float* qg, int ldq, const SeqL
                                   kTcSmemOf<uint8_t>));
     Q27_CUDA(cudaFuncSetAttribute(attention_tc_kernel<Fp4Kv, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                   kTcSmemOf<Fp4Kv>));
-    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<uint8_t, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  kT8Smem<uint8_t>));
-    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<Fp4Kv, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  kT8Smem<Fp4Kv>));
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<uint8_t, true, true, false>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kT8Smem<uint8_t>));
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<Fp4Kv, true, true, false>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kT8Smem<Fp4Kv>));
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<uint8_t, true, true, true>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kT8Smem<uint8_t>));
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<Fp4Kv, true, true, true>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kT8Smem<Fp4Kv>));
     return true;
   }();
   (void)init;
@@ -2521,22 +2839,29 @@ void attention_decode_lanes(const float* q, const float* qg, int ldq, const SeqL
   if (tc_f8(kv_type)) {
     const bool wide = tc8_warps(T) > kT8Grp;
     const dim3 block8(tc8_warps(T) * 32 + (wide ? kT8Prod<true> : kTcProd));
-    if (wide && kv_type == KvType::NVFP4)
-      launch_pdl(attention_tc8_kernel<Fp4Kv, true, true>, grid, block8, kT8Smem<Fp4Kv>, s, q, lanes.pos, T,
-                 static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), lanes.page_table[0], splits, part,
-                 lanes, 0, static_cast<const SpecTree*>(nullptr), false);
-    else if (wide)
-      launch_pdl(attention_tc8_kernel<uint8_t, true, true>, grid, block8, kT8Smem<uint8_t>, s, q, lanes.pos, T,
-                 static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), lanes.page_table[0], splits,
-                 part, lanes, 0, static_cast<const SpecTree*>(nullptr), false);
-    else if (kv_type == KvType::NVFP4)
-      launch_pdl(attention_tc8_kernel<Fp4Kv, true>, grid, block8, kT8Smem<Fp4Kv>, s, q, lanes.pos, T,
-                 static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), lanes.page_table[0], splits, part,
-                 lanes, 0, static_cast<const SpecTree*>(nullptr), false);
+    auto launch_t8 = [&](auto is_tree) {
+      constexpr bool kTr = decltype(is_tree)::value;
+      if (wide && kv_type == KvType::NVFP4)
+        launch_pdl(attention_tc8_kernel<Fp4Kv, true, true, kTr>, grid, block8, kT8Smem<Fp4Kv>, s, q, lanes.pos, T,
+                   static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), lanes.page_table[0], splits, part,
+                   lanes, 0, trees, false);
+      else if (wide)
+        launch_pdl(attention_tc8_kernel<uint8_t, true, true, kTr>, grid, block8, kT8Smem<uint8_t>, s, q, lanes.pos, T,
+                   static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), lanes.page_table[0], splits,
+                   part, lanes, 0, trees, false);
+      else if (kv_type == KvType::NVFP4)
+        launch_pdl(attention_tc8_kernel<Fp4Kv, true, false, kTr>, grid, block8, kT8Smem<Fp4Kv>, s, q, lanes.pos, T,
+                   static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), lanes.page_table[0], splits, part,
+                   lanes, 0, trees, false);
+      else
+        launch_pdl(attention_tc8_kernel<uint8_t, true, false, kTr>, grid, block8, kT8Smem<uint8_t>, s, q, lanes.pos, T,
+                   static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), lanes.page_table[0], splits,
+                   part, lanes, 0, trees, false);
+    };
+    if (trees)
+      launch_t8(std::true_type{});
     else
-      launch_pdl(attention_tc8_kernel<uint8_t, true>, grid, block8, kT8Smem<uint8_t>, s, q, lanes.pos, T,
-                 static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), lanes.page_table[0], splits,
-                 part, lanes, 0, static_cast<const SpecTree*>(nullptr), false);
+      launch_t8(std::false_type{});
   } else {
     for (int z = 0; z < lanes.n; z++)
       Q27_CHECK(lanes.lr.rows(z) == T && T <= kTcMaxT, "attention_decode_lanes: lanes of different rows need FP8 MMAs");
@@ -2557,7 +2882,7 @@ void attention_decode_lanes(const float* q, const float* qg, int ldq, const SeqL
   }
   Q27_CUDA(cudaGetLastError());
   launch_pdl(attention_combine_kernel<true>, dim3(unsigned(rows)), dim3(kHeadDim), 0, s, qg, ldq, lanes.pos, splits, 0,
-             kTcChunk, part, out, q8, in_scale, static_cast<const SpecTree*>(nullptr), lanes, q4, sf4, 0);
+             kTcChunk, part, out, q8, in_scale, trees, lanes, q4, sf4, 0);
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -2570,6 +2895,18 @@ void kv_commit(KvLayer* layers_dev, int nlayers, KvType kv_type, const int32_t* 
     launch_pdl(kv_commit_kernel<Fp4Kv>, grid, dim3(kHeadDim), 0, s, layers_dev, page_table, pos_dev, ncommit, cpath);
   else
     launch_pdl(kv_commit_kernel<uint8_t>, grid, dim3(kHeadDim), 0, s, layers_dev, page_table, pos_dev, ncommit, cpath);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void kv_commit_lanes(KvLayer* layers_dev, int nlayers, KvType kv_type, const SeqLanes& lanes,
+                     const int32_t* ncommit, const int32_t* cpath, cudaStream_t s) {
+  const dim3 grid(nlayers, 2 * kKvHeads, lanes.n);
+  if (kv_type == KvType::BF16)
+    launch_pdl(kv_commit_lanes_kernel<bf16>, grid, dim3(kHeadDim), 0, s, layers_dev, lanes, ncommit, cpath);
+  else if (kv_type == KvType::NVFP4)
+    launch_pdl(kv_commit_lanes_kernel<Fp4Kv>, grid, dim3(kHeadDim), 0, s, layers_dev, lanes, ncommit, cpath);
+  else
+    launch_pdl(kv_commit_lanes_kernel<uint8_t>, grid, dim3(kHeadDim), 0, s, layers_dev, lanes, ncommit, cpath);
   Q27_CUDA(cudaGetLastError());
 }
 

@@ -269,14 +269,18 @@ class Model {
     return b;
   }
   void logits(const float* x_rows, int rows);  // final norm + lm_head into logits_
-  void gdn(int layer, int T);
-  void attn(int layer, int T);
-  void mlp(int layer, int T);
+  bool gdn(int layer, int T, bool norm_done = false, const SkinnyNorm* next_norm = nullptr);
+  bool attn(int layer, int T, bool norm_done = false, const SkinnyNorm* next_norm = nullptr);
+  bool mlp(int layer, int T, bool norm_done = false, const SkinnyNorm* next_norm = nullptr);
   // GEMM on the activation already quantized into aq_ / asf_ (out += when residual).
   void gemm_q(const char* what, const LinearFp8& l, int T, float* out, bool residual);
-  void gemm_q(const char* what, const LinearFp4& l, int T, float* out, bool residual);
-  void gemm_q(const char* what, const LinearQ& l, int T, float* out, bool residual) {
-    l.fp4 ? gemm_q(what, l.f4, T, out, residual) : gemm_q(what, l.f8, T, out, residual);
+  bool gemm_q(const char* what, const LinearFp4& l, int T, float* out, bool residual,
+              const SkinnyNorm* next_norm = nullptr);
+  bool gemm_q(const char* what, const LinearQ& l, int T, float* out, bool residual,
+              const SkinnyNorm* next_norm = nullptr) {
+    if (l.fp4) return gemm_q(what, l.f4, T, out, residual, next_norm);
+    gemm_q(what, l.f8, T, out, residual);
+    return false;
   }
   QuantOut q8(float in_scale) const;  // quantize into aq_
   QuantOut q4(float in_scale, int T = 0) const;  // quantize into aq_ / asf_ (T > 0: in two terms under Q27_ACT_A4X2)
@@ -353,7 +357,11 @@ class Model {
   std::vector<bool> slot_used_;
   char* stage_ = nullptr;            // device copy of one checkpoint on its way to the host
   cudaEvent_t stage_ev_ = nullptr, stage_in_ev_ = nullptr;  // staging free again / filled
-  cudaStream_t cs_ = nullptr;        // device -> host copies of checkpoints
+  cudaEvent_t ring_ready_ev_ = nullptr;  // async draft ring H2D done on cs_
+  bool ring_h2d_pending_ = false;
+  void wait_ring_h2d();              // stream-wait s_ on ring_ready_ev_ before draft accesses ring
+  void sync_ring_h2d();              // host-sync cs_ before touching checkpoint slots
+  cudaStream_t cs_ = nullptr;        // device -> host copies of checkpoints (and async ring H2D)
   std::vector<int32_t> plan_;        // checkpoint positions of the running prefill (ascending)
   uint64_t use_clock_ = 0;
   CacheStats cstats_;
@@ -411,14 +419,24 @@ class Model {
   // draft), copied from the pinned b_lrh_ by the step itself (a memcpy node of its graph; stage_rows writes b_lrh_
   // before each launch), so a graph runs any split of its shape (lanes, total rows, the longest lane's rows).
   bool dev_rows_ = false;
-  LaneRows *b_lrh_ = nullptr, *b_lrd_ = nullptr;
+  LaneRows *b_lrh_ = nullptr, *b_lrh_p1_ = nullptr, *b_lrd_ = nullptr;
   void stage_rows();
+  void stage_rows_p1();
   LaneRows vrows() const;            // blr_ / bdlr_ as the kernels take them (with dev_rows_: their device copies)
   LaneRows drows() const;
   uint64_t bcaptures_ = 0;           // batched-step graphs captured (instantiated or updated)
   // Cut steps (P3-39, Q27_SPEC_CUT): the draft at the lanes' rows (batch_rows), then each lane verifies the prefix
   // that maximizes the expected tokens per ms (from the draft's table, dspine_conf_tokens; cut_rows).
   bool batch_cut_ = false;
+  bool cut_fine_ = true;             // Q27_CUT_FINE: fine-grained step-1 cut_rows + 450W tiered verify_ms
+  bool bpipe_ = true;                // Q27_BATCH_PIPELINE: launch p1(k+1) ahead after p2(k) (read-only, zero rollback)
+  bool batch_bftree_ = true;         // Q27_BATCH_BFTREE: per-lane BF-Tree in batched verify (single graph, no cut sync)
+  int batch_bftree_walks_ = 2;       // Q27_BATCH_BFTREE_WALKS: stochastic walks per lane for batched sampled BF-Tree
+  bool b_tree_on_ = false;           // active batched step uses BF-Tree (set in batch_prepare)
+  bool b_p1_inflight_ = false;       // p1(k+1) already queued on s_ ahead of host return
+  LaneRows b_p1_dlr_{};              // draft layout used by in-flight p1(k+1)
+  std::vector<int32_t> b_p1_lanes_;  // lanes used by in-flight p1(k+1)
+  cudaEvent_t b_ev_p1_ = nullptr, b_ev_p2_ = nullptr;
   int spec_draft_rows_ = 0;          // (spec_set_draft_rows)
   bool cut_step_ = false;            // the current step is cut
   float cut_lam_ = 0.f;              // tokens per ms of the recent cut steps (0: none yet)
@@ -495,6 +513,7 @@ class Model {
 
   // Activations (sized for prefill_chunk tokens).
   float *x_ = nullptr, *h_ = nullptr, *big1_ = nullptr, *big2_ = nullptr;
+  size_t big2_bytes_ = 0;
   float *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *o_ = nullptr, *n_ = nullptr;
   float *a_ = nullptr, *b_ = nullptr, *g_ = nullptr, *beta_ = nullptr;
   uint8_t *aq_ = nullptr, *asf_ = nullptr;
@@ -540,10 +559,10 @@ class Model {
   int graph_sbuf_ = -1;  // the GDN state buffer the decode graph was captured with
   // Captured graphs by sampling settings (sequences with different settings take turns, Phase 6); the
   // least recently used one is destroyed beyond kGraphCache. graph_exec_ / spec_graph_ point into them.
-  static constexpr int kGraphCache = 4;
+  static constexpr int kGraphCache = 16;
   // Batched steps: an entry per lanes, sampling and total rows (the launches depend on the total; the lanes' split of
   // it only changes arguments and grids, so a step of other rows updates the entry's graph in place).
-  static constexpr int kBatchGraphCache = 48;  // (cut steps: an entry per shape of the draft and of the verify)
+  static constexpr int kBatchGraphCache = 96;  // (cut steps: an entry per shape of the draft and of the verify)
   struct CachedGraph {
     GraphKey key;
     SpecSampling smp;
@@ -605,6 +624,9 @@ class Model {
   int bftree_on_ = 0;       // Q27_SPEC_BFTREE: 0=off, 1=greedy best-first tree, 2=greedy+sampled budget-capped tree
   int bftree_nodes_ = 0;    // Q27_BFTREE_NODES: tree node budget (0: use spec_block_of(smp), else 2..16)
   float bftree_temp_ = 1.f; // Q27_BFTREE_TEMP: softmax temperature for greedy best-first tree ranking
+  int bftree_walks_ = 0;    // Q27_BFTREE_WALKS: sampled tree walks (0=adaptive lo/hi by accept_ema, 1..4=fixed)
+  int bftree_walks_lo_ = 3; // Q27_BFTREE_WALKS_LO: low-accept walk count when adaptive (3 or 4)
+  int bftree_walks_hi_ = 0; // Q27_BFTREE_WALKS_HI: high-accept walk count (0=pure chain, 2=2-walk tree)
   int rollout_on_ = 1;      // Q27_SPEC_ROLLOUT: 1=off, 2=2-step autoregressive DSpine rollout (31 rows)
   float rollout_thresh_ = 13.f;  // Q27_ROLLOUT_THRESH: accept_ema threshold to trigger 2-step rollout
   // Copy steps (local patch, Q27_COPY): host-drafted chains from an earlier span the output is copying.
