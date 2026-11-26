@@ -98,8 +98,10 @@ Q27_COPY_SAMPLED=1 Q27_EDIT_COPY=1 Q27_SPEC_BFTREE=1 Q27_BFTREE_NODES=16 Q27_BFT
 Q27_TOKEN_CACHE_MB=16`.
 - `Q27_LM_HEAD_A4X2=0` (the one-term output head) and `Q27_DRAFT_WINDOW=8192` are upstream settings that differ from
   upstream's defaults. Upstream's default two-term head is closer to the BF16 model (top-1 agreement on QUASAR with
-  NVFP4 KV: 87.7% against 86.8%, upstream's `docs/benchmarks.md`) at the same speed (upstream's measurement). This
-  branch with the two-term head is not yet measured on these prompts.
+  NVFP4 KV: 87.7% against 86.8%, upstream's `docs/benchmarks.md`) at the same speed (upstream's measurement). On this
+  branch (27 Nov, both run orders) the two-term head gave reasoning / code 636 / 443 against 627 / 439 on Huihui and
+  659 / 448 against 658 / 453 on QUASAR, with file edits within 0.4%: about the same speed. A 2,048-token draft window
+  cost 8% on file edits.
 - Copy steps (`Q27_COPY`, default off): when the output repeats earlier text (a file it edits, a passage it quotes),
   the engine drafts the next tokens from that span and verifies up to 128 rows in one step (64 first, 128 after a step
   that accepted every row). The target model still checks every token.
