@@ -1,3 +1,5 @@
+> **Branch kit4b-0.8.1:** upstream v0.8.1 with local patches. What they do, how they were measured and checked: [LOCAL-PATCHES.md](LOCAL-PATCHES.md).
+
 # Qwen3.8-27B on one RTX 5090
 
 A single-purpose inference engine for [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) on one NVIDIA RTX 5090

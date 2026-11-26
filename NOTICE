@@ -1,0 +1,13 @@
+qwen3-27b-5090 with local patches (branch kit4b-0.8.1)
+
+The engine is mkyt/qwen3-27b-5090 v0.8.1, Copyright (c) 2026 Masahiro Kiyota, under the MIT License (LICENSE).
+
+engine/src/edit_copy.h is a port of src/edit_copy.hpp from yasakani-dev/yasakani (v0.2.0+), under the Apache
+License 2.0 (LICENSE-APACHE-2.0). The YASAKANI NOTICE reads, in the part that applies to that file:
+
+    YASAKANI
+    Copyright 2026 the YASAKANI authors
+
+    This product includes software developed by the YASAKANI authors.
+
+The port changes the code to fit this engine (see the file header). No YASAKANI model files are included.
