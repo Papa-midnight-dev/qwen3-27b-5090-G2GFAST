@@ -23,6 +23,8 @@ best); code-v1 356.2 on QUASAR and 366.0 on Huihui.
 | QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 | **663.9** (other order 627.3, not used) | **453.0** (454.9) | 8.52, 5.87 |
 | sakamakismile/Huihui-Qwen3.8-27B-abliterated-NVFP4 | **630.4** (other order 612.4, not used) | **440.2** (441.8) | 8.11, 5.68 |
 
+The submitted runs (verified by the site, 27 Nov): QUASAR [reasoning-v1](https://www.localmaxxing.com/en/models/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4?run=cmwy44lqy057hpd0134ni7anf), [code-v1](https://www.localmaxxing.com/en/models/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4?run=cmwy452hv057kpd01ls9nbkml); Huihui [reasoning-v1](https://www.localmaxxing.com/en/models/sakamakismile/Huihui-Qwen3.8-27B-abliterated-NVFP4?run=cmwy453ln057npd01vbdlur7e), [code-v1](https://www.localmaxxing.com/en/models/sakamakismile/Huihui-Qwen3.8-27B-abliterated-NVFP4?run=cmwy45530057qpd01co4mqy6m).
+
 One test session (27 Nov, desktop idle), both run orders. Bold = the run submitted to LocalMaxxing: the median run
 of 15 in the lower of the run orders where every request's client-side rate agreed with the engine's within 2%.
 Exception, decided by us when the data showed it: one code prompt reads +2.0-2.4% (client faster) on Huihui in every
