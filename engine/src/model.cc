@@ -261,6 +261,7 @@ Model::Model(const Options& opt) : opt_(opt) {
     Q27_CUDA(cudaEventCreateWithFlags(&stage_ev_, cudaEventDisableTiming));
     Q27_CUDA(cudaEventCreateWithFlags(&stage_in_ev_, cudaEventDisableTiming));
     Q27_CUDA(cudaEventCreateWithFlags(&ring_ready_ev_, cudaEventDisableTiming));
+    Q27_CUDA(cudaEventCreateWithFlags(&ring_prior_ev_, cudaEventDisableTiming));
     Q27_CUDA(cudaEventRecord(stage_ev_, cs_));
     log("prefix cache: %d state slots of %.1f MiB (%.2f GiB pinned, allocated as needed), checkpoint interval %d", slots,
         ckpt_bytes_ / 1048576.0, slots * double(ckpt_bytes_) / (1 << 30), opt.checkpoint_interval);
@@ -456,6 +457,12 @@ void Model::configure() {
   {  // (16, 32, 64, or 128 rows; 128 requires rep_rows_ >= 128)
     const int r = env_int("Q27_COPY_ROWS", 32);
     copy_rows_ = (r > 64 && rep_rows_ >= kCopyMaxT) ? kCopyMaxT : r > 32 ? 64 : r > kSpecBlock ? 32 : kSpecBlock;
+    // (kit4b: with decode-only W4A4x2 activations a 128-row copy step would drop the second term that a 64-row step
+    // keeps (review of climb4); such steps stay at 64 rows.)
+    if (act_a4x2_small_ && copy_rows_ > 64) {
+      log("[q27] Q27_ACT_A4X2=decode: copy steps of 64 rows (not %d)", copy_rows_);
+      copy_rows_ = 64;
+    }
   }
   // (32 rows only where a 32-row verify runs on the same FP8-MMA attention as decode: FP8 / NVFP4 KV, tensor cores on)
   if ((opt_.kv_type != KvType::FP8 && opt_.kv_type != KvType::NVFP4) || env_int("Q27_ATTN_TC", 1) == 0 ||
@@ -471,9 +478,16 @@ void Model::configure() {
   batch_adapt_ = adapt_on_ && env_int("Q27_SPEC_ADAPT_BATCH", 1) != 0;
   batch_hyst_ = std::max(0.f, env_f("Q27_SPEC_ADAPT_HYST", 0.01f));
   batch_cut_ = draft_ && draft_->dspine() && env_int("Q27_SPEC_CUT", 1) != 0;
-  cut_fine_ = env_int("Q27_CUT_FINE", 1) != 0;
-  bpipe_ = env_int("Q27_BATCH_PIPELINE", 1) != 0;
+  cut_fine_ = env_int("Q27_CUT_FINE", 0) != 0;  // (kit4b: off by default, v3 behaviour; no gain in W22)
+  bpipe_ = env_int("Q27_BATCH_PIPELINE", 0) != 0;  // (kit4b: off by default, v3 behaviour; no gain in W22)
   batch_bftree_ = draft_ && draft_->dspine() && env_int("Q27_BATCH_BFTREE", 0) != 0;
+  // (kit4b, 26 Nov 2026: optional modes that the climb4 review found unsafe with 128-row steps or untested for
+  // exactness are refused here: legacy trees over 16 nodes, two-step rollout, the sampled best-first tree and the
+  // batched best-first tree. Each falls back to v3 behaviour with a log line.)
+  if (adapt_paths_ > 1) { log("[q27] Q27_SPEC_ADAPT_PATHS=%d is not supported in this build: 1 (chains)", adapt_paths_); adapt_paths_ = 1; }
+  if (rollout_on_ > 1) { log("[q27] Q27_SPEC_ROLLOUT=%d is not supported in this build: 1", rollout_on_); rollout_on_ = 1; }
+  if (bftree_on_ > 1) { log("[q27] Q27_SPEC_BFTREE=%d is not supported in this build: 1 (greedy only)", bftree_on_); bftree_on_ = 1; }
+  if (batch_bftree_) { log("[q27] Q27_BATCH_BFTREE=1 is not supported in this build: 0"); batch_bftree_ = false; }
   batch_bftree_walks_ = std::clamp(env_int("Q27_BATCH_BFTREE_WALKS", 2), 1, kTreePaths);
   dev_rows_ = env_int("Q27_BATCH_DEV_ROWS", 1) != 0;
   // (fitted on recorded DSpine steps of 7 workloads, P3-39: [1, logit(c), entropy, log(1 + e), logit(c) log(1 + e)])
@@ -521,7 +535,7 @@ Model::~Model() {
   if (cs_) cudaStreamSynchronize(cs_), cudaStreamDestroy(cs_);
   for (char* m : slot_mem_)
     if (m) cudaFreeHost(m);
-  for (auto e : {stage_ev_, stage_in_ev_, ring_ready_ev_})
+  for (auto e : {stage_ev_, stage_in_ev_, ring_ready_ev_, ring_prior_ev_})
     if (e) cudaEventDestroy(e);
   for (auto* m : {&prof_.eager, &prof_.graph})
     for (auto e : m->events) cudaEventDestroy(e);
@@ -798,12 +812,16 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
     // Wait for any prior D2H checkpoint copy on cs_ before reading slot_mem_[best->slot].
     Q27_CUDA(cudaStreamSynchronize(cs_));
     const char* src = slot_mem_[best->slot];
+    if (draft_) { Q27_CUDA(cudaEventRecord(ring_prior_ev_, s_)); }  // (kit4b: the work on s_ before this restore; below)
     Q27_CUDA(cudaMemcpyAsync(ssm_, src, ssm_bytes_, cudaMemcpyHostToDevice, s_));
     Q27_CUDA(cudaMemcpyAsync(conv_, src + ssm_bytes_, conv_bytes_, cudaMemcpyHostToDevice, s_));
     if (timing) { Q27_CUDA(cudaStreamSynchronize(s_)); t3 = clk(); }
     if (draft_) {
       // Async 160 MiB draft ring H2D on cs_: overlaps completely with spec_begin's target forward pass on s_!
       const size_t rb = draft_->ring_layers_bytes();
+      // (kit4b fix, Astra review of climb4, blocker 3: earlier work on s_, such as a partial prefill's append_ctx or the
+      // last step of the previous request, may still write the ring; the copy on cs_ starts after it.)
+      Q27_CUDA(cudaStreamWaitEvent(cs_, ring_prior_ev_));  // (recorded before the state copies above)
       Q27_CUDA(cudaMemcpyAsync(draft_->ring_k(), src + ssm_bytes_ + conv_bytes_, rb, cudaMemcpyHostToDevice, cs_));
       Q27_CUDA(cudaMemcpyAsync(draft_->ring_v(), src + ssm_bytes_ + conv_bytes_ + rb, rb, cudaMemcpyHostToDevice, cs_));
       Q27_CUDA(cudaEventRecord(ring_ready_ev_, cs_));
@@ -1485,7 +1503,7 @@ void Model::copy_hist(int32_t* dst, const int32_t* ids, int n) {
   Q27_CUDA(cudaMemcpyAsync(dst, h.data(), size_t(n) * 4, cudaMemcpyHostToDevice, s_));
 }
 
-void Model::logits(const float* x_rows, int rows) {
+void Model::logits(const float* x_rows, int rows, float* out) {
   mark("norm+quant");
   if (w_.lm_head8.w) {  // (an FP8 lm_head: lm_head is the draft model's NVFP4 copy)
     rmsnorm_quant(x_rows, w_.final_norm, rows, kEps, nullptr, q8row(), s_);
@@ -1508,7 +1526,7 @@ void Model::logits(const float* x_rows, int rows) {
     return;
   }
   rmsnorm_quant(x_rows, w_.final_norm, rows, kEps, nullptr, q4(w_.lm_head.in_scale), s_);
-  gemm_q("lm_head", w_.lm_head, rows, logits_, false);
+  gemm_q("lm_head", w_.lm_head, rows, out ? out : logits_, false);
 }
 
 void Model::forward_topk(const int32_t* ids, int n, int k,
@@ -1896,7 +1914,14 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
   verify_ = false;
   copy_verify_ = false;
   cap_ = nullptr;
-  logits(x_, W);
+  if (W > kSkinnyMaxM && skinny_ && !w_.lm_head8.w && !head_a4x2_) {
+    // (kit4b, Fable checkpoint: a copy verify of more than kSkinnyMaxM rows runs the head in kSkinnyMaxM-row slices on
+    // the skinny path, the numerics of v3's 64-row copy steps; climb4 ran 128 rows through the general GEMM.)
+    for (int r0 = 0; r0 < W; r0 += kSkinnyMaxM)
+      logits(x_ + size_t(r0) * kHidden, std::min(kSkinnyMaxM, W - r0), logits_ + size_t(r0) * kVocab);
+  } else {
+    logits(x_, W);
+  }
   mark("accept");
   if (smp.bias) {
     BiasLanes bl;
@@ -1976,8 +2001,10 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   const SpecSampling smp = spec_smp_;
   const int W_step = spec_rows(smp);
   Q27_CHECK(pos_ + W_step <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
-  // Pages for this step's rows and for the one launched ahead.
-  ensure_pages(pos_ + std::max(kSpecBlock, W_step) + W_step);
+  // Pages for this step's rows and for the one launched ahead. A copy step is never launched ahead, so it reserves
+  // only kSpecBlock beyond its rows, as v3 did. (kit4b fix: climb4 asked for pos_ + 2 * 128 on a 128-row copy step,
+  // which can evict a checkpoint or raise KvFull under shared KV pressure. Astra review of climb4.)
+  ensure_pages(pos_ + W_step + (smp.copy ? kSpecBlock : std::max(kSpecBlock, W_step)));
   auto same = [](const SpecSampling& a, const SpecSampling& b) { return a.same(b); };
   static const char* trace = getenv("Q27_TRACE");  // debug timeline (build with -DQ27_TRACE)
   if (trace) trace_step_begin(s_);
@@ -1988,6 +2015,9 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   if (smp.masked) {
     Q27_CHECK(spec_drafted_, "spec_step: a masked sequence's step is drafted first (spec_draft)");
     spec_drafted_ = false;
+    // (kit4b: the verify must read the rows as the chain that spec_draft drafted and the host masked)
+    Q27_CHECK(!drafted_tree_ && smp.paths <= 1 && !bftree_of(smp) && spec_rows(smp) == drafted_rows_,
+              "spec_step: a masked step verifies a different shape than spec_draft drafted");
     spec_part(smp, 2);
     par_host_ ^= 1;
   } else if (spec_inflight_) {
@@ -2059,12 +2089,12 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
     Q27_CUDA(cudaMemcpy(ti, ti_, sizeof ti, cudaMemcpyDeviceToHost));
     Q27_CUDA(cudaMemcpy(cp, cpath_, sizeof cp, cudaMemcpyDeviceToHost));
     fprintf(stderr, "[dbg] pos %d n %d nodes %d paths %d | path", pos_, n, tr.n, tr.npaths);
-    for (int i = 0; i < n; i++) fprintf(stderr, " %d", cp[i]);
+    for (int i = 0; i < std::min(n, kSpecBlock); i++) fprintf(stderr, " %d", cp[i]);  // (kit4b: cp holds kSpecBlock)
     fprintf(stderr, "\n");
     for (int i = 0; i < tr.n; i++) {
       fprintf(stderr, "[dbg]   node %2d tok %6d depth %d parent %2d owner %d argmax %6d draws", i, tr.tok[i], tr.depth[i],
-              tr.depth[i] ? tr.path[i][tr.depth[i] - 1] : -1, tr.owner[i], ti[i]);
-      for (int j = 0; j < tr.ndraws[i]; j++) fprintf(stderr, " %d", tr.draws[i][j]);
+              tr.depth[i] ? (tr.depth[i] <= kSpecBlock ? tr.path[i][tr.depth[i] - 1] : i - 1) : -1, tr.owner[i], ti[i]);  // (kit4b: a copy chain deeper than path[] has parent i - 1)
+      for (int j = 0; j < std::min<int>(tr.ndraws[i], kTreeDraws); j++) fprintf(stderr, " %d", tr.draws[i][j]);
       fprintf(stderr, "\n");
     }
   }
@@ -2123,7 +2153,10 @@ bool Model::copy_prepare() {
     return h;
   };
   copy_index_upto(L);
-  int W = std::min(copy_rows_, step_capacity_);  // (64 or 32 rows; fewer near the page limit or for a 16-token caller)
+  // (kit4b, diagnostic window W22: 128-row copy steps gained 25% on sampled edits but lost 10% on an edit whose copies
+  // break often. A copy run starts at 64 rows and takes 128 only after a 64-or-more-row step accepted every row.)
+  const int cap = copy_rows_ > 64 && !copy_full_ ? 64 : copy_rows_;
+  int W = std::min(cap, step_capacity_);  // (64 or 32 rows; fewer near the page limit or for a 16-token caller)
   while (W > kSpecBlock && pos_ + kSpecBlock + W > max_pages_ * kPageTokens) W /= 2;
   if (pos_ + kSpecBlock + W > max_pages_ * kPageTokens) return false;
   int32_t d[kTreeMax];  // d[m]: the output token expected at position L + m
@@ -2226,6 +2259,7 @@ void Model::copy_follow(const int32_t* out, int n) {
     }
   } hint{this, L};
   ec_n_ = n;
+  copy_full_ = copy_last_ && copy_w_ >= 64 && n >= copy_w_;  // (kit4b: see copy_prepare)
   if (copy_last_) {
     copy_steps_++, copy_tokens_ += n;
     if (n - 1 < 4 && copy_fresh_) {  // a fresh lock that failed at once: repeated structure, not a copy
@@ -2342,7 +2376,10 @@ void Model::spec_draft(int32_t* chain) {
   Q27_CHECK(draft_ && spec_smp_.masked, "spec_draft: not a masked sequence");
   batch_exit();
   wait_ring_h2d();
+  // (kit4b fix: a masked step is always a chain in both phases; see spec_set_masked)
+  spec_smp_.bftree = 0, spec_smp_.bftree_nodes = 0, spec_smp_.rollout = 1;
   const SpecSampling smp = spec_smp_;
+  drafted_rows_ = spec_rows(smp), drafted_tree_ = smp.paths > 1 || bftree_of(smp);
   Q27_CHECK(!spec_inflight_, "spec_draft: a step in flight");
   Q27_CHECK(pos_ + spec_rows(smp) <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
   ensure_pages(pos_ + kSpecBlock + spec_rows(smp));  // (KvFull before anything ran)
@@ -2359,6 +2396,11 @@ void Model::spec_set_masked(int area) {
   Q27_CHECK(area < 0 || parked_[area].used, "spec_set_masked: no such sequence");
   if (area < 0) spec_flush();
   smp.masked = true, smp.paths = 1, smp.copy = 0;  // (local patch: no copy step's rows or tree carry over)
+  // (kit4b fix, 26 Nov 2026: neither may a best-first tree or a two-step rollout. spec_draft drafts from this state and
+  // the host masks its rows as one chain; spec_step verifies them as a chain. Astra review of climb4, blocker 1.)
+  smp.bftree = 0, smp.bftree_nodes = 0;
+  smp.bftree_walks = smp.bftree_walks_next = smp.bftree_walks_due = 0;
+  smp.rollout = smp.rollout_next = smp.rollout_due = 1;
   smp.block = smp.block_next = smp.block_due = draft_->block();  // (a masked chain keeps the full block: the host masks its rows)
   smp.stop[2] = -1;  // (the reasoning has ended)
 }

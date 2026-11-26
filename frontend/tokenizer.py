@@ -187,6 +187,16 @@ class Tokenizer:
         text = self.render(messages, tools=self._escape(tools), add_generation_prompt=add_generation_prompt, **kwargs)
         return self.encode_marked(text)
 
+    def prompt_ids_array(self, messages, tools=None, add_generation_prompt=True, **kwargs):
+        """prompt_ids as an int32 array.array (kit4b: the server's fast path; prompt_ids keeps returning a list, as in
+        v3, so callers that compare it with a list still work. Same ids.)"""
+        messages = [m if not isinstance(m, dict) or m.get("role") == "assistant" else self._escape_message(m)
+                    for m in messages]
+        text = self.render(messages, tools=self._escape(tools), add_generation_prompt=add_generation_prompt, **kwargs)
+        if ESC not in text and not self._seg_limit:
+            return array.array("i", self.encode(text))
+        return self._encode_marked_array(text)
+
     def _escape(self, x):
         """x (strings, lists and mappings of them, keys too) with the added tokens' strings marked."""
         if isinstance(x, str):
@@ -266,9 +276,13 @@ class Tokenizer:
 
     def encode_marked(self, text):
         """Ids of a rendered prompt whose client text was marked (_escape): the added tokens the template wrote are
-        tokens, the text between them is encoded without added tokens, with the marked strings put back."""
+        tokens, the text between them is encoded without added tokens, with the marked strings put back. A list,
+        as in v3 (kit4b)."""
         if ESC not in text and not self._seg_limit:
             return self.encode(text)
+        return self._encode_marked_array(text).tolist()
+
+    def _encode_marked_array(self, text):
         added_ids, raw_segs, at = [], [], 0
         for m in self._added_re.finditer(text):
             raw_segs.append(text[at:m.start()])

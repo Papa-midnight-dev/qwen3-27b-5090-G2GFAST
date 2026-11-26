@@ -849,7 +849,7 @@ bool launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const ui
   // ext_reduce so skinny_kernel exits cleanly and skinny_reduce_norm_kernel fuses reduce + norm + NVFP4 quant.
   const char* e_ext = getenv("Q27_SKINNY_EXT_REDUCE_M");
   const char* e_fn = getenv("Q27_FUSE_REDUCE_NORM_M");
-  const int fn_min = e_fn && *e_fn ? atoi(e_fn) : 9;
+  const int fn_min = e_fn && *e_fn ? atoi(e_fn) : 0;  // (kit4b: off by default; no gain in W22, and long JSONL 2-3% slower)
   const bool fuse_norm = kFp4 && norm && norm->w && !x2 && !wscale && p.c && p.beta == 1.f && p.N == dims::kHidden &&
                          p.splits > 1 && fn_min > 0 && M >= fn_min;
   // (W4A4x2: decided by the tokens, x2, as for a one-term call of x2 rows; with one split and more than one token

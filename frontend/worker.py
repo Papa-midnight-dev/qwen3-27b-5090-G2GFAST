@@ -106,8 +106,7 @@ class Seq:
         self.force, self.unsent = req.get("force"), []
         if self.force is not None and self.force[0] is None:
             self.out, self.force = list(self.force[1]), None
-            self.eng_ids = array.array("i", self.prompt)
-            self.eng_ids.extend(self.out)
+            self.eng_ids = list(self.prompt) + list(self.out)  # (kit4b: a list, as in v3; ids_bytes converts)
             self.unsent = list(self.out)
         # Structured output: the llguidance grammar, and the token after which it applies (the end of the
         # reasoning; None: from the start). matcher: made on arrival (Scheduler.submit); gm: the same once the grammar
@@ -149,6 +148,8 @@ class Seq:
 
 
 class Scheduler:
+    _batch_out = None  # (kit4b: a class default, so a Scheduler built without __init__ (the tests) emits as v3 did)
+
     def __init__(self, conn, cfg):
         from q27lib import Engine, KvFull
 
@@ -996,8 +997,7 @@ class Scheduler:
         elif v.area is not None:
             self.engine.seq_suspend(v.area)
             v.area = None
-        v.eng_ids = array.array("i", v.prompt)
-        v.eng_ids.extend(v.out)  # (ids_bytes follows the new length)
+        v.eng_ids = list(v.prompt) + list(v.out)  # (kit4b: a list, as in v3; ids_bytes follows the new length)
         v.started, v.fed, v.phase = False, 0, PREFILL
 
     def finish(self, s, reason, save=True, notify=True):

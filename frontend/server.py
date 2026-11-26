@@ -598,7 +598,9 @@ class Generation:
         # it, and when the first token came.
         self.prefilled, self.toks, self.first_tok, self.drafts = None, [], None, None
         try:
-            ids_bytes = ids.tobytes() if isinstance(ids, array.array) else array.array("i", ids).tobytes()
+            # (kit4b: only a 4-byte 'i' array goes as raw bytes; any other type converts by value. Astra review.)
+            ok_raw = isinstance(ids, array.array) and ids.typecode == "i" and ids.itemsize == 4
+            ids_bytes = ids.tobytes() if ok_raw else array.array("i", ids).tobytes()
             req = dict(ids_bytes=ids_bytes, max_new=max_new, images=images, force=force, **(grammar or {}), **sampling)
         except (TypeError, OverflowError):
             req = dict(ids=ids, max_new=max_new, images=images, force=force, **(grammar or {}), **sampling)
@@ -806,7 +808,7 @@ class Server:
         messages = with_video_parts(messages)
         try:
             with self.tok_lock:
-                ids = self.tok.prompt_ids(messages, tools=tools or None, **kwargs)
+                ids = self.tok.prompt_ids_array(messages, tools=tools or None, **kwargs)  # (kit4b: int32 array, same ids)
         except Exception as e:  # noqa: BLE001 - template errors (no user message, bad roles) are the client's
             raise ApiError(400, f"chat template: {e}") from e
         media, images = Images.collect(messages), None

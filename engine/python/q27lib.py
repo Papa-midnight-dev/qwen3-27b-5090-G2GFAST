@@ -157,7 +157,13 @@ def call(name, *args):
 
 
 def _int32_arr(ids):
-    return ids if isinstance(ids, array.array) and ids.typecode == "i" else array.array("i", ids)
+    # (kit4b: a private copy, as in v3: the native call releases the GIL, so a caller's array could change under it.
+    # An 'i' array copies as one memcpy. Astra review of climb4.)
+    if isinstance(ids, array.array) and ids.typecode == "i" and ids.itemsize == 4:
+        out = array.array("i")
+        out.frombytes(ids.tobytes())
+        return out
+    return array.array("i", ids)
 
 
 class KvFull(RuntimeError):

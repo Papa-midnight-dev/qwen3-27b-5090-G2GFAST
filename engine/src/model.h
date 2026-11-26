@@ -268,7 +268,7 @@ class Model {
     b.list[0] = bias_, b.pos[0] = pos_dev_;
     return b;
   }
-  void logits(const float* x_rows, int rows);  // final norm + lm_head into logits_
+  void logits(const float* x_rows, int rows, float* out = nullptr);  // final norm + lm_head into logits_ (or out)
   bool gdn(int layer, int T, bool norm_done = false, const SkinnyNorm* next_norm = nullptr);
   bool attn(int layer, int T, bool norm_done = false, const SkinnyNorm* next_norm = nullptr);
   bool mlp(int layer, int T, bool norm_done = false, const SkinnyNorm* next_norm = nullptr);
@@ -358,6 +358,10 @@ class Model {
   char* stage_ = nullptr;            // device copy of one checkpoint on its way to the host
   cudaEvent_t stage_ev_ = nullptr, stage_in_ev_ = nullptr;  // staging free again / filled
   cudaEvent_t ring_ready_ev_ = nullptr;  // async draft ring H2D done on cs_
+  cudaEvent_t ring_prior_ev_ = nullptr;
+  bool copy_full_ = false;   // (kit4b) the last step was a copy step that accepted every row: the next may use 128
+  int drafted_rows_ = 0;     // (kit4b) the rows spec_draft drafted for a masked step; spec_step verifies the same chain
+  bool drafted_tree_ = false;  // (kit4b fix: the ring restore on cs_ waits for earlier work on s_)
   bool ring_h2d_pending_ = false;
   void wait_ring_h2d();              // stream-wait s_ on ring_ready_ev_ before draft accesses ring
   void sync_ring_h2d();              // host-sync cs_ before touching checkpoint slots
@@ -428,8 +432,8 @@ class Model {
   // Cut steps (P3-39, Q27_SPEC_CUT): the draft at the lanes' rows (batch_rows), then each lane verifies the prefix
   // that maximizes the expected tokens per ms (from the draft's table, dspine_conf_tokens; cut_rows).
   bool batch_cut_ = false;
-  bool cut_fine_ = true;             // Q27_CUT_FINE: fine-grained step-1 cut_rows + 450W tiered verify_ms
-  bool bpipe_ = true;                // Q27_BATCH_PIPELINE: launch p1(k+1) ahead after p2(k) (read-only, zero rollback)
+  bool cut_fine_ = false;            // Q27_CUT_FINE: fine-grained step-1 cut_rows + 450W tiered verify_ms
+  bool bpipe_ = false;               // Q27_BATCH_PIPELINE: launch p1(k+1) ahead after p2(k) (read-only, zero rollback)
   bool batch_bftree_ = true;         // Q27_BATCH_BFTREE: per-lane BF-Tree in batched verify (single graph, no cut sync)
   int batch_bftree_walks_ = 2;       // Q27_BATCH_BFTREE_WALKS: stochastic walks per lane for batched sampled BF-Tree
   bool b_tree_on_ = false;           // active batched step uses BF-Tree (set in batch_prepare)
@@ -654,7 +658,7 @@ class Model {
   void copy_follow(const int32_t* out, int n);
   void copy_reset() {
     copy_index_.clear(), copy_len_ = 0, copy_src_ = -1, copy_cool_ = 0, copy_backoff_ = 16, copy_last_ = false;
-    copy_hint_ = false;
+    copy_hint_ = false, copy_full_ = false;
     ec_.reset(), ec_first_edit_ = -1;
   }
   // Edit copy (research patch, Q27_EDIT_COPY, port of YASAKANI's): learned replacements applied to the copied input.
