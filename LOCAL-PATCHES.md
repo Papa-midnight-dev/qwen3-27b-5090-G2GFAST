@@ -124,7 +124,7 @@ Q27_TOKEN_CACHE_MB=16`.
    `hf download tencent/Qwen3.8-27B-DSpine-b16 --revision 5f54174d301dbca65d9aa4448dc47e56732d9a12 --cache-dir ./hf/hub`
    and `hf download QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 --local-dir ./quasar` (or
    `sakamakismile/Huihui-Qwen3.8-27B-abliterated-NVFP4`). We measured QUASAR revision `4a22293`; it has the same weight
-   files as the revision upstream pins (`15d2e47`). Mounting the folder as `WEIGHTS` uses the checkpoint's own output
+   files as the revision upstream pins (`15d2e47`) and the newer `a07bf63` (only the README differs). Mounting the folder as `WEIGHTS` uses the checkpoint's own output
    head, as measured; upstream's `WEIGHTS=quasar` mode takes another checkpoint's head instead.
 3. Build: `docker build -t q27:kit4b .` (it compiles the CUDA code; allow some time).
 4. Start: `docker run --gpus all --ulimit memlock=-1 -p 127.0.0.1:8000:8000 -v "$PWD/hf":/hf:ro
