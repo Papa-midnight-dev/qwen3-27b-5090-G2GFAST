@@ -11,7 +11,7 @@ system instruction) and thinking off; 512 tokens, T 0. Per request: the engine's
 is kept for the exactness comparison against a SPEC=none arm. nvidia-smi pmon and the load average are logged.
 Run it with nothing else using the GPU or the server. canonical_prompts.go: the LocalMaxxing CLI's
 cmd/lmx/canonical_prompts.go (github.com/LottoLottoLotto/localmaxxing-cli); the script checks the prompt hashes.
-usage: python3 lmx_canonical.py <canonical_prompts.go> <out dir> [--cells medium,xhigh,off] [--n 15] [--save-text]"""
+usage: python3 lmx_canonical.py <canonical_prompts.go> <out dir> [--cells medium,xhigh,off] [--n 15] [--save-text] [--base-url URL]"""
 import argparse, hashlib, json, os, random, re, statistics, subprocess, sys, time, urllib.request
 
 BASE = "http://127.0.0.1:8000"; URL = BASE + "/v1/chat/completions"; MODEL = "qwen3.8-27b"
@@ -83,8 +83,10 @@ def main():
     ap.add_argument("go"); ap.add_argument("out")
     ap.add_argument("--cells", default="medium,xhigh,off"); ap.add_argument("--n", type=int, default=15)
     ap.add_argument("--save-text", action="store_true")
+    ap.add_argument("--base-url", default="http://127.0.0.1:8000", help="the server (default http://127.0.0.1:8000)")
     a = ap.parse_args()
-    global SAVE_TEXT; SAVE_TEXT = a.save_text
+    global SAVE_TEXT, BASE, URL; SAVE_TEXT = a.save_text
+    BASE = a.base_url.rstrip("/"); URL = BASE + "/v1/chat/completions"
     os.makedirs(a.out, exist_ok=True)
     pmon = subprocess.Popen(["nvidia-smi", "pmon", "-s", "um", "-d", "1"], stdout=open(os.path.join(a.out, "pmon.txt"), "w"),
                             stderr=subprocess.DEVNULL)

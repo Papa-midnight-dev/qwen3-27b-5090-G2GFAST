@@ -1,4 +1,6 @@
-> **Branch kit4b-0.8.1:** upstream v0.8.1 with local patches. What they do, how they were measured and checked: [LOCAL-PATCHES.md](LOCAL-PATCHES.md).
+> **Branch kit4b-0.8.1:** upstream v0.8.1 with local patches; the fastest verified single-request runs for Qwen3.8-27B on one
+> RTX 5090 on LocalMaxxing (27 Nov 2026). Step by step, from a clean box to a verified run: [GUIDE.md](GUIDE.md).
+> What the patches do, how they were measured and checked: [LOCAL-PATCHES.md](LOCAL-PATCHES.md).
 
 # Qwen3.8-27B on one RTX 5090
 
