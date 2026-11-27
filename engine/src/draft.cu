@@ -795,7 +795,7 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
   // the paths are the smp.paths best of a beam search (one path: the argmax walk).
   SpecTree* tr = choice.tree;
   const int K = max(1, min(smp.paths, kTreePaths));
-  const bool use_opt_tree = kPre && !kBatch && smp.opt_tree > 0 && smp.temperature > 0.f;
+  const bool use_opt_tree = kPre && smp.opt_tree > 0 && smp.temperature > 0.f;
   const bool use_bftree = !use_opt_tree && kPre && smp.bftree > 0 && (smp.temperature <= 0.f || smp.bftree >= 2);
   const int bf_budget =
       kBatch ? nrows : min(kSpecBlock, max(2, (!use_opt_tree && smp.bftree_nodes > 0) ? smp.bftree_nodes : nd + 1));
@@ -934,24 +934,40 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
       float h0 = (lane < kSelK && p0 > 0.f) ? -p0 * logf(p0) : 0.f;
       for (int o = 16; o > 0; o >>= 1) h0 += __shfl_xor_sync(0xffffffffu, h0, o);
       if (lane == 0) {
+        // Strictly F_0-measurable asymmetric 1-slot kSnap1 BFS trees (root-only branching -> <= 1 GDN snapshot!).
+        // Higher H0 chain cutoffs at smaller budgets (B=4,8: 0.85; B=12,16: 0.65) avoid depth-capping prose/code.
+        static constexpr int8_t kB4[2][4] = {
+            {1, 1, 1, 0},  // H0 < 0.65: pure chain (depth 3)
+            {2, 1, 0, 0},  // H0 >= 0.65: 2-way asym (depths 2, 1; 1-slot kSnap1)
+        };
         static constexpr int8_t kB8[4][8] = {
             {1, 1, 1, 1, 1, 1, 1, 0},  // H0 < 0.45: pure chain (depth 7)
-            {2, 1, 1, 1, 0, 1, 1, 0},  // 0.45 <= H0 < 1.0: 2-way asym (depths 5, 2; 1-slot kSnap1)
-            {2, 1, 1, 1, 1, 1, 0, 0},  // 1.0 <= H0 < 1.6: 2-way (depths 4, 3; 1-slot kSnap1)
-            {3, 1, 1, 1, 1, 0, 0, 0},  // H0 >= 1.6: 3-way (depths 3, 2, 2; 1-slot kSnap1)
+            {2, 1, 1, 1, 0, 1, 1, 0},  // 0.45 <= H0 < 1.00: 2-way asym (depths 5, 2; 1-slot kSnap1)
+            {2, 1, 1, 1, 1, 1, 0, 0},  // 1.00 <= H0 < 1.60: 2-way (depths 4, 3; 1-slot kSnap1)
+            {3, 1, 1, 1, 1, 0, 0, 0},  // H0 >= 1.60: 3-way asym (depths 3, 2, 2; 1-slot kSnap1)
+        };
+        static constexpr int8_t kB12[4][12] = {
+            {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0},  // H0 < 0.45: pure chain (depth 11)
+            {2, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0},  // 0.45 <= H0 < 1.00: 2-way asym (depths 8, 3; 1-slot kSnap1)
+            {3, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 0},  // 1.00 <= H0 < 1.60: 3-way asym (depths 5, 4, 2; 1-slot kSnap1)
+            {4, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0},  // H0 >= 1.60: 4-way asym (depths 4, 3, 2, 2; 1-slot kSnap1)
         };
         static constexpr int8_t kB16[4][16] = {
             {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0},  // H0 < 0.45: pure chain (depth 15)
-            {2, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 0},  // 0.45 <= H0 < 1.0: 2-way asym (depths 11, 4; 1-slot kSnap1)
-            {3, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0},  // 1.0 <= H0 < 1.6: 3-way asym (depths 8, 4, 3; 1-slot kSnap1)
-            {4, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1, 0, 1, 0},  // H0 >= 1.6: 4-way asym (depths 6, 4, 3, 2; 1-slot kSnap1)
+            {2, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 0},  // 0.45 <= H0 < 1.00: 2-way asym (depths 11, 4; 1-slot kSnap1)
+            {3, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0},  // 1.00 <= H0 < 1.60: 3-way asym (depths 8, 4, 3; 1-slot kSnap1)
+            {4, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1, 0, 1, 0},  // H0 >= 1.60: 4-way asym (depths 6, 4, 3, 2; 1-slot kSnap1)
         };
-        const int bin = (smp.opt_tree == 3) ? 0 : (h0 < 0.45f ? 0 : (h0 < 1.0f ? 1 : (h0 < 1.6f ? 2 : 3)));
+        const int bin = (smp.opt_tree == 3) ? 0 : (h0 < 0.45f ? 0 : (h0 < 1.00f ? 1 : (h0 < 1.60f ? 2 : 3)));
         for (int i = 0; i < bf_budget; i++) {
           if (bf_budget == 16)
             s_cnt_bfs[i] = kB16[bin][i];
+          else if (bf_budget == 12)
+            s_cnt_bfs[i] = kB12[bin][i];
           else if (bf_budget == 8)
             s_cnt_bfs[i] = kB8[bin][i];
+          else if (bf_budget == 4)
+            s_cnt_bfs[i] = kB4[(smp.opt_tree == 3 || h0 < 0.65f) ? 0 : 1][i];
           else
             s_cnt_bfs[i] = (i + 1 < bf_budget) ? 1 : 0;
         }
@@ -1286,6 +1302,13 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
           const int nd = tr->path[tr->leaf[p]][i];
           if (tr->owner[nd] < 0) tr->owner[nd] = int8_t(p);
         }
+      if constexpr (kBatch) {
+        // Ensure trivial chain DFS schedule is populated for chain lanes inside a mixed kSnap1 batch.
+        if (tr->dfs_n == 0 && K == 1) {
+          tr->dfs_n = int8_t(n);
+          for (int i = 0; i < n; i++) tr->dfs_order[i] = int8_t(i), tr->dfs_push[i] = -1, tr->dfs_pop[i] = -1;
+        }
+      }
     } else {
       tr->leaf[0] = int8_t(n - 1);
     }

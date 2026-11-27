@@ -2112,7 +2112,8 @@ void gdn_verify_prep(const float* qkv, int ld, int T, float* conv_state, const b
                      const bf16* wa, const bf16* wb, float* q, const GdnSpec& sp, cudaStream_t s) {
   Q27_CHECK(T <= kVerifyMaxT, "gdn_verify_prep: T must be <= 32");
   const int prep_mode = ml_env_int("Q27_ML_GDN_PREP");
-  if (prep_mode == 1 || (prep_mode == 2 && T > 8 && sp.lanes == 0 && sp.paths <= 1)) {
+  if (prep_mode == 1 || (prep_mode == 2 && T > 8 && sp.lanes == 0 && sp.paths <= 1) ||
+      (prep_mode == 3 && (T > 8 || sp.lanes > 0))) {
     if (sp.lanes > 0) {
       Q27_CHECK(sp.lanes <= kMaxLanes && sp.lr.n == sp.lanes && sp.prow0, "gdn_verify_prep: invalid batched spec");
       T = T > 0 ? sp.lr.max_rows() : 0;
@@ -2212,7 +2213,11 @@ void gdn_verify(const float* q, int T, const bf16* A_log, const bf16* dt_bias, f
     constexpr bool kCs = decltype(cs_tag)::value;
     if (sp.lanes > 0) {
       Q27_CHECK(sp.lanes <= kMaxLanes && sp.lr.n == sp.lanes && sp.prow0, "gdn_verify: invalid batched spec");
-      if (sp.paths > 1)
+      if (sp.paths == 3)
+        launch_pdl_cluster(gdn_rec_kernel<true, true, true, false, kCs, true>, dim3(kVHeads * kRecSplit, sp.lanes),
+                           dim3(kRecWarps * 32), 0, s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias,
+                           state, z, ldz, norm_w, eps, out, q8, in_scale, sp, q4, sf4);
+      else if (sp.paths > 1)
         launch_pdl_cluster(gdn_rec_kernel<true, true, true, false, kCs>, dim3(kVHeads * kRecSplit, sp.lanes),
                            dim3(kRecWarps * 32), 0, s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias,
                            state, z, ldz, norm_w, eps, out, q8, in_scale, sp, q4, sf4);

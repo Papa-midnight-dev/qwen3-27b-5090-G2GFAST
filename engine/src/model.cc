@@ -503,6 +503,7 @@ void Model::configure() {
   if (bftree_on_ > 1) { log("[q27] Q27_SPEC_BFTREE=%d is not supported in this build: 1 (greedy only)", bftree_on_); bftree_on_ = 1; }
   if (batch_bftree_) { log("[q27] Q27_BATCH_BFTREE=1 is not supported in this build: 0"); batch_bftree_ = false; }
   batch_bftree_walks_ = std::clamp(env_int("Q27_BATCH_BFTREE_WALKS", 2), 1, kTreePaths);
+  batch_opt_tree_ = draft_ && draft_->dspine() ? std::clamp(env_int("Q27_ML_BATCH_OPT", 0), 0, 4) : 0;
   dev_rows_ = env_int("Q27_BATCH_DEV_ROWS", 1) != 0;
   // (fitted on recorded DSpine steps of 7 workloads, P3-39: [1, logit(c), entropy, log(1 + e), logit(c) log(1 + e)])
   cut_cal_ = ConfCalib{{{0.300642f, 0.664243f, -0.350132f, -0.201407f, -0.015231f},
@@ -2316,15 +2317,16 @@ void Model::spec_adapt(SpecSampling& smp, int n) const {
     smp.block_next = adapt_low_;
   else if (smp.block_next != full && smp.accept_ema >= adapt_up_)
     smp.block_next = full;
-  if (opt_tree_on_ == 1 && smp.temperature > 0.f) {
+  const int ot_mode = opt_tree_on_ > 0 ? opt_tree_on_ : (batch_opt_tree_ > 0 ? 1 : 0);
+  if (ot_mode == 1 && smp.temperature > 0.f) {
     // Strictly F_{t-1}-measurable hysteresis: start in pure chain so high-accept code/JSON (ema >= 4.0)
     // pays 0 tree overhead and zero depth-cap tax; enable Ent-Sequoia OPT when ema < 4.0, bypass at >= 4.6.
     if (smp.opt_tree_next > 0 && smp.accept_ema >= 4.6f)
       smp.opt_tree_next = 0;
     else if (smp.opt_tree_next == 0 && smp.accept_ema < 4.0f)
       smp.opt_tree_next = 1;
-  } else if (opt_tree_on_ > 0 && smp.temperature > 0.f) {
-    smp.opt_tree_due = smp.opt_tree_next = opt_tree_on_;
+  } else if (ot_mode > 0 && smp.temperature > 0.f) {
+    smp.opt_tree_due = smp.opt_tree_next = ot_mode;
   } else {
     smp.opt_tree_due = smp.opt_tree_next = 0;
   }
@@ -2751,7 +2753,8 @@ SpecSampling& Model::lane_smp(int z) {
 
 GdnSpec Model::gdn_spec_lanes(int gi) const {
   GdnSpec sp = gdn_spec(gi);  // (the replay buffers; lane z uses its rows, blr_)
-  sp.par = b_par_, sp.ncommit = b_nc_, sp.cpath = b_cpath_, sp.tree = b_tree_, sp.paths = b_tree_on_ ? 2 : 1;
+  sp.par = b_par_, sp.ncommit = b_nc_, sp.cpath = b_cpath_, sp.tree = b_tree_;
+  sp.paths = b_opt_tree_on_ ? 3 : (b_tree_on_ ? 2 : 1);
   sp.lanes = int(blanes_.size());
   sp.lr = vrows(), sp.prow0 = b_prow0_;
   for (int z = 0; z < sp.lanes; z++) {
@@ -2841,6 +2844,7 @@ void Model::batch_exit() {
   batch_on_ = false;
   b_drafted_ = false;
   b_tree_on_ = false;
+  b_opt_tree_on_ = false;
   const int n = int(blanes_.size());
   if (batch_pending_) {  // the last verify's commits: replay-only blocks (conv and recurrent states)
     for (int i = 0; i < kLayers; i++) {
@@ -3125,13 +3129,33 @@ void Model::batch_prepare(const int32_t* lanes, int n, const int* keep_w) {
   // Lanes of different rows need DSpine (DFlash2's blocks are 8) and the FP8-MMA verify; else every lane has 8.
   const bool vary = draft_->dspine() && attention_lanes_vary(opt_.kv_type);
   bvary_ = vary;
-  const bool bft = batch_bftree_ && vary && !batch_masked();
-  b_tree_on_ = bft;
+  bool any_opt = false;
+  const int max_opt_n = (batch_opt_tree_ == 4) ? 2 : kMaxLanes;
+  if (batch_opt_tree_ > 0 && vary && !batch_masked() && n >= 2 && n <= max_opt_n) {
+    for (int z = 0; z < n; z++) {
+      const SpecSampling& m = lane_smp(z);
+      if (!m.pinned && m.temperature > 0.f && m.logprobs < 0 && (batch_opt_tree_ >= 2 || m.opt_tree_due > 0)) {
+        any_opt = true;
+        break;
+      }
+    }
+  }
+  const bool bft = !any_opt && batch_bftree_ && vary && !batch_masked();
+  b_opt_tree_on_ = any_opt;
+  b_tree_on_ = bft || any_opt;
   int w[kMaxLanes];
   if (!vary) {
     std::fill(w, w + n, ddims::kBlock);
   } else if (keep_w) {  // (kit4b: the rows this masked batch was drafted with; planning again would move them)
     std::copy(keep_w, keep_w + n, w);
+  } else if (any_opt && batch_opt_tree_ >= 2) {
+    const int full = std::min(draft_->block(), kSpecBlock);
+    const int cap = (batch_opt_tree_ == 3 || batch_opt_tree_ == 4) ? std::min(batch_rows_, 32) : batch_rows_;
+    const int per = std::clamp((cap / n) / 4 * 4, 4, full);
+    for (int z = 0; z < n; z++) {
+      const SpecSampling& m = lane_smp(z);
+      w[z] = m.pinned ? std::clamp(m.block_due, 2, kSpecBlock) : per;
+    }
   } else if (bft) {
     const int full = std::min(draft_->block(), kSpecBlock);
     const int per = std::clamp(batch_rows_ / n, 2, full);
@@ -3147,8 +3171,12 @@ void Model::batch_prepare(const int32_t* lanes, int n, const int* keep_w) {
   bsl_.lr = bacc_.lr = bacc_.clr = blr_;
   cut_step_ = false;
   for (int z = 0; z < n; z++) {
+    const SpecSampling& lm = lane_smp(z);
+    const bool lane_opt = any_opt && !lm.pinned && lm.temperature > 0.f && lm.logprobs < 0 &&
+                          (batch_opt_tree_ >= 2 || lm.opt_tree_due > 0);
     bacc_.smp[z].block = w[z];
-    bacc_.smp[z].paths = bft ? 2 : 1;
+    bacc_.smp[z].opt_tree = lane_opt ? 1 : 0;
+    bacc_.smp[z].paths = (bft || lane_opt) ? 2 : 1;
     bacc_.smp[z].bftree = bft ? 2 : 0;
     bacc_.smp[z].bftree_nodes = 0;
     bacc_.smp[z].bftree_temp = bftree_temp_;

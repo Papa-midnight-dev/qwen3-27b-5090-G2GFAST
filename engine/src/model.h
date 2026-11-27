@@ -632,7 +632,9 @@ class Model {
   int adapt_low_ = 8;
   int adapt_paths_ = 1;     // Q27_SPEC_ADAPT_PATHS (local patch): tree walks at the low width, sampled only
   int bftree_on_ = 0;       // Q27_SPEC_BFTREE: 0=off, 1=greedy best-first tree, 2=greedy+sampled budget-capped tree
-  int opt_tree_on_ = 0;     // (moonshot-limits) Q27_ML_OPT_TREE: 1=Ent-Sequoia OPT, 2=force B=16, 3=chain-in-tree timing
+  int opt_tree_on_ = 0;
+  int batch_opt_tree_ = 0;
+  bool b_opt_tree_on_ = false;     // (moonshot-limits) Q27_ML_OPT_TREE: 1=Ent-Sequoia OPT, 2=force B=16, 3=chain-in-tree timing
   int bftree_nodes_ = 0;    // Q27_BFTREE_NODES: tree node budget (0: use spec_block_of(smp), else 2..16)
   float bftree_temp_ = 1.f; // Q27_BFTREE_TEMP: softmax temperature for greedy best-first tree ranking
   int bftree_walks_ = 0;    // Q27_BFTREE_WALKS: sampled tree walks (0=adaptive lo/hi by accept_ema, 1..4=fixed)
