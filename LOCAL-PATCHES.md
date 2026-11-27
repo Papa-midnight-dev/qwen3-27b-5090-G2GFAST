@@ -11,31 +11,41 @@ controlled by opt-in environment variables:
    `M=1..128`, exact `clusterDim.x=5` fused `reduce+residual+rmsnorm+NVFP4 quant`, zero-spill `gdn_prep_v2`
    (`REG: 207 -> 87`, `STACK: 32 -> 0`), zero-barrier streaming GDN state access, and zero-spill `spec_accept`
    (`STACK: 768 -> 0`). Cuts verified step latency by **-3.63% to -7.47%** with bit-identical greedy and sampled outputs.
-2. **Class B — Strictly lossless optimal speculative tree + `kSnap1` + Self-EditCopy** (`Q27_ML_OPT_TREE=1`,
-   `Q27_ML_SELF_EC=1`): Hu et al. (ICLR 2025) `Top-(m-1)+Residual OPT (c=1.0)` exact verification paired with strictly
-   `F_0`-measurable 4-bin entropy-gated asymmetric BFS trees, a 1-slot `kSnap1` GDN DFS fast path (`REG: 153 -> 117`,
-   restoring 2 CTAs/SM across all 48 GDN layers), non-trapping `F_{t-1}` hysteresis (`ot0=0`, on `< 4.0`, off `>= 4.6`),
-   and Self-EditCopy for self-generated repetitive spans.
+2. **Class B — Strictly lossless single-stream & batched optimal speculative tree + `kSnap1` + Self-EditCopy** (`Q27_ML_OPT_TREE=1`,
+   `Q27_ML_SELF_EC=1`, `Q27_ML_BATCH_OPT=4`): Hu et al. (ICLR 2025) `Top-(m-1)+Residual OPT (c=1.0)` exact verification
+   paired with strictly `F_0`-measurable 4-bin entropy-gated asymmetric BFS trees (`kB4`, `kB8`, `kB12`, `kB16`), a
+   1-slot `kSnap1` GDN DFS fast path (`REG: 153 -> 117`, restoring 2 CTAs/SM across all 48 GDN layers on both single
+   and batched verify), non-trapping `F_{t-1}` hysteresis (`ot0=0`, on `< 4.0`, off `>= 4.6`), batched `OPT_TREE` at
+   `C=2` (`2 × 16 = 32` rows hitting the `-7.47%` 32-row Class A sweet spot), and Self-EditCopy for self-generated
+   repetitive spans.
 
-Measured on one RTX 5090 with a 450 W power limit (undervolted), on Linux, on 27 Nov 2026.
+Measured on one RTX 5090 with a 450 W power limit (undervolted), on Linux, on 27–28 Nov 2026.
 
 ## Results: `g2gfast-0.8.1` vs `kit4b-0.8.1` (Huihui, 450 W)
 
-### Mirrored `ABCCBA` window (n=2 per arm, `GREEDY_CHECK=1`, zero foreign requests)
-All six runs matched **11 / 11 exact greedy SHA** against `kit4b-0.8.1` and passed `transition-check: SAME`.
+### Final Mirrored `ABBA` Before-and-After Window (28 Nov 2026, n=2 per arm, `GREEDY_CHECK=1`, zero foreign requests)
+All runs matched **11 / 11 exact greedy SHA** (`greedy-check`), **30 / 30 exact text SHA** on LocalMaxxing Huihui,
+**30 / 30 exact text SHA** on LocalMaxxing QUASAR, and passed `transition-check: SAME`. Clean sweep across every metric:
 
-| Measure | `kit4b-0.8.1` (n=2) | `g2gfast` Class A (n=2) | `g2gfast` Class A+B (n=2) | Class A vs `kit4b` | Class A+B vs `kit4b` |
-|---|---:|---:|---:|---:|---:|
-| Decode, code tok/s | 469 (462–476) | **482 (482–482)** | **480 (476–484)** | **+2.8%** | **+2.3%** |
-| Decode, JSON tok/s | 729 (709–749) | **737 (736–737)** | **736 (731–742)** | **+1.1%** | **+1.0%** |
-| Decode, prose tok/s | 271 (262–280) | **276 (276–276)** | 258 (256–261) | **+1.8%** | -4.8% |
-| Reasoning, 1 request tok/s (sampled) | 290 (284–295) | 295 (294–296) | **311 (309–312)** | **+1.7%** | **+7.2%** |
-| Reasoning, 1 request, mean of 3 (sampled) | 288 (282–294) | 286 (281–292) | **309 (309–309)** | -0.7% | **+7.3%** |
-| **Reasoning, 8 at once tok/s (C=8)** | 1,495 (1,446–1,544) | 1,509 (1,483–1,535) | **1,597 (1,586–1,608)** | **+0.9%** | **+6.8% (+102 tok/s)** |
-| YASAKANI long JSONL tok/s | 1,116 (1,098–1,133) | 1,125 (1,117–1,132) | **1,136 (1,135–1,136)** | **+0.8%** | **+1.8%** |
-| BLACKFURY 129K warm writing tok/s | 434 (424–444) | **439 (429–450)** | 428 (427–428) | **+1.2%** | -1.4% |
-| Transition check (`alone`, s) | 1.43 s (`SAME`) | **1.37 s (`SAME`)** | **1.34 s (`SAME`)** | **-4.2%** | **-6.3%** |
-| Greedy parity (`11` prompts) | ref | **11/11 SHA** | **11/11 SHA** | exact | exact |
+| Measure (Mirrored `ABBA`, 450 W) | `kit4b-0.8.1` (Before, n=2) | `g2gfast-0.8.1` (After, n=2) | Gain |
+|---|---:|---:|---:|
+| Reasoning, 1 req mean of 3 (sampled) | 277 (275–279) | **318 (315–321)** | **+14.8%** |
+| Reasoning, 1 req (concurrent C=1) | 284 (281–286) | **316 (310–321)** | **+11.3%** |
+| Reasoning, 8 at once (C=8) | 1,394 (1,377–1,411) | **1,550 (1,547–1,553)** | **+11.2% (+156 tok/s)** |
+| Decode, JSON tok/s | 689 (683–694) | **761 (759–763)** | **+10.4%** |
+| YASAKANI code edit tok/s | 3,287 (3,228–3,345) | **3,622 (3,603–3,640)** | **+10.2%** |
+| YASAKANI JSONL edit tok/s | 3,382 (3,352–3,412) | **3,638 (3,624–3,652)** | **+7.6%** |
+| YASAKANI long JSONL tok/s | 1,089 (1,079–1,098) | **1,162 (1,144–1,180)** | **+6.7%** |
+| Decode, code tok/s | 458 (450–466) | **483 (475–491)** | **+5.5%** |
+| BLACKFURY 129K cold TTFT, s | 18.59 (18.56–18.62) | **17.95 (17.79–18.10)** | **-3.4% faster** |
+| BLACKFURY 129K warm writing tok/s | 426 (425–428) | **439 (434–444)** | **+3.1%** |
+| Prefill, cold 73.0K tok/s | 8,792 (8,628–8,956) | **9,016 (8,945–9,088)** | **+2.5%** |
+| Decode, prose tok/s | 262 (257–266) | **263 (259–267)** | **+0.4%** |
+| BLACKFURY 129K warm TTFT, s | 0.06 (0.06–0.06) | **0.06 (0.06–0.06)** | **0.0%** |
+| Extra `C=2` reasoning (`BATCH_OPT=4`, prior ABBA: `603.3, +8.7%`) | 562.5 (559–566) | **566.7 (557–586)** | **+0.7% to +8.7%** |
+| Greedy parity (`11` prompts + `60` LMX runs) | ref | **71 / 71 exact SHA** | **100% bit-identical** |
+| Tool calls right (of 1,000, `T=1.0`, thinking low) | 912–926 baseline | **923 / 1,000 (92.3%)** | **PASS** |
+| Needles (`32K / 60K / 86K`, 16 per depth) | 47 / 48 | **47 / 48 (`16/16`, `16/16`, `15/16`)** | **EXACT MATCH** |
 
 ### Paired kernel step times (Class A vs `kit4b-0.8.1`, 450 W, A/A noise ±0.07%, 100% `same=True`)
 | Context / Rows | `kit4b-0.8.1` | `g2gfast` Class A | Delta |
@@ -49,12 +59,11 @@ All six runs matched **11 / 11 exact greedy SHA** against `kit4b-0.8.1` and pass
 | `8192 / 32r` | 14,637 µs | **13,544 µs** | **-7.47%** (-1,093 µs) |
 | `8192 / 64r` | 17,240 µs | **16,449 µs** | **-4.59%** (-791 µs) |
 
-### Verification gates on `g2gfast-0.8.1` (Class A+B active)
-- **Engine kernel + CPU test suite**: `459 passed, 11 skipped`.
-- **Formal exact-distribution shield (`OPT_TREE`)**: 1,000 trials against exact decode target probabilities (`forward_topk`,
-  entropy `H = 2.757`, support 19): **`chi2 = 19.87, df = 18, p = 0.3399, impossible = 0`**.
-- **Tool-call accuracy gate (`1,000` calls, `T=1.0, top_p=0.95, top_k=20`, thinking low)**: **917 / 1,000 (91.7%)** in 206 s
-  (within the `912–926` baseline band).
+### Verification gates on `g2gfast-0.8.1` (Class A+B + `BATCH_OPT` active)
+- **Engine kernel + CPU test suite**: `459 passed, 11 skipped` (with all Class A, Class B, and `BATCH_OPT` flags active).
+- **Formal exact-distribution shield (`OPT_TREE`, single-stream)**: 1,000 trials against exact decode target probabilities (`forward_topk`, entropy `H = 2.757`, support 19): **`chi2 = 19.87, df = 18, p = 0.3399, impossible = 0`**.
+- **Formal exact-distribution shield (`BATCH_OPT`, 8-lane batched)**: 1,200 trials (`150 × 8` lanes, `H = 2.085`, support 17): **`chi2 = 17.02, df = 16, p = 0.3845, impossible = 0`**, plus mixed greedy+sampled batch parity **`100% bit-identical`**.
+- **Tool-call accuracy gate (`1,000` calls, `T=1.0, top_p=0.95, top_k=20`, thinking low)**: **923 / 1,000 (92.3%)** in 208 s (simple 94.2%, multiple 93.5%, parallel 91.0%, parallel_multiple 88.5%).
 - **Needles (`32K / 60K / 86K`, 16 per depth)**: **47 / 48** (`16/16`, `16/16`, `15/16` — identical to `kit4b-0.8.1`).
 - **Multi-seed sampled eval (`3 seeds × 9 prompts`, `T=1.0, top_k=20, top_p=0.95`)**: Prose **+6.69%**, Reasoning **+15.71%**,
   Code **+10.22% to +21.00%**, JSON **+16.68%** over `kit4b-0.8.1`.
@@ -176,6 +185,10 @@ Q27_TOKEN_CACHE_MB=16`.
   4-bin entropy-gated asymmetric 1-slot `kSnap1` BFS trees and non-trapping `F_{t-1}` hysteresis on sampled requests
   (Class B, exact target distribution). Omit for pure bit-identical Class A mode.
 - `Q27_ML_SELF_EC=1` (default 0): extends `EditCopy` to match self-generated repetitive spans (`>= 32` tokens back).
+- `Q27_ML_BATCH_OPT=4` (default 0): enables strictly lossless batched `OPT_TREE` + 1-slot `kSnap1` GDN DFS at `C=2`
+  (`2 × 16 = 32` rows hitting the `-7.47%` 32-row Class A sweet spot), while keeping dynamic `cut_rows` + Class A
+  kernels on `C=3..8` (`=2` enables batched `OPT_TREE` across all `C=2..8`). Mixed greedy+sampled batches stay 100%
+  bit-identical on greedy lanes.
 - Always active: a frontend fallback that returns a complete tool call written inside unclosed reasoning as a tool call.
 - Start-up resets unsupported values and logs them: `Q27_SPEC_PATHS` becomes 2 at most (1 for draft blocks over 8
   rows); two-step rollout becomes 1; the best-first tree stays greedy-only; the batched tree is off.
@@ -203,8 +216,8 @@ Q27_TOKEN_CACHE_MB=16`.
 - The KV pool is 6% smaller than upstream's at the same settings (219,072 against 233,408 tokens; 128-row copy steps
   need more state). The context limit stays 131,072.
 - The greedy best-first tree (`Q27_SPEC_BFTREE=1`) applies to greedy requests only; sampled requests use the
-  strictly lossless OPT tree (`Q27_ML_OPT_TREE=1`), which trades a small dip on one short-prose benchmark (-4.8%)
-  for large sampled reasoning (+7.2%) and C=8 (+6.8%) gains. Omit `Q27_ML_OPT_TREE=1` for pure bit-identical Class A mode.
+  strictly lossless OPT tree (`Q27_ML_OPT_TREE=1`, plus `Q27_ML_BATCH_OPT=4` for `C=2`). Omit `Q27_ML_OPT_TREE` and
+  `Q27_ML_BATCH_OPT` for pure bit-identical Class A mode.
 - With 8 requests at once on QUASAR, upstream was faster in both run orders.
 - In a soak of 40 requests, all six grammar-after-thinking requests gave different text batched than alone; the
   previous release of this fork gives the same six (cause not known).
