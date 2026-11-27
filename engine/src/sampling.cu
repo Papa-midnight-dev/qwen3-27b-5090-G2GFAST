@@ -300,7 +300,7 @@ __device__ __forceinline__ void spec_accept_body(int32_t* ids, int32_t* block_id
                                                  int k, int ld, const DraftChoice& ch, const SpecSampling& smp,
                                                  const uint64_t* rng, int32_t* ncommit, int32_t* cpath, SpecOut* out,
                                                  int32_t* hist, const int32_t* pos, const int32_t* par,
-                                                 const int32_t* budget, int* acc, float* p) {
+                                                 const int32_t* budget, int* acc, float* p, float* det_p) {
   if (par) out += *par;  // the step's slot (the host may read the previous step's while this one runs)
   const SpecTree* tr = ch.tree;
   int a = 0, n = 0, bonus = 0;  // (local patch: kTreeMax, a copy step's chain of up to 32 rows)
@@ -332,39 +332,124 @@ __device__ __forceinline__ void spec_accept_body(int32_t* ids, int32_t* block_id
       mass = 1.f;
       const int d = tr->depth[n];
       int next = -1;
-      for (int j = 0; j < tr->ndraws[n] && next < 0; j++) {
-        const int c = tr->draws[n][j], x = tr->tok[c];
-        // (research patch, 25 Nov 2026: cidx < 0 marks a point-mass draw, a copy step's host-drafted token: q(x) = 1,
-        // so x is accepted with probability p(x) and a rejection leaves p without x; the output still follows p)
-        const bool point = tr->cidx[c] < 0;
-        const float qx = point ? 1.f : tr->q[n][tr->cidx[c]];
-        float px = 0.f;
-        for (int i = 0; i < m; i++)
-          if (id[i] == x) px = p[i] / mass;
-        // (a point draw: index 32 + n, so a copy chain of up to 64 rows stays below the residual draws at 160 + n)
-        if (rng_uniform(rng, point ? kRngAccept + n : kRngAccept + 4 * n + j) * qx < px) {
-          next = c;
+      const int ndet = tr->n_det[n];
+      if (ndet > 0) {
+        // (moonshot-limits ALG-1a) Hu et al. (ICLR 2025) OPTIMAL Top-(m-1)+Residual (c = 1.0): strictly lossless!
+        // draws[n][0..ndet-1]: distinct deterministic children H_u.
+        // If ndraws[n] > ndet: draws[n][ndet] is 1 stochastic child drawn from q_tilde = tr->q[n] (0 on H_u, sum=1 on V\H_u).
+        const bool has_stoch = tr->ndraws[n] > ndet;
+        if (has_stoch) {
+          const int cs = tr->draws[n][ndet], xs = tr->tok[cs];
+          const float qx = tr->q[n][tr->cidx[cs]];
+          float px = 0.f;
+          for (int i = 0; i < m; i++)
+            if (id[i] == xs) px = p[i];
+          if (qx > 0.f && rng_uniform(rng, kRngAccept + 4 * n) * qx < px) next = cs;
+        }
+        if (next < 0) {
+          float p_det = 0.f;
+          for (int j = 0; j < ndet; j++) {
+            const int xt = tr->tok[tr->draws[n][j]];
+            float pj = 0.f;
+            for (int i = 0; i < m; i++)
+              if (id[i] == xt) pj = p[i];
+            det_p[j] = pj;
+            p_det += pj;
+          }
+          float S = 0.f;
+          for (int i = 0; i < m; i++) {
+            bool in_det = false;
+            for (int j = 0; j < ndet; j++)
+              if (tr->tok[tr->draws[n][j]] == id[i]) {
+                in_det = true;
+                break;
+              }
+            if (in_det) {
+              p[i] = 0.f;
+            } else if (has_stoch) {
+              float qi = 0.f;
+              for (int cc = 0; cc < kSpecSelK; cc++)
+                if (ch.cand[d * kSpecSelK + cc] == id[i]) qi = tr->q[n][cc];
+              p[i] = fmaxf(p[i] - qi, 0.f);
+              S += p[i];
+            } else {
+              S += p[i];
+            }
+          }
+          const float M = p_det + S;
+          if (M > 1e-12f) {
+            const float u = rng_uniform(rng, kRngResidual + n) * M;
+            if (u < p_det) {
+              float cum = 0.f;
+              next = tr->draws[n][ndet - 1];
+              for (int j = 0; j < ndet; j++) {
+                cum += det_p[j];
+                if (u < cum) {
+                  next = tr->draws[n][j];
+                  break;
+                }
+              }
+            } else {
+              if (S > 1e-12f) {
+                const float u2 = fminf(u - p_det, S);
+                float cum = 0.f;
+                bonus = id[m - 1];
+                for (int i = 0; i < m; i++) {
+                  if (p[i] > 0.f) {
+                    bonus = id[i];
+                    cum += p[i];
+                    if (u2 < cum) break;
+                  }
+                }
+              } else {
+                float tmp_mass;
+                target_dist(v, k, smp.temperature, smp.top_p, smp.min_p, p, tmp_mass);
+                bonus = pick(p, m, tmp_mass, rng_uniform(rng, kRngResidual + n), id);
+              }
+              break;
+            }
+          } else {
+            float tmp_mass;
+            target_dist(v, k, smp.temperature, smp.top_p, smp.min_p, p, tmp_mass);
+            bonus = pick(p, m, tmp_mass, rng_uniform(rng, kRngResidual + n), id);
+            break;
+          }
+        }
+      } else {
+        for (int j = 0; j < tr->ndraws[n] && next < 0; j++) {
+          const int c = tr->draws[n][j], x = tr->tok[c];
+          // (research patch, 25 Nov 2026: cidx < 0 marks a point-mass draw, a copy step's host-drafted token: q(x) = 1,
+          // so x is accepted with probability p(x) and a rejection leaves p without x; the output still follows p)
+          const bool point = tr->cidx[c] < 0;
+          const float qx = point ? 1.f : tr->q[n][tr->cidx[c]];
+          float px = 0.f;
+          for (int i = 0; i < m; i++)
+            if (id[i] == x) px = p[i] / mass;
+          // (a point draw: index 32 + n, so a copy chain of up to 64 rows stays below the residual draws at 160 + n)
+          if (rng_uniform(rng, point ? kRngAccept + n : kRngAccept + 4 * n + j) * qx < px) {
+            next = c;
+            break;
+          }
+          float tot = 0.f;  // rejected: the residual max(p - q, 0)
+          for (int i = 0; i < m; i++) {
+            float qi = 0.f;
+            if (point)
+              qi = id[i] == x ? 1.f : 0.f;
+            else
+              for (int cc = 0; cc < kSpecSelK; cc++)
+                if (ch.cand[d * kSpecSelK + cc] == id[i]) qi = tr->q[n][cc];
+            p[i] = fmaxf(p[i] / mass - qi, 0.f);
+            tot += p[i];
+          }
+          if (!(tot > 0.f)) {  // numerically empty residual: fall back to p
+            target_dist(v, k, smp.temperature, smp.top_p, smp.min_p, p, tot);
+          }
+          mass = tot;
+        }
+        if (next < 0) {
+          bonus = pick(p, m, mass, rng_uniform(rng, kRngResidual + n), id);
           break;
         }
-        float tot = 0.f;  // rejected: the residual max(p - q, 0)
-        for (int i = 0; i < m; i++) {
-          float qi = 0.f;
-          if (point)
-            qi = id[i] == x ? 1.f : 0.f;
-          else
-            for (int cc = 0; cc < kSpecSelK; cc++)
-              if (ch.cand[d * kSpecSelK + cc] == id[i]) qi = tr->q[n][cc];
-          p[i] = fmaxf(p[i] / mass - qi, 0.f);
-          tot += p[i];
-        }
-        if (!(tot > 0.f)) {  // numerically empty residual: fall back to p
-          target_dist(v, k, smp.temperature, smp.top_p, smp.min_p, p, tot);
-        }
-        mass = tot;
-      }
-      if (next < 0) {
-        bonus = pick(p, m, mass, rng_uniform(rng, kRngResidual + n), id);
-        break;
       }
       if (stop(tr->tok[next]) || a + 2 > limit) {
         bonus = tr->tok[next];
@@ -395,10 +480,12 @@ __global__ void spec_accept_kernel(int32_t* ids, int32_t* block_ids, const float
                                    const int32_t* par, const int32_t* budget) {
   __shared__ int s_acc[kTreeMax];
   __shared__ float s_p[kMaxK];
+  __shared__ float s_det_p[kTreeDraws];
   pdl_trigger();
   pdl_wait();
   if (threadIdx.x != 0) return;
-  spec_accept_body(ids, block_ids, tv, ti, k, ld, ch, smp, rng, ncommit, cpath, out, hist, pos, par, budget, s_acc, s_p);
+  spec_accept_body(ids, block_ids, tv, ti, k, ld, ch, smp, rng, ncommit, cpath, out, hist, pos, par, budget, s_acc, s_p,
+                   s_det_p);
 }
 
 // Batched steps (P6-10): block z accepts lane z (its rows al.lr.first(z) .., top-k lists of ld entries, of which
@@ -410,6 +497,7 @@ __global__ void spec_accept_lanes_kernel(int32_t* ids, int32_t* anchor, const fl
                                          const int32_t* pos, const int32_t* par, const int32_t* budget) {
   __shared__ int s_acc[kTreeMax];
   __shared__ float s_p[kMaxK];
+  __shared__ float s_det_p[kTreeDraws];
   pdl_trigger();
   pdl_wait();
   if (threadIdx.x != 0) return;
@@ -420,7 +508,7 @@ __global__ void spec_accept_lanes_kernel(int32_t* ids, int32_t* anchor, const fl
   ch.src = const_cast<int32_t*>(src) + z;
   spec_accept_body(ids + r0, anchor + z, tv + r0 * ld, ti + r0 * ld, lane_sel(al.k, z), ld, ch, lane_sel(al.smp, z),
                    rng + 2 * z, ncommit + z, cpath + kLaneSlot * z, out + 2 * z, nullptr, pos + z, par + z,
-                   budget + z, s_acc, s_p);
+                   budget + z, s_acc, s_p, s_det_p);
 }
 
 __global__ void spec_advance_lanes_kernel(LaneRows lr_in, int32_t* pos, const int32_t* ncommit, int32_t* par,

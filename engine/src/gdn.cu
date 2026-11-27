@@ -1367,8 +1367,8 @@ struct RecIn {  // a token's inputs: k / q rows [2048] (16 key heads), v rows [6
 // of the previous step only), every CTA replays the previous verify's committed rows onto the
 // committed state in registers and writes it to the other state buffer (other CTAs may still be
 // reading `state`).
-template <bool kVerify, bool kTree, bool kBatch = false, bool kWide = false, bool kL2Cs = false>
-__global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T, const bf16* A_log,
+template <bool kVerify, bool kTree, bool kBatch = false, bool kWide = false, bool kL2Cs = false, bool kSnap1 = false>
+__global__ void __launch_bounds__(kRecWarps * 32, kSnap1 ? 2 : 1) gdn_rec_kernel(RecIn in, int T, const bf16* A_log,
                                                                  const bf16* dt_bias, float* state, const float* z,
                                                                  int ldz, const bf16* norm_w, float eps, float* out,
                                                                  uint8_t* q8, float in_scale, GdnSpec sp,
@@ -1513,6 +1513,24 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
         if (j == 4) so[b0 + t][lcol] = o;
       }
       __syncthreads();  // (the staging buffers are refilled by the next tile)
+    }
+  } else if constexpr (kTree && kSnap1) {
+    // (moonshot-limits) 1-snapshot DFS fast path for Ent-Sequoia OPT trees (<= 1 live slot -> REG<=128 -> 2 CTAs/SM!)
+    const SpecTree* tree = sp.tree + ln;
+    float snap0[kRecRows];
+    const int dn = tree->dfs_n;
+    for (int s = 0; s < dn; s++) {
+      if (tree->dfs_pop[s] == 0) {
+#pragma unroll
+        for (int i = 0; i < kRecRows; i++) S[i] = snap0[i];
+      }
+      const int t = tree->dfs_order[s];
+      const float o = gdn_step(S, sk[t], sq[t], sv[t][lcol], s_decay[t], s_beta[t]);
+      if (j == 4) so[t][lcol] = o;
+      if (tree->dfs_push[s] == 0) {
+#pragma unroll
+        for (int i = 0; i < kRecRows; i++) snap0[i] = S[i];
+      }
     }
   } else if constexpr (kTree) {
     const SpecTree* tree = sp.tree + ln;
@@ -2203,7 +2221,11 @@ void gdn_verify(const float* q, int T, const bf16* A_log, const bf16* dt_bias, f
                            dim3(kRecWarps * 32), 0, s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias,
                            state, z, ldz, norm_w, eps, out, q8, in_scale, sp, q4, sf4);
     } else if (sp.paths > 1) {
-      if (T <= kSpecBlock)
+      if (T <= kSpecBlock && sp.paths == 3)
+        launch_pdl_cluster(gdn_rec_kernel<true, true, false, false, kCs, true>, dim3(kVHeads * kRecSplit),
+                           dim3(kRecWarps * 32), 0, s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias,
+                           state, z, ldz, norm_w, eps, out, q8, in_scale, sp, q4, sf4);
+      else if (T <= kSpecBlock)
         launch_pdl_cluster(gdn_rec_kernel<true, true, false, false, kCs>, dim3(kVHeads * kRecSplit),
                            dim3(kRecWarps * 32), 0, s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias,
                            state, z, ldz, norm_w, eps, out, q8, in_scale, sp, q4, sf4);

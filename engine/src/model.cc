@@ -454,6 +454,7 @@ void Model::configure() {
   // layout the trees' random numbers and rows use. 1: chains only (0.8.1 as shipped).
   adapt_paths_ = std::clamp(env_int("Q27_SPEC_ADAPT_PATHS", 1), 1, kTreePaths);
   bftree_on_ = draft_ && draft_->dspine() ? std::clamp(env_int("Q27_SPEC_BFTREE", 0), 0, 2) : 0;
+  opt_tree_on_ = draft_ && draft_->dspine() ? std::clamp(env_int("Q27_ML_OPT_TREE", 0), 0, 3) : 0;
   bftree_nodes_ = env_int("Q27_BFTREE_NODES", 0);
   if (bftree_nodes_ > 0 && draft_) bftree_nodes_ = std::clamp(bftree_nodes_, 2, draft_->block());
   bftree_temp_ = env_f("Q27_BFTREE_TEMP", 1.2f);
@@ -484,6 +485,7 @@ void Model::configure() {
   // accepted token by token with the target's probability (spec_accept_body). 0: greedy only (as before).
   copy_sampled_ = env_int("Q27_COPY_SAMPLED", 0) != 0;
   ec_on_ = copy_on_ && env_int("Q27_EDIT_COPY", 0) != 0;  // (research patch: edit copy, YASAKANI's)
+  self_ec_ = ec_on_ && env_int("Q27_ML_SELF_EC", 0) != 0;
   adapt_up_ = env_f("Q27_SPEC_ADAPT_UP", 4.5f);
   adapt_down_ = env_f("Q27_SPEC_ADAPT_DOWN", 4.0f);
   adapt_alpha_ = std::clamp(env_f("Q27_SPEC_ADAPT_ALPHA", 0.125f), 0.f, 1.f);
@@ -1869,6 +1871,8 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
                            : 0;
   spec_smp_.bftree = 0, spec_smp_.bftree_nodes = 0, spec_smp_.bftree_temp = bftree_temp_;
   spec_smp_.bftree_walks = spec_smp_.bftree_walks_next = spec_smp_.bftree_walks_due = w0;
+  const int ot0 = (opt_tree_on_ >= 2 && spec_smp_.temperature > 0.f) ? opt_tree_on_ : 0;
+  spec_smp_.opt_tree = 0, spec_smp_.opt_tree_next = spec_smp_.opt_tree_due = ot0;
   spec_smp_.accept_ema = 0.5f * (adapt_up_ + adapt_down_);
   spec_smp_.lane_rows = std::min(ddims::kBlock, draft_->block()), spec_smp_.lane_ema = 4.25f, spec_smp_.lane_seen = 0;
   return first;
@@ -1918,7 +1922,7 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
     }
     if (part == 1) return;
   }
-  verify_paths_ = is_tree ? std::max(2, smp.paths) : 1;
+  verify_paths_ = (smp.opt_tree > 0) ? 3 : (is_tree ? std::max(2, smp.paths) : 1);
   verify_ = true;
   copy_verify_ = smp.copy > 0 || smp.rollout > 1;  // (wide_chain: attention_decode tiled FP8-MMA + kWide GDN)
   cap_ = cap_buf_;
@@ -1981,6 +1985,7 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
     spec_smp_.block = spec_smp_.block_due;
     spec_smp_.rollout = 1;
     spec_smp_.bftree = 0, spec_smp_.bftree_nodes = 0, spec_smp_.bftree_temp = bftree_temp_;
+    spec_smp_.opt_tree = 0;
     spec_smp_.bftree_walks =
         (bftree_on_ > 0 && (spec_smp_.temperature <= 0.f || bftree_on_ >= 2)) ? spec_smp_.bftree_walks_due : 0;
     // (local patch: trees at the low width; the paths follow from block_due and fixed request settings only, so a
@@ -1997,7 +2002,11 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
       if (copy_last_) spec_smp_.paths = 1;
     }
     if (spec_smp_.copy == 0 && !spec_smp_.masked && !spec_smp_.pinned && spec_smp_.logprobs < 0) {
-      if (rollout_on_ > 1 && spec_smp_.temperature <= 0.f && spec_smp_.rollout_due > 1 &&
+      if (opt_tree_on_ > 0 && spec_smp_.temperature > 0.f && spec_smp_.opt_tree_due > 0) {
+        spec_smp_.opt_tree = spec_smp_.opt_tree_due;
+        spec_smp_.paths = 1;
+        if (opt_tree_on_ == 2) spec_smp_.block = draft_->block();
+      } else if (rollout_on_ > 1 && spec_smp_.temperature <= 0.f && spec_smp_.rollout_due > 1 &&
           pos_ + 2 * (1 + (spec_block_of(spec_smp_) - 1) * 2) <= max_pages_ * kPageTokens &&
           step_capacity_ >= 1 + (spec_block_of(spec_smp_) - 1) * 2) {
         spec_smp_.rollout = 2;
@@ -2073,6 +2082,7 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   const bool ahead = allow_ahead && !smp.masked && spec_pipeline_ && graphs_ && spec_graph_ && spec_warm_ &&
                      same(smp, spec_key_) && !trace && smp.block_next == smp.block &&
                      smp.rollout_next == smp.rollout && smp.bftree_walks_next == smp.bftree_walks &&
+                     smp.opt_tree_next == smp.opt_tree &&
                      !prof_.on && !dbg_accept && smp.copy == 0 && !(copy_on_ && copy_hint_ && copy_eligible(smp)) &&
                      pos_ + 2 * std::max(kSpecBlock, W_step) <= max_pages_ * kPageTokens;  // (worst-case position)
   if (ahead) {
@@ -2243,12 +2253,14 @@ void Model::copy_follow(const int32_t* out, int n) {
     ~Hint() {
       m->copy_hint_ = false;
       if (m->ec_on_ && m->copy_eligible(m->spec_smp_)) {  // (edit copy: feedback, then align on the committed tokens)
-        if (!m->ec_) m->ec_ = std::make_unique<q27_editcopy::EditCopy>(int(std::max<int64_t>(0, L - m->ec_n_ - 1)));
+        if (!m->ec_)
+          m->ec_ = std::make_unique<q27_editcopy::EditCopy>(int(std::max<int64_t>(0, L - m->ec_n_ - 1)), m->self_ec_);
         auto& ec = *m->ec_;
         if (m->copy_last_ && m->ec_first_edit_ >= 0) {
           if (m->ec_n_ - 1 > m->ec_first_edit_) ec.hit(); else ec.missed();
         }
-        const int64_t raw = m->copy_src_ >= 0 && m->copy_src_ < ec.input_end() ? m->copy_src_ : -1;
+        const int64_t raw_lim = m->self_ec_ ? std::max<int64_t>(ec.input_end(), L - 32) : int64_t(ec.input_end());
+        const int64_t raw = m->copy_src_ >= 0 && m->copy_src_ < raw_lim ? m->copy_src_ : -1;
         m->seq_ids_.push_back(m->spec_last_);
         ec.advance(m->seq_ids_, int(L), int(raw));
         m->seq_ids_.pop_back();
@@ -2297,12 +2309,25 @@ void Model::spec_adapt(SpecSampling& smp, int n) const {
   smp.block_due = smp.block_next;
   smp.rollout_due = smp.rollout_next;
   smp.bftree_walks_due = smp.bftree_walks_next;
+  smp.opt_tree_due = smp.opt_tree_next;
   smp.accept_ema += adapt_alpha_ * (float(n) - smp.accept_ema);
   const int full = draft_->block();
   if (smp.block_next == full && smp.accept_ema < adapt_down_)
     smp.block_next = adapt_low_;
   else if (smp.block_next != full && smp.accept_ema >= adapt_up_)
     smp.block_next = full;
+  if (opt_tree_on_ == 1 && smp.temperature > 0.f) {
+    // Strictly F_{t-1}-measurable hysteresis: start in pure chain so high-accept code/JSON (ema >= 4.0)
+    // pays 0 tree overhead and zero depth-cap tax; enable Ent-Sequoia OPT when ema < 4.0, bypass at >= 4.6.
+    if (smp.opt_tree_next > 0 && smp.accept_ema >= 4.6f)
+      smp.opt_tree_next = 0;
+    else if (smp.opt_tree_next == 0 && smp.accept_ema < 4.0f)
+      smp.opt_tree_next = 1;
+  } else if (opt_tree_on_ > 0 && smp.temperature > 0.f) {
+    smp.opt_tree_due = smp.opt_tree_next = opt_tree_on_;
+  } else {
+    smp.opt_tree_due = smp.opt_tree_next = 0;
+  }
   if (bftree_on_ > 0 && smp.temperature <= 0.f) {
     // Greedy adaptive BF-Tree bypass: super-high-accept repetitive streams (e.g. long JSONL, ema >= 8.5)
     // switch cleanly to full 16-row chain (zero tree depth cap); all other greedy streams keep BF-Tree.

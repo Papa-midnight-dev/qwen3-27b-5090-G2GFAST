@@ -32,6 +32,7 @@ struct SpecTree {
   int8_t leaf[kTreePaths];                // last node of each path
   int8_t cidx[kTreeMax];                  // index of tok[i] among the candidates at its depth (root: 0)
   int8_t ndraws[kTreeMax];                // draws made from the node (one per walk through it)
+  int8_t n_det[kTreeMax];                 // (moonshot-limits ALG-1a) leading deterministic children in draws[u][0..n_det[u])
   int8_t draws[kTreeMax][kTreeDraws];     // their child nodes, in draw order (duplicates repeat)
   float q[kTreeMax][kSpecSelK];           // the distribution the node's draws came from
   // Heavy-child-last DFS schedule for arbitrary trees (n <= 16 uses <= 3 live GDN state snapshots).
@@ -79,6 +80,8 @@ struct SpecSampling {
   int bftree_nodes = 0;
   float bftree_temp = 1.f;
   int bftree_walks = 0, bftree_walks_next = 0, bftree_walks_due = 0;
+  int opt_tree = 0;  // (moonshot-limits ALG-1a+ALG-2) 1=Ent-Sequoia Top-(m-1)+Res OPT, 2=force B=16, 3=chain-in-tree timing
+  int opt_tree_next = 0, opt_tree_due = 0;
   int rollout = 1, rollout_next = 1, rollout_due = 1;
   // Batched steps (Model::batch_prepare): the lane's rows (4 / 8 / 12 / 16, DSpine) and the moving average of its tokens
   // per batched step at those rows. Past batched steps decide them, as the single width above.
@@ -94,7 +97,8 @@ struct SpecSampling {
            min_p == o.min_p && pen.presence == o.pen.presence && pen.frequency == o.pen.frequency &&
            logprobs == o.logprobs && masked == o.masked && stop[2] == o.stop[2] && biased == o.biased &&
            ignore_eos == o.ignore_eos && block == o.block && copy == o.copy && bftree == o.bftree &&
-           bftree_nodes == o.bftree_nodes && bftree_walks == o.bftree_walks && rollout == o.rollout;
+           bftree_nodes == o.bftree_nodes && bftree_walks == o.bftree_walks && opt_tree == o.opt_tree &&
+           rollout == o.rollout;
   }
 };
 

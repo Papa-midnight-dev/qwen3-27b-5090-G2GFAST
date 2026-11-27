@@ -246,12 +246,14 @@ class Model {
   void set_sbuf(int b);  // host side of the GDN state buffer switch
   int spec_block_of(const SpecSampling& smp) const { return smp.block > 0 ? smp.block : draft_->block(); }
   bool bftree_of(const SpecSampling& smp) const {
-    return smp.copy == 0 && smp.rollout <= 1 && smp.bftree > 0 && (smp.temperature <= 0.f || smp.bftree >= 2);
+    return smp.copy == 0 && smp.rollout <= 1 &&
+           ((smp.bftree > 0 && (smp.temperature <= 0.f || smp.bftree >= 2)) ||
+            (smp.opt_tree > 0 && smp.temperature > 0.f));
   }
   int spec_rows(const SpecSampling& smp) const {
     if (smp.copy > 0) return smp.copy;
     if (smp.rollout > 1) return 1 + (spec_block_of(smp) - 1) * smp.rollout;
-    if (bftree_of(smp)) return smp.bftree_nodes > 0 ? smp.bftree_nodes : spec_block_of(smp);
+    if (bftree_of(smp)) return (smp.opt_tree == 0 && smp.bftree_nodes > 0) ? smp.bftree_nodes : spec_block_of(smp);
     return 1 + (spec_block_of(smp) - 1) * std::max(1, smp.paths);
   }
   GdnSpec gdn_spec(int gdn_layer) const;
@@ -630,6 +632,7 @@ class Model {
   int adapt_low_ = 8;
   int adapt_paths_ = 1;     // Q27_SPEC_ADAPT_PATHS (local patch): tree walks at the low width, sampled only
   int bftree_on_ = 0;       // Q27_SPEC_BFTREE: 0=off, 1=greedy best-first tree, 2=greedy+sampled budget-capped tree
+  int opt_tree_on_ = 0;     // (moonshot-limits) Q27_ML_OPT_TREE: 1=Ent-Sequoia OPT, 2=force B=16, 3=chain-in-tree timing
   int bftree_nodes_ = 0;    // Q27_BFTREE_NODES: tree node budget (0: use spec_block_of(smp), else 2..16)
   float bftree_temp_ = 1.f; // Q27_BFTREE_TEMP: softmax temperature for greedy best-first tree ranking
   int bftree_walks_ = 0;    // Q27_BFTREE_WALKS: sampled tree walks (0=adaptive lo/hi by accept_ema, 1..4=fixed)
@@ -667,6 +670,7 @@ class Model {
   }
   // Edit copy (research patch, Q27_EDIT_COPY, port of YASAKANI's): learned replacements applied to the copied input.
   bool ec_on_ = false;
+  bool self_ec_ = false;  // (moonshot-limits S3.1) Q27_ML_SELF_EC: allow output-to-output EditCopy alignment
   std::unique_ptr<q27_editcopy::EditCopy> ec_;
   int ec_first_edit_ = -1;               // the chain row - 1 of the first edited token of the last copy step (-1: none)
   std::vector<int32_t> ec_out_;

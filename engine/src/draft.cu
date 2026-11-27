@@ -795,13 +795,16 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
   // the paths are the smp.paths best of a beam search (one path: the argmax walk).
   SpecTree* tr = choice.tree;
   const int K = max(1, min(smp.paths, kTreePaths));
-  const bool use_bftree = kPre && smp.bftree > 0 && (smp.temperature <= 0.f || smp.bftree >= 2);
-  const int bf_budget = kBatch ? nrows : min(kSpecBlock, max(2, smp.bftree_nodes > 0 ? smp.bftree_nodes : nd + 1));
-  if (use_bftree)
+  const bool use_opt_tree = kPre && !kBatch && smp.opt_tree > 0 && smp.temperature > 0.f;
+  const bool use_bftree = !use_opt_tree && kPre && smp.bftree > 0 && (smp.temperature <= 0.f || smp.bftree >= 2);
+  const int bf_budget =
+      kBatch ? nrows : min(kSpecBlock, max(2, (!use_opt_tree && smp.bftree_nodes > 0) ? smp.bftree_nodes : nd + 1));
+  if (use_opt_tree || use_bftree)
     nrows = bf_budget;
   else if (!kBatch && K == 1)
     nrows = nd + 1;
   __shared__ int8_t child[kTreeMax][kSelK];
+  __shared__ int8_t s_dfs_ch[kSpecBlock][kSpecBlock];
   __shared__ int n_nodes;
   if (lane == 0) {
     n_nodes = 1;
@@ -810,7 +813,7 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
     tr->path[0][0] = 0;
     tr->cidx[0] = 0;
     tr->dfs_n = 0;
-    for (int i = 0; i < nrows; i++) tr->ndraws[i] = 0, tr->owner[i] = -1;
+    for (int i = 0; i < nrows; i++) tr->ndraws[i] = 0, tr->n_det[i] = 0, tr->owner[i] = -1;
   }
   const int child_rows = nrows;
   for (int i = lane; i < child_rows * kSelK; i += 32) child[i / kSelK][i % kSelK] = -1;
@@ -865,20 +868,20 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
   };
   // Heavy-child-last DFS schedule for arbitrary trees (n <= 16 -> <= 3 live GDN snapshots); lane 0 only.
   auto build_dfs = [&](int n) {
-    int8_t ch[kSpecBlock][kSpecBlock], nch[kSpecBlock], sz[kSpecBlock];
+    int8_t nch[kSpecBlock], sz[kSpecBlock];
     for (int u = 0; u < n; u++) nch[u] = 0, sz[u] = 1;
     for (int v = 1; v < n; v++) {
       const int p = tr->path[v][tr->depth[v] - 1];
-      ch[p][nch[p]++] = int8_t(v);
+      s_dfs_ch[p][nch[p]++] = int8_t(v);
     }
     for (int u = n - 1; u >= 0; u--) {
-      for (int i = 0; i < nch[u]; i++) sz[u] = int8_t(sz[u] + sz[ch[u][i]]);
+      for (int i = 0; i < nch[u]; i++) sz[u] = int8_t(sz[u] + sz[s_dfs_ch[u][i]]);
       // Insertion sort children by descending subtree size (heaviest child first -> visited LAST).
       for (int i = 1; i < nch[u]; i++) {
-        int8_t key = ch[u][i];
+        int8_t key = s_dfs_ch[u][i];
         int j = i - 1;
-        while (j >= 0 && sz[ch[u][j]] < sz[key]) ch[u][j + 1] = ch[u][j], j--;
-        ch[u][j + 1] = key;
+        while (j >= 0 && sz[s_dfs_ch[u][j]] < sz[key]) s_dfs_ch[u][j + 1] = s_dfs_ch[u][j], j--;
+        s_dfs_ch[u][j + 1] = key;
       }
     }
     int8_t st_node[kSpecBlock], st_pop[kSpecBlock], st_free[kSpecBlock];
@@ -895,25 +898,157 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
         tr->dfs_push[out_n] = -1;
       } else if (nch[u] == 1) {
         tr->dfs_push[out_n] = -1;
-        st_node[sp] = ch[u][0], st_pop[sp] = -1, st_free[sp] = 0, sp++;
+        st_node[sp] = s_dfs_ch[u][0], st_pop[sp] = -1, st_free[sp] = 0, sp++;
       } else {
         int slot = 0;
         while ((live >> slot) & 1u) slot++;
         live |= (1u << slot);
         tr->dfs_push[out_n] = int8_t(slot);
         // Push heaviest first (visited LAST -> restores & frees slot).
-        st_node[sp] = ch[u][0], st_pop[sp] = int8_t(slot), st_free[sp] = 1, sp++;
+        st_node[sp] = s_dfs_ch[u][0], st_pop[sp] = int8_t(slot), st_free[sp] = 1, sp++;
         // Push remaining children (last pushed is visited FIRST -> continues directly from current S).
         for (int i = 1; i < nch[u]; i++) {
           const bool first_vis = (i == nch[u] - 1);
-          st_node[sp] = ch[u][i], st_pop[sp] = first_vis ? int8_t(-1) : int8_t(slot), st_free[sp] = 0, sp++;
+          st_node[sp] = s_dfs_ch[u][i], st_pop[sp] = first_vis ? int8_t(-1) : int8_t(slot), st_free[sp] = 0, sp++;
         }
       }
       out_n++;
     }
     tr->dfs_n = int8_t(out_n);
   };
-  if (use_bftree && smp.temperature <= 0.f) {
+  if (use_opt_tree) {
+    // (moonshot-limits ALG-1a + ALG-2) Strictly F_0-measurable 4-bin Entropy-Gated Sequoia Fixed-Budget Tree
+    // with Hu et al. (ICLR 2025) Top-(m-1)+Residual OPT (c=1.0). Exact D1-optimal BFS child counts:
+    __shared__ int8_t s_cnt_bfs[kSpecBlock];
+    {
+      // Step 0: Compute anchor root distribution q_0 and Shannon entropy H_0 BEFORE any stochastic draw!
+      int32_t ptok0[1] = {0};
+      const float sc0 = row(0, 0) - penalty(0, ptok0);
+      const float x0 = sc0 / smp.temperature;
+      float mx0 = x0;
+      for (int o = 16; o > 0; o >>= 1) mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, o));
+      const float ex0 = lane < kSelK ? expf(x0 - mx0) : 0.f;
+      float sum0 = ex0;
+      for (int o = 16; o > 0; o >>= 1) sum0 += __shfl_xor_sync(0xffffffffu, sum0, o);
+      const float p0 = ex0 / sum0;
+      float h0 = (lane < kSelK && p0 > 0.f) ? -p0 * logf(p0) : 0.f;
+      for (int o = 16; o > 0; o >>= 1) h0 += __shfl_xor_sync(0xffffffffu, h0, o);
+      if (lane == 0) {
+        static constexpr int8_t kB8[4][8] = {
+            {1, 1, 1, 1, 1, 1, 1, 0},  // H0 < 0.45: pure chain (depth 7)
+            {2, 1, 1, 1, 0, 1, 1, 0},  // 0.45 <= H0 < 1.0: 2-way asym (depths 5, 2; 1-slot kSnap1)
+            {2, 1, 1, 1, 1, 1, 0, 0},  // 1.0 <= H0 < 1.6: 2-way (depths 4, 3; 1-slot kSnap1)
+            {3, 1, 1, 1, 1, 0, 0, 0},  // H0 >= 1.6: 3-way (depths 3, 2, 2; 1-slot kSnap1)
+        };
+        static constexpr int8_t kB16[4][16] = {
+            {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0},  // H0 < 0.45: pure chain (depth 15)
+            {2, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 0},  // 0.45 <= H0 < 1.0: 2-way asym (depths 11, 4; 1-slot kSnap1)
+            {3, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0},  // 1.0 <= H0 < 1.6: 3-way asym (depths 8, 4, 3; 1-slot kSnap1)
+            {4, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1, 0, 1, 0},  // H0 >= 1.6: 4-way asym (depths 6, 4, 3, 2; 1-slot kSnap1)
+        };
+        const int bin = (smp.opt_tree == 3) ? 0 : (h0 < 0.45f ? 0 : (h0 < 1.0f ? 1 : (h0 < 1.6f ? 2 : 3)));
+        for (int i = 0; i < bf_budget; i++) {
+          if (bf_budget == 16)
+            s_cnt_bfs[i] = kB16[bin][i];
+          else if (bf_budget == 8)
+            s_cnt_bfs[i] = kB8[bin][i];
+          else
+            s_cnt_bfs[i] = (i + 1 < bf_budget) ? 1 : 0;
+        }
+      }
+    }
+    __syncwarp();
+    for (int u = 0; u < bf_budget; u++) {
+      const int cur_n = __shfl_sync(0xffffffffu, n_nodes, 0);
+      if (u >= cur_n) break;
+      const int m = s_cnt_bfs[u];
+      const int e = tr->depth[u];
+      if (m <= 0 || e >= nd) continue;
+      int32_t ptok[kMaxDraft];
+      if (pen)
+        for (int i = 0; i < e; i++) ptok[i] = tr->tok[tr->path[u][i + 1]];
+      const float sc = row(e, e == 0 ? 0 : tr->cidx[u]) - penalty(e, ptok);
+      const float x = sc / smp.temperature;
+      float mx = x;
+      for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+      const float ex = lane < kSelK ? expf(x - mx) : 0.f;
+      float sum = ex;
+      for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+      const float prob = ex / sum;
+      if (m == 1) {
+        if (lane < kSelK) tr->q[u][lane] = prob;
+        float cum = prob;
+        for (int o = 1; o < 32; o <<= 1) {
+          const float y = __shfl_up_sync(0xffffffffu, cum, o);
+          if (lane >= o) cum += y;
+        }
+        const float u_rng = rng_uniform(rng, 0x20000000u + u);
+        const unsigned below = __ballot_sync(0xffffffffu, lane < kSelK && u_rng >= cum);
+        const int idx = min(__popc(below), kSelK - 1);
+        if (lane == 0) {
+          const int c = node_of(u, idx, e, 0.f);
+          tr->draws[u][0] = int8_t(c);
+          tr->ndraws[u] = 1;
+          tr->n_det[u] = 0;
+        }
+      } else {
+        // Select top-(m-1) distinct candidates deterministically (ties: lower candidate index).
+        bool in_H = false;
+        for (int j = 0; j < m - 1; j++) {
+          float bp = (lane < kSelK && !in_H) ? prob : -1.f;
+          int bi = (lane < kSelK && !in_H) ? lane : kSelK;
+          for (int o = 16; o > 0; o >>= 1) {
+            const float op = __shfl_xor_sync(0xffffffffu, bp, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (op > bp || (op == bp && oi < bi)) bp = op, bi = oi;
+          }
+          if (lane == bi) in_H = true;
+          if (lane == 0) {
+            const int c = node_of(u, bi, e, 0.f);
+            tr->draws[u][tr->ndraws[u]++] = int8_t(c);
+          }
+        }
+        float rem = (lane < kSelK && !in_H) ? prob : 0.f;
+        for (int o = 16; o > 0; o >>= 1) rem += __shfl_xor_sync(0xffffffffu, rem, o);
+        if (rem <= 1e-6f) {
+          // Guard against 0/0 NaN: emit m-th child as pure deterministic (no stochastic residual).
+          float bp = (lane < kSelK && !in_H) ? prob : -1.f;
+          int bi = (lane < kSelK && !in_H) ? lane : kSelK;
+          for (int o = 16; o > 0; o >>= 1) {
+            const float op = __shfl_xor_sync(0xffffffffu, bp, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (op > bp || (op == bp && oi < bi)) bp = op, bi = oi;
+          }
+          if (lane < kSelK) tr->q[u][lane] = 0.f;
+          if (lane == 0) {
+            const int c = node_of(u, bi, e, 0.f);
+            tr->draws[u][tr->ndraws[u]++] = int8_t(c);
+            tr->n_det[u] = int8_t(m);
+          }
+        } else {
+          const float qt = (lane < kSelK && !in_H) ? (prob / rem) : 0.f;
+          if (lane < kSelK) tr->q[u][lane] = qt;
+          float cum = qt;
+          for (int o = 1; o < 32; o <<= 1) {
+            const float y = __shfl_up_sync(0xffffffffu, cum, o);
+            if (lane >= o) cum += y;
+          }
+          const float u_rng = rng_uniform(rng, 0x20000000u + u);
+          const unsigned pos_mask = __ballot_sync(0xffffffffu, lane < kSelK && qt > 0.f);
+          const unsigned hit = __ballot_sync(0xffffffffu, lane < kSelK && qt > 0.f && u_rng < cum);
+          const int idx = hit ? (__ffs(hit) - 1) : (31 - __clz(pos_mask));
+          if (lane == 0) {
+            const int c = node_of(u, idx, e, 0.f);
+            tr->draws[u][tr->ndraws[u]++] = int8_t(c);
+            tr->n_det[u] = int8_t(m - 1);
+          }
+        }
+      }
+      __syncwarp();
+    }
+    __syncwarp();
+    if (lane == 0) build_dfs(n_nodes);
+  } else if (use_bftree && smp.temperature <= 0.f) {
     // Greedy Best-First Exact Probability Tree from DSpine's 16x16 lattice (100% bit-identical to plain greedy).
     __shared__ float bf_node_lp[kSpecBlock], bf_child_lp[kSpecBlock][kSelK];
     const float inv_t = 1.f / fmaxf(smp.bftree_temp, 0.05f);
@@ -1144,8 +1279,8 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
   if (lane == 0) {
     const int n = n_nodes;
     tr->n = n;
-    tr->npaths = use_bftree ? 2 : K;
-    if (!use_bftree) {
+    tr->npaths = (use_bftree || use_opt_tree) ? 2 : K;
+    if (!use_bftree && !use_opt_tree) {
       for (int p = 0; p < K; p++)  // owner: the first path through the node
         for (int i = 0; i <= tr->depth[tr->leaf[p]]; i++) {
           const int nd = tr->path[tr->leaf[p]][i];

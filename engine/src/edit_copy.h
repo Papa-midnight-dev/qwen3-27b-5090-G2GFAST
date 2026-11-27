@@ -27,13 +27,16 @@ class EditCopy {
   };
   std::array<Rule, rule_limit> rules_{};
   int used_ = 0, input_end_, source_ = -1, output_ = -1, literal_ = 0, run_ = 0;   // run_: tokens copied unchanged in a row
+  bool self_copy_ = false;  // (moonshot-limits S3.1) allow alignment against committed earlier output up to end - 32
   mutable int prop_rule_ = -1, prop_src_ = -1;   // the rule (and its source place) that gave the first edited token of the last proposal
 
-  int match(const std::vector<int32_t>& ids, int at) const {
+  int src_limit(int end) const { return self_copy_ ? std::max(input_end_, end - 32) : input_end_; }
+
+  int match(const std::vector<int32_t>& ids, int at, int lim) const {
     int best = -1;
     for (int i = 0; i < used_; ++i) {
       const Rule& r = rules_[i];
-      if (!r.usable() || r.nf > input_end_ - at || ids[at] != r.from[0]) continue;
+      if (!r.usable() || r.nf > lim - at || ids[at] != r.from[0]) continue;
       if (std::equal(r.from.begin(), r.from.begin() + r.nf, ids.begin() + at) &&
           (best < 0 || r.nf > rules_[best].nf || (r.nf == rules_[best].nf && r.score > rules_[best].score))) best = i;
     }
@@ -77,7 +80,7 @@ class EditCopy {
   }
 
 public:
-  explicit EditCopy(int input_end) : input_end_(input_end) {}
+  explicit EditCopy(int input_end, bool self_copy = false) : input_end_(input_end), self_copy_(self_copy) {}
   // (q27 port) An alignment is held and a rule could be proposed: the next step may be an edit-copy step.
   bool active() const {
     return source_ >= 0 && std::any_of(rules_.begin(), rules_.begin() + used_, [](const Rule& r) { return r.usable(); });
@@ -86,8 +89,9 @@ public:
 
   // ids[0..input_end_) is immutable input. ids[input_end_..end) is observed output.
   void advance(const std::vector<int32_t>& ids, int end, int raw_next) {
+    const int lim = src_limit(end);
     if (source_ >= 0) {
-      while (source_ < input_end_ && output_ < end) {
+      while (source_ < lim && output_ < end) {
         if (ids[source_] == ids[output_]) {
           ++source_; ++output_; literal_ = std::min(anchor, literal_ + 1); ++run_;
           if (used_ > 0) observe_kept(ids);
@@ -97,7 +101,7 @@ public:
         for (int cost = 1; cost <= gap * 2 && ds < 0; ++cost) {
           for (int s = std::max(0, cost - gap); s <= std::min(gap, cost); ++s) {
             const int o = cost - s;
-            if (source_ + s + anchor > input_end_ || output_ + o + anchor > end) continue;
+            if (source_ + s + anchor > lim || output_ + o + anchor > end) continue;
             if (std::equal(ids.begin() + source_ + s, ids.begin() + source_ + s + anchor,
                            ids.begin() + output_ + o)) { ds = s; dout = o; break; }
           }
@@ -111,10 +115,10 @@ public:
         source_ = -1;
         break;
       }
-      if (source_ >= 0 && source_ < input_end_) return;
+      if (source_ >= 0 && source_ < lim) return;
     }
     source_ = -1;
-    if (end - input_end_ >= anchor && raw_next >= anchor && raw_next < input_end_) {
+    if (end - input_end_ >= anchor && raw_next >= anchor && raw_next < lim) {
       source_ = raw_next; output_ = end; literal_ = anchor; run_ = anchor;
     }
   }
@@ -139,9 +143,10 @@ public:
     out.clear(); prop_rule_ = -1;
     if (source_ < 0 || limit <= 0 || std::none_of(rules_.begin(), rules_.begin() + used_,
                                                    [](const Rule& r) { return r.usable(); })) return -1;
+    const int lim = src_limit(end);
     int s = source_, o = output_, first_edit = -1;
-    while (s < input_end_ && static_cast<int>(out.size()) < limit) {
-      const int ri = match(ids, s);
+    while (s < lim && static_cast<int>(out.size()) < limit) {
+      const int ri = match(ids, s, lim);
       const Rule* rule = ri >= 0 ? &rules_[ri] : nullptr;
       const int32_t* data = rule ? rule->to.data() : &ids[s];
       const int count = rule ? rule->nt : 1;
