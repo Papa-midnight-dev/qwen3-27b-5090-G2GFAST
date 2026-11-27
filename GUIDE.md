@@ -33,10 +33,10 @@ The results, the method and the checks are in [LOCAL-PATCHES.md](LOCAL-PATCHES.m
 
 ### 1. Get the code
 ```bash
-git clone https://github.com/Papa-midnight-dev/qwen3-27b-5090-moonshot
-cd qwen3-27b-5090-moonshot
+git clone https://github.com/Papa-midnight-dev/qwen3-27b-5090-G2GFAST
+cd qwen3-27b-5090-G2GFAST
 ```
-Check: `git branch --show-current` prints `kit4b-0.8.1`.
+Check: `git branch --show-current` prints `g2gfast-0.8.1`.
 
 ### 2. Download the draft and the weights
 The engine never downloads at run time, so download first. The draft must be the revision the engine pins:
@@ -49,19 +49,19 @@ Check: `du -sh hf weights` shows about 4 GB and 20 GB.
 
 ### 3. Build the image
 ```bash
-docker build -t q27:kit4b .
+docker build -t q27:g2gfast .
 ```
-This compiles the CUDA code, so it takes a while the first time. Check: `docker images q27` lists `kit4b`.
+This compiles the CUDA code, so it takes a while the first time. Check: `docker images q27` lists `g2gfast`.
 
 ### 4. Start the engine
 Stop any other program that uses the GPU first (another engine, a game). Then:
 ```bash
 docker run -d --name q27 --gpus all --shm-size=8g --ulimit memlock=-1 -p 127.0.0.1:8000:8000 \
-  --env-file bench/localmaxxing/kit4b.env \
-  -v "$PWD/hf":/hf:ro -v "$PWD/weights":/models/weights:ro q27:kit4b
+  --env-file bench/localmaxxing/g2gfast.env \
+  -v "$PWD/hf":/hf:ro -v "$PWD/weights":/models/weights:ro q27:g2gfast
 ```
 Keep the port on 127.0.0.1: the engine's stats page shows the start of recent requests and has no sign-in.
-`bench/localmaxxing/kit4b.env` holds every setting of the measured runs, each with a comment.
+`bench/localmaxxing/g2gfast.env` holds every setting of branch `g2gfast-0.8.1` (Class A + Class B), each with a comment.
 Check: after about a minute, `curl -s 127.0.0.1:8000/health` answers, and `docker logs q27` shows a line that
 starts `[q27] kv pool:` (the number of tokens depends on the free GPU memory).
 
