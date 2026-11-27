@@ -1,12 +1,65 @@
-# Local patches on qwen3-27b-5090 v0.8.1: branch kit4b-0.8.1
+# Local patches on qwen3-27b-5090 v0.8.1: branch g2gfast-0.8.1
 
-This branch is upstream [mkyt/qwen3-27b-5090](https://github.com/mkyt/qwen3-27b-5090) v0.8.1 (MIT) with local patches.
-Upstream did the hard work: the engine, the kernels and the DSpine integration. The patches add copy steps for text the
-model repeats, a best-first draft tree for greedy requests, a short-prompt attention kernel and some smaller changes.
-Measured on one RTX 5090 with a 450 W power limit (undervolted), on Linux, on 26-27 Nov 2026. The engine measured is
-commit `b28fa62` of this branch.
+This branch is upstream [mkyt/qwen3-27b-5090](https://github.com/mkyt/qwen3-27b-5090) v0.8.1 (MIT) with local patches,
+building directly on branch `kit4b-0.8.1` (`b28fa62`, preserved unchanged for existing LocalMaxxing references).
+Upstream did the hard work: the engine, the kernels and the DSpine integration. On top of `kit4b-0.8.1` (copy steps,
+greedy best-first draft tree, warm-tail attention kernel), `g2gfast-0.8.1` adds two zero-loss optimization layers
+controlled by opt-in environment variables:
 
-## Results
+1. **Class A — Bit-identical SM120 silicon kernels** (`Q27_ML_L2_HINT=3`, `Q27_ML_FUSE_RN=3`, `Q27_ML_GDN_PREP=2`,
+   `Q27_ML_GDN_CS=1`): PTX `L2::evict_first` + `ld.global.cs` on streaming NVFP4 weights and scale factors across all
+   `M=1..128`, exact `clusterDim.x=5` fused `reduce+residual+rmsnorm+NVFP4 quant`, zero-spill `gdn_prep_v2`
+   (`REG: 207 -> 87`, `STACK: 32 -> 0`), zero-barrier streaming GDN state access, and zero-spill `spec_accept`
+   (`STACK: 768 -> 0`). Cuts verified step latency by **-3.63% to -7.47%** with bit-identical greedy and sampled outputs.
+2. **Class B — Strictly lossless optimal speculative tree + `kSnap1` + Self-EditCopy** (`Q27_ML_OPT_TREE=1`,
+   `Q27_ML_SELF_EC=1`): Hu et al. (ICLR 2025) `Top-(m-1)+Residual OPT (c=1.0)` exact verification paired with strictly
+   `F_0`-measurable 4-bin entropy-gated asymmetric BFS trees, a 1-slot `kSnap1` GDN DFS fast path (`REG: 153 -> 117`,
+   restoring 2 CTAs/SM across all 48 GDN layers), non-trapping `F_{t-1}` hysteresis (`ot0=0`, on `< 4.0`, off `>= 4.6`),
+   and Self-EditCopy for self-generated repetitive spans.
+
+Measured on one RTX 5090 with a 450 W power limit (undervolted), on Linux, on 27 Nov 2026.
+
+## Results: `g2gfast-0.8.1` vs `kit4b-0.8.1` (Huihui, 450 W)
+
+### Mirrored `ABCCBA` window (n=2 per arm, `GREEDY_CHECK=1`, zero foreign requests)
+All six runs matched **11 / 11 exact greedy SHA** against `kit4b-0.8.1` and passed `transition-check: SAME`.
+
+| Measure | `kit4b-0.8.1` (n=2) | `g2gfast` Class A (n=2) | `g2gfast` Class A+B (n=2) | Class A vs `kit4b` | Class A+B vs `kit4b` |
+|---|---:|---:|---:|---:|---:|
+| Decode, code tok/s | 469 (462–476) | **482 (482–482)** | **480 (476–484)** | **+2.8%** | **+2.3%** |
+| Decode, JSON tok/s | 729 (709–749) | **737 (736–737)** | **736 (731–742)** | **+1.1%** | **+1.0%** |
+| Decode, prose tok/s | 271 (262–280) | **276 (276–276)** | 258 (256–261) | **+1.8%** | -4.8% |
+| Reasoning, 1 request tok/s (sampled) | 290 (284–295) | 295 (294–296) | **311 (309–312)** | **+1.7%** | **+7.2%** |
+| Reasoning, 1 request, mean of 3 (sampled) | 288 (282–294) | 286 (281–292) | **309 (309–309)** | -0.7% | **+7.3%** |
+| **Reasoning, 8 at once tok/s (C=8)** | 1,495 (1,446–1,544) | 1,509 (1,483–1,535) | **1,597 (1,586–1,608)** | **+0.9%** | **+6.8% (+102 tok/s)** |
+| YASAKANI long JSONL tok/s | 1,116 (1,098–1,133) | 1,125 (1,117–1,132) | **1,136 (1,135–1,136)** | **+0.8%** | **+1.8%** |
+| BLACKFURY 129K warm writing tok/s | 434 (424–444) | **439 (429–450)** | 428 (427–428) | **+1.2%** | -1.4% |
+| Transition check (`alone`, s) | 1.43 s (`SAME`) | **1.37 s (`SAME`)** | **1.34 s (`SAME`)** | **-4.2%** | **-6.3%** |
+| Greedy parity (`11` prompts) | ref | **11/11 SHA** | **11/11 SHA** | exact | exact |
+
+### Paired kernel step times (Class A vs `kit4b-0.8.1`, 450 W, A/A noise ±0.07%, 100% `same=True`)
+| Context / Rows | `kit4b-0.8.1` | `g2gfast` Class A | Delta |
+|---|---:|---:|---:|
+| `512 / 8r` | 11,316 µs | **10,867–10,906 µs** | **-3.63% to -3.87%** |
+| `512 / 16r` | 12,235 µs | **11,740–11,744 µs** | **-4.02%** |
+| `512 / 32r` | 14,039 µs | **12,993 µs** | **-7.45%** (-1,046 µs) |
+| `512 / 64r` | 16,201 µs | **15,406 µs** | **-4.90%** (-795 µs) |
+| `8192 / 8r` | 11,809 µs | **11,350–11,380 µs** | **-3.63% to -3.75%** |
+| `8192 / 16r` | 12,746 µs | **12,278–12,294 µs** | **-3.67%** |
+| `8192 / 32r` | 14,637 µs | **13,544 µs** | **-7.47%** (-1,093 µs) |
+| `8192 / 64r` | 17,240 µs | **16,449 µs** | **-4.59%** (-791 µs) |
+
+### Verification gates on `g2gfast-0.8.1` (Class A+B active)
+- **Engine kernel + CPU test suite**: `459 passed, 11 skipped`.
+- **Formal exact-distribution shield (`OPT_TREE`)**: 1,000 trials against exact decode target probabilities (`forward_topk`,
+  entropy `H = 2.757`, support 19): **`chi2 = 19.87, df = 18, p = 0.3399, impossible = 0`**.
+- **Tool-call accuracy gate (`1,000` calls, `T=1.0, top_p=0.95, top_k=20`, thinking low)**: **917 / 1,000 (91.7%)** in 206 s
+  (within the `912–926` baseline band).
+- **Needles (`32K / 60K / 86K`, 16 per depth)**: **47 / 48** (`16/16`, `16/16`, `15/16` — identical to `kit4b-0.8.1`).
+- **Multi-seed sampled eval (`3 seeds × 9 prompts`, `T=1.0, top_k=20, top_p=0.95`)**: Prose **+6.69%**, Reasoning **+15.71%**,
+  Code **+10.22% to +21.00%**, JSON **+16.68%** over `kit4b-0.8.1`.
+
+## Baseline Results (`kit4b-0.8.1`, commit `b28fa62`)
 
 ### LocalMaxxing canonical prompts (single request, batch 1)
 These runs follow the [LocalMaxxing](https://www.localmaxxing.com) rules: a cache-bust nonce line before the canonical
@@ -113,13 +166,23 @@ Q27_TOKEN_CACHE_MB=16`.
   requests; sampled requests keep chains.
 - `Q27_FA_SMALL` (default ON): a short-prompt attention kernel for warm follow-ups.
 - `Q27_TOKEN_CACHE_MB` (default 0): the frontend caches encoded text between added tokens.
+- `Q27_ML_L2_HINT=3` (default 0): PTX `L2::evict_first` + `ld.global.cs` on streaming NVFP4 weights and scale factors
+  across all `M=1..128` (Class A, bit-identical).
+- `Q27_ML_FUSE_RN=3` (default 0): exact `clusterDim.x=5` fused `skinny_reduce + residual + rmsnorm + NVFP4 quant`
+  (Class A, bit-identical).
+- `Q27_ML_GDN_PREP=2` (default 0): zero-spill `gdn_prep_v2` for `T > 8` (`REG: 207 -> 87`, `STACK: 32 -> 0`, Class A).
+- `Q27_ML_GDN_CS=1` (default 0): zero-barrier streaming `ld/st.global.cs.f32` on GDN SSM state tiles (Class A).
+- `Q27_ML_OPT_TREE=1` (default 0): Hu et al. (ICLR 2025) strictly lossless `Top-(m-1)+Residual OPT` verification with
+  4-bin entropy-gated asymmetric 1-slot `kSnap1` BFS trees and non-trapping `F_{t-1}` hysteresis on sampled requests
+  (Class B, exact target distribution). Omit for pure bit-identical Class A mode.
+- `Q27_ML_SELF_EC=1` (default 0): extends `EditCopy` to match self-generated repetitive spans (`>= 32` tokens back).
 - Always active: a frontend fallback that returns a complete tool call written inside unclosed reasoning as a tool call.
 - Start-up resets unsupported values and logs them: `Q27_SPEC_PATHS` becomes 2 at most (1 for draft blocks over 8
   rows); two-step rollout becomes 1; the best-first tree stays greedy-only; the batched tree is off.
 
-## Reproduce the LocalMaxxing cells
-1. Get the code: `git clone https://github.com/Papa-midnight-dev/qwen3-27b-5090-moonshot && cd qwen3-27b-5090-moonshot`
-   (the default branch is this one).
+## Reproduce
+1. Get the code: `git clone https://github.com/Papa-midnight-dev/qwen3-27b-5090-G2GFAST && cd qwen3-27b-5090-G2GFAST`
+   (the default branch is `g2gfast-0.8.1`; the previous `kit4b-0.8.1` branch is kept unchanged).
 2. Download the DSpine draft at the revision the engine pins, and the weights (the engine never downloads at run time):
    `hf download tencent/Qwen3.8-27B-DSpine-b16 --revision 5f54174d301dbca65d9aa4448dc47e56732d9a12 --cache-dir ./hf/hub`
    and `hf download QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 --local-dir ./quasar` (or
@@ -139,7 +202,9 @@ Q27_TOKEN_CACHE_MB=16`.
 ## Known limits
 - The KV pool is 6% smaller than upstream's at the same settings (219,072 against 233,408 tokens; 128-row copy steps
   need more state). The context limit stays 131,072.
-- The draft tree helps greedy requests only.
+- The greedy best-first tree (`Q27_SPEC_BFTREE=1`) applies to greedy requests only; sampled requests use the
+  strictly lossless OPT tree (`Q27_ML_OPT_TREE=1`), which trades a small dip on one short-prose benchmark (-4.8%)
+  for large sampled reasoning (+7.2%) and C=8 (+6.8%) gains. Omit `Q27_ML_OPT_TREE=1` for pure bit-identical Class A mode.
 - With 8 requests at once on QUASAR, upstream was faster in both run orders.
 - In a soak of 40 requests, all six grammar-after-thinking requests gave different text batched than alone; the
   previous release of this fork gives the same six (cause not known).

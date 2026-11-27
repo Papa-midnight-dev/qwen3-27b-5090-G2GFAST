@@ -1,6 +1,4 @@
-> **Branch kit4b-0.8.1:** upstream v0.8.1 with local patches; the fastest verified single-request runs for Qwen3.8-27B on one
-> RTX 5090 on LocalMaxxing (27 Nov 2026). Step by step, from a clean box to a verified run: [GUIDE.md](GUIDE.md).
-> What the patches do, how they were measured and checked: [LOCAL-PATCHES.md](LOCAL-PATCHES.md).
+> **Branch g2gfast-0.8.1:** upstream v0.8.1 with local patches—builds on `kit4b-0.8.1` (the fastest verified single-request runs for Qwen3.8-27B on one RTX 5090 on LocalMaxxing, 27 Nov 2026) with Class A bit-identical SM120 silicon kernels (-3.6% to -7.47% step time) and Class B strictly lossless optimal speculative trees (+7.2% sampled reasoning C=1, +6.8% / 1,597 tok/s reasoning C=8). Step by step, from a clean box to a verified run: [GUIDE.md](GUIDE.md). What the patches do, how they were measured and checked: [LOCAL-PATCHES.md](LOCAL-PATCHES.md).
 
 # Qwen3.8-27B on one RTX 5090
 
