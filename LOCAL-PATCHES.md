@@ -118,14 +118,23 @@ Q27_TOKEN_CACHE_MB=16`.
   rows); two-step rollout becomes 1; the best-first tree stays greedy-only; the batched tree is off.
 
 ## Reproduce the LocalMaxxing cells
-1. Build: `git clone -b kit4b-0.8.1 https://github.com/Papa-midnight-dev/qwen3-27b-5090-moonshot && cd
-   qwen3-27b-5090-moonshot && docker build -t q27:kit4b .`
-2. Start: `docker run --gpus all -p 127.0.0.1:8000:8000 -v "$MODEL_DIR":/models/weights:ro -v "$HF_HOME":/hf:ro
-   -e WEIGHTS=/models/weights` with each setting above as `-e NAME=value`, then `q27:kit4b`. Keep the port on
-   127.0.0.1: the engine's stats page shows the start of recent requests and has no sign-in.
-3. Run `python3 bench/localmaxxing/lmx_canonical.py "$PROMPTS_GO" "$OUT_DIR" --cells medium --save-text` with nothing
-   else using the GPU. `$PROMPTS_GO` is `cmd/lmx/canonical_prompts.go` from
-   [localmaxxing-cli](https://github.com/LottoLottoLotto/localmaxxing-cli); the script checks its sha256 against the site.
+1. Get the code: `git clone https://github.com/Papa-midnight-dev/qwen3-27b-5090-moonshot && cd qwen3-27b-5090-moonshot`
+   (the default branch is this one).
+2. Download the DSpine draft at the revision the engine pins, and the weights (the engine never downloads at run time):
+   `hf download tencent/Qwen3.8-27B-DSpine-b16 --revision 5f54174d301dbca65d9aa4448dc47e56732d9a12 --cache-dir ./hf/hub`
+   and `hf download QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 --local-dir ./quasar` (or
+   `sakamakismile/Huihui-Qwen3.8-27B-abliterated-NVFP4`). We measured QUASAR revision `4a22293`; it has the same weight
+   files as the revision upstream pins (`15d2e47`). Mounting the folder as `WEIGHTS` uses the checkpoint's own output
+   head, as measured; upstream's `WEIGHTS=quasar` mode takes another checkpoint's head instead.
+3. Build: `docker build -t q27:kit4b .` (it compiles the CUDA code; allow some time).
+4. Start: `docker run --gpus all --ulimit memlock=-1 -p 127.0.0.1:8000:8000 -v "$PWD/hf":/hf:ro
+   -v "$PWD/quasar":/models/weights:ro -e WEIGHTS=/models/weights` with each setting above as `-e NAME=value`, then
+   `q27:kit4b`. Keep the port on 127.0.0.1: the engine's stats page shows the start of recent requests and has no
+   sign-in.
+5. Measure: `python3 bench/localmaxxing/lmx_canonical.py "$PROMPTS_GO" "$OUT_DIR" --cells medium --save-text` with
+   nothing else using the GPU. `$PROMPTS_GO` is `cmd/lmx/canonical_prompts.go` from
+   [localmaxxing-cli](https://github.com/LottoLottoLotto/localmaxxing-cli); the script checks its sha256 against the
+   site. Expect some spread between sessions: other programs on the GPU or CPU cost us 1-8%.
 
 ## Known limits
 - The KV pool is 6% smaller than upstream's at the same settings (219,072 against 233,408 tokens; 128-row copy steps
