@@ -1035,6 +1035,208 @@ __global__ void __launch_bounds__(kPrepThreads) gdn_prep_kernel(const float* qkv
   }
 }
 
+// ---------------------------------------------------------------- moonshot-limits Tier 1 Wave A (Class A bit-identical)
+// H-NUM-1: gdn_prep_v2_kernel — zero stack spill (STACK:0), low regs (2-3 CTAs/SM), 1-wave @ T=8/16.
+constexpr int kPrepABPer2 = 2;
+constexpr int kPrepAB2 = 2 * kVHeads / kPrepABPer2;  // 48
+constexpr int kPrepWideTok2 = 8;
+template <bool kVerify, bool kTree, bool kBatch = false, bool kSplitQkv = false>
+__global__ void __launch_bounds__(kPrepThreads, 2) gdn_prep_v2_kernel(const float* qkv, int ld, int T, float* conv_state,
+                                                                      const bf16* conv_w, const float* h,
+                                                                      const bf16* wa, const bf16* wb, PrepOut po,
+                                                                      GdnSpec sp) {
+  pdl_trigger();
+  int ln = 0;
+  int64_t r0 = 0, pr0 = 0, cp0 = 0;
+  if constexpr (kBatch) {
+    ln = blockIdx.y;
+    conv_state = lane_sel(sp.lconv, ln);
+    const LaneRows lr = sp.lr.live();
+    r0 = lr.first(ln), pr0 = sp.prow0[ln], cp0 = int64_t(kLaneSlot) * ln;
+    if (T > 0) T = lr.rows(ln);
+    qkv += r0 * ld, h += r0 * kHidden, po.q += r0 * kQ;
+  }
+  const int blk = blockIdx.x, tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+  __shared__ float red[kPrepGroup][kPrepThreads / 32];
+  __shared__ int8_t s_depth[kVerifyMaxT], s_path[kVerifyMaxT][kSpecBlock];
+  int cur = 0, prev = 0, nc = 0;
+  if constexpr (kVerify) {
+    cur = sp.par[ln], prev = cur ^ 1, nc = sp.ncommit[ln];
+    po.k = (cur ? sp.k[1] : sp.k[0]) + r0 * kQ, po.v = (cur ? sp.v[1] : sp.v[0]) + r0 * kVHeads * kVDim;
+    po.ab = (cur ? sp.ab[1] : sp.ab[0]) + r0 * 2 * kVHeads;
+  }
+  const int qkv_slices = kSplitQkv ? max(1, (T + kPrepWideTok2 - 1) / kPrepWideTok2) : 1;
+  const int qkv_blks = (kPrepQK + kPrepV) * qkv_slices;
+  if (blk < qkv_blks) {
+    const int slice = kSplitQkv ? blk / (kPrepQK + kPrepV) : 0;
+    const int cblk = kSplitQkv ? blk % (kPrepQK + kPrepV) : blk;
+    const int tbeg_q = kSplitQkv ? slice * kPrepWideTok2 : 0;
+    const int tend_q = kSplitQkv ? min(T, tbeg_q + kPrepWideTok2) : T;
+    const bool is_qk = cblk < kPrepQK;
+    const int half = tid / kKDim, j = tid % kKDim;
+    const int c = is_qk ? half * kQ + cblk * kKDim + j : 2 * kQ + (cblk - kPrepQK) * kPrepThreads + tid;
+    ConvIn in;
+    if (!kSplitQkv || slice == 0) {
+      in = conv_load(conv_state, conv_w, c);
+      if constexpr (kVerify) conv_replay(in, c, (prev ? sp.raw[1] : sp.raw[0]) + pr0 * kConvDim, nc, sp.cpath + cp0);
+    } else {
+#pragma unroll
+      for (int i = 0; i < kConvK; i++) in.w[i] = __bfloat162float(conv_w[c * kConvK + i]);
+      in.x[0] = 0.f, in.x[1] = 0.f, in.x[2] = 0.f;
+    }
+    if (T == 0 || tbeg_q >= tend_q) return;
+    pdl_wait();
+    if constexpr (kTree) {
+      if (tid < T) {
+        const int d = sp.tree[ln].depth[tid];
+        s_depth[tid] = int8_t(d);
+        for (int i = 0; i <= d; i++) s_path[tid][i] = sp.tree[ln].path[tid][i];
+      }
+      __syncthreads();
+    }
+    auto sel_inx = [&](int idx) -> float { return idx == 0 ? in.x[0] : (idx == 1 ? in.x[1] : in.x[2]); };
+    auto eval_conv = [&](int t) -> float {
+      float x0, x1, x2, x3;
+      if constexpr (kTree) {
+        const int d = s_depth[t];
+        const int8_t* prow = s_path[t];
+        const int s0 = d - 3, s1 = d - 2, s2 = d - 1, s3 = d;
+        x0 = s0 < 0 ? sel_inx(s0 + 3) : qkv[int64_t(prow[s0]) * ld + c];
+        x1 = s1 < 0 ? sel_inx(s1 + 3) : qkv[int64_t(prow[s1]) * ld + c];
+        x2 = s2 < 0 ? sel_inx(s2 + 3) : qkv[int64_t(prow[s2]) * ld + c];
+        x3 = qkv[int64_t(prow[s3]) * ld + c];
+      } else {
+        const int s0 = t - 3, s1 = t - 2, s2 = t - 1;
+        x0 = s0 < 0 ? sel_inx(s0 + 3) : qkv[int64_t(s0) * ld + c];
+        x1 = s1 < 0 ? sel_inx(s1 + 3) : qkv[int64_t(s1) * ld + c];
+        x2 = s2 < 0 ? sel_inx(s2 + 3) : qkv[int64_t(s2) * ld + c];
+        x3 = qkv[int64_t(t) * ld + c];
+      }
+      float acc = 0.f;
+      acc += in.w[0] * x0;
+      acc += in.w[1] * x1;
+      acc += in.w[2] * x2;
+      acc += in.w[3] * x3;
+      return acc / (1.f + expf(-acc));
+    };
+    if (!is_qk) {
+      float* raw = kVerify ? ((cur ? sp.raw[1] : sp.raw[0]) + r0 * kConvDim) : nullptr;
+      for (int t = tbeg_q; t < tend_q; t++) {
+        const float xv = eval_conv(t);
+        if constexpr (kVerify) raw[int64_t(t) * kConvDim + c] = qkv[int64_t(t) * ld + c];
+        po.v[int64_t(t) * (kVHeads * kVDim) + c - 2 * kQ] = xv;
+      }
+    } else {
+      for (int t0 = tbeg_q; t0 < tend_q; t0 += kPrepGroup) {
+        const int tn = min(kPrepGroup, tend_q - t0);
+        float x[kPrepGroup];
+#pragma unroll
+        for (int u = 0; u < kPrepGroup; u++) {
+          if (u < tn) x[u] = eval_conv(t0 + u);
+        }
+        if constexpr (kVerify) {
+          float* raw = (cur ? sp.raw[1] : sp.raw[0]) + r0 * kConvDim;
+          for (int u = 0; u < tn; u++) raw[int64_t(t0 + u) * kConvDim + c] = qkv[int64_t(t0 + u) * ld + c];
+        }
+#pragma unroll
+        for (int u = 0; u < kPrepGroup; u++) {
+          if (u >= tn) break;
+          float ss = x[u] * x[u];
+          for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+          if (lane == 0) red[u][warp] = ss;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int u = 0; u < kPrepGroup; u++) {
+          if (u >= tn) break;
+          const float ss = red[u][4 * half] + red[u][4 * half + 1] + red[u][4 * half + 2] + red[u][4 * half + 3];
+          const int t = t0 + u;
+          if (half == 0)
+            po.q[int64_t(t) * kQ + cblk * kKDim + j] = x[u] * rsqrtf(ss + 1e-6f) * rsqrtf(float(kKDim));
+          else
+            po.k[int64_t(t) * kQ + cblk * kKDim + j] = x[u] * rsqrtf(ss + 1e-6f);
+        }
+        __syncthreads();
+      }
+    }
+    if constexpr (!kVerify) {
+      float* st = conv_state + c * (kConvK - 1);
+      st[0] = in.x[1], st[1] = in.x[2], st[2] = qkv[c];
+    }
+  } else {
+    __shared__ float red_ab[kPrepABPer2][kPrepGroup][kPrepThreads / 32];
+    const int ab = blk - qkv_blks;
+    const int n0 = (ab % kPrepAB2) * kPrepABPer2;
+    const int ab_tok = kSplitQkv ? kPrepWideTok2 : kPrepABTok<kVerify>;
+    const int tbeg = (ab / kPrepAB2) * ab_tok, tend = min(T, tbeg + ab_tok);
+    constexpr int kIters = (kHidden + kPrepThreads * 8 - 1) / (kPrepThreads * 8);  // 3
+    uint4 wraw[kPrepABPer2][kIters];
+#pragma unroll
+    for (int u = 0; u < kPrepABPer2; u++) {
+      const int n = n0 + u;
+      const bf16* wr = (n < kVHeads ? wa : wb) + int64_t(n % kVHeads) * kHidden;
+#pragma unroll
+      for (int it = 0; it < kIters; it++) {
+        const int i = tid * 8 + it * kPrepThreads * 8;
+        if (i < kHidden) wraw[u][it] = __ldg(reinterpret_cast<const uint4*>(wr + i));
+      }
+    }
+    if (tbeg >= tend) return;
+    pdl_wait();
+    for (int t0 = tbeg; t0 < tend; t0 += kPrepGroup) {
+      const int tn = min(kPrepGroup, tend - t0);
+#pragma unroll 1
+      for (int g = 0; g < tn; g++) {
+        const float* ht = h + int64_t(t0 + g) * kHidden;
+        float acc[kPrepABPer2] = {0.f, 0.f};
+#pragma unroll
+        for (int it = 0; it < kIters; it++) {
+          const int i = tid * 8 + it * kPrepThreads * 8;
+          if (i >= kHidden) break;
+          const float4 x0 = *reinterpret_cast<const float4*>(ht + i);
+          const float4 x1 = *reinterpret_cast<const float4*>(ht + i + 4);
+#pragma unroll
+          for (int u = 0; u < kPrepABPer2; u++) {
+            const __nv_bfloat162* hw = reinterpret_cast<const __nv_bfloat162*>(&wraw[u][it]);
+            float2 w0 = __bfloat1622float2(hw[0]), w1 = __bfloat1622float2(hw[1]), w2 = __bfloat1622float2(hw[2]),
+                   w3 = __bfloat1622float2(hw[3]);
+            acc[u] += x0.x * w0.x + x0.y * w0.y + x0.z * w1.x + x0.w * w1.y + x1.x * w2.x + x1.y * w2.y + x1.z * w3.x +
+                      x1.w * w3.y;
+          }
+        }
+#pragma unroll
+        for (int u = 0; u < kPrepABPer2; u++) {
+          float a = acc[u];
+          for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+          if (lane == 0) red_ab[u][g][warp] = a;
+        }
+      }
+      __syncthreads();
+      if (tid < kPrepABPer2 * tn) {
+        const int u = tid / tn, g = tid % tn;
+        float sum = 0.f;
+#pragma unroll
+        for (int w = 0; w < kPrepThreads / 32; w++) sum += red_ab[u][g][w];
+        po.ab[int64_t(t0 + g) * 2 * kVHeads + n0 + u] = sum;
+      }
+      __syncthreads();
+    }
+  }
+}
+
+
+static int ml_env_int(const char* name) {
+  const char* e = getenv(name);
+  return e && *e ? atoi(e) : 0;
+}
+
+template <bool kVerify, bool kSplitQkv = false>
+int prep_blocks2(int T) {
+  const int qkv_slices = kSplitQkv ? std::max(1, (T + kPrepWideTok2 - 1) / kPrepWideTok2) : 1;
+  const int ab_tok = kSplitQkv ? kPrepWideTok2 : kPrepABTok<kVerify>;
+  return (kPrepQK + kPrepV) * qkv_slices + kPrepAB2 * std::max(1, (T + ab_tok - 1) / ab_tok);
+}
+
 // Recurrent part: a cluster of kRecSplit CTAs per value head, each owning 32 of the 128 state
 // columns. In a warp, lane group c = lane / 8 owns column c of the warp's 4, and lane j = lane % 8 of
 // the group the rows j, j + 8, ..., j + 120 (16 values in registers). A token costs no
@@ -1165,7 +1367,7 @@ struct RecIn {  // a token's inputs: k / q rows [2048] (16 key heads), v rows [6
 // of the previous step only), every CTA replays the previous verify's committed rows onto the
 // committed state in registers and writes it to the other state buffer (other CTAs may still be
 // reading `state`).
-template <bool kVerify, bool kTree, bool kBatch = false, bool kWide = false>
+template <bool kVerify, bool kTree, bool kBatch = false, bool kWide = false, bool kL2Cs = false>
 __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T, const bf16* A_log,
                                                                  const bf16* dt_bias, float* state, const float* z,
                                                                  int ldz, const bf16* norm_w, float eps, float* out,
@@ -1211,8 +1413,17 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
   }
   const float* st = state + int64_t(h) * kKDim * kVDim;
   float S[kRecRows];
+  if constexpr (kL2Cs) {
 #pragma unroll
-  for (int i = 0; i < kRecRows; i++) S[i] = st[(j + 8 * i) * kVDim + col];
+    for (int i = 0; i < kRecRows; i++) {
+      float v;
+      asm volatile("ld.global.cs.f32 %0, [%1];" : "=f"(v) : "l"(st + (j + 8 * i) * kVDim + col));
+      S[i] = v;
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < kRecRows; i++) S[i] = st[(j + 8 * i) * kVDim + col];
+  }
   const float A = __bfloat162float(A_log[h]), dtb = __bfloat162float(dt_bias[h]);
   // Stages the inputs of n tokens (rows rows[0..n)) into shared memory (k, q of head kh, this CTA's v
   // columns, decay / beta).
@@ -1253,8 +1464,14 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
     }
     {  // the committed state moves to the other buffer (also when nothing was replayed)
       float* so_ = (kBatch ? state : sb ? sp.st[0] : sp.st[1]) + int64_t(h) * kKDim * kVDim;
+      if constexpr (kL2Cs) {
 #pragma unroll
-      for (int i = 0; i < kRecRows; i++) so_[(j + 8 * i) * kVDim + col] = S[i];
+        for (int i = 0; i < kRecRows; i++)
+          asm volatile("st.global.cs.f32 [%0], %1;" ::"l"(so_ + (j + 8 * i) * kVDim + col), "f"(S[i]));
+      } else {
+#pragma unroll
+        for (int i = 0; i < kRecRows; i++) so_[(j + 8 * i) * kVDim + col] = S[i];
+      }
     }
     in.k = (cur ? sp.k[1] : sp.k[0]) + r0 * kQ, in.v = (cur ? sp.v[1] : sp.v[0]) + r0 * kVHeads * kVDim;
     in.ab = (cur ? sp.ab[1] : sp.ab[0]) + r0 * 2 * kVHeads;
@@ -1411,6 +1628,379 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
   GDN_PROBE(7);
 }
 
+// H-NUM-2: gdn_rec_v2_kernel — SMEM-coalesced float4 state R/W, precomputed s_kq, drop kr[16], kSplit=2 (1 wave) or 4.
+__device__ __forceinline__ float gdn_step_v2(float (&S)[kRecRows], const float* k, const float* q, float kq, float v,
+                                             float decay, float beta) {
+  const int j = threadIdx.x % 8;
+  float akv = 0.f, aq = 0.f;
+#pragma unroll
+  for (int i = 0; i < kRecRows; i++) {
+    const float ki = k[j + 8 * i];
+    const float qi = q[j + 8 * i];
+    S[i] *= decay;
+    akv += S[i] * ki;
+    aq += S[i] * qi;
+  }
+  const bool hi = j & 4;
+  float s = (hi ? aq : akv) + __shfl_xor_sync(0xffffffffu, hi ? akv : aq, 4);
+  s += __shfl_xor_sync(0xffffffffu, s, 2);
+  s += __shfl_xor_sync(0xffffffffu, s, 1);
+  const float dl = (v - s) * beta;
+  const float dp = __shfl_xor_sync(0xffffffffu, dl, 4);
+  const float d = hi ? dp : dl;
+#pragma unroll
+  for (int i = 0; i < kRecRows; i++) S[i] += k[j + 8 * i] * d;
+  return s + d * kq;
+}
+
+__device__ __forceinline__ void gdn_replay_step_v2(float (&S)[kRecRows], const float* k, float v, float decay,
+                                                   float beta) {
+  const int j = threadIdx.x % 8;
+  float akv = 0.f;
+#pragma unroll
+  for (int i = 0; i < kRecRows; i++) {
+    const float ki = k[j + 8 * i];
+    S[i] *= decay;
+    akv += S[i] * ki;
+  }
+  akv += __shfl_xor_sync(0xffffffffu, akv, 4);
+  akv += __shfl_xor_sync(0xffffffffu, akv, 2);
+  akv += __shfl_xor_sync(0xffffffffu, akv, 1);
+  const float d = (v - akv) * beta;
+#pragma unroll
+  for (int i = 0; i < kRecRows; i++) S[i] += k[j + 8 * i] * d;
+}
+
+template <int kSplit, bool kVerify, bool kTree, bool kBatch = false, bool kWide = false, bool kSmemCoalesce = true,
+          bool kL2Evict = false>
+__global__ void __launch_bounds__((32 / kSplit) * 32) gdn_rec_v2_kernel(RecIn in, int T, const bf16* A_log,
+                                                                        const bf16* dt_bias, float* state,
+                                                                        const float* z, int ldz, const bf16* norm_w,
+                                                                        float eps, float* out, uint8_t* q8,
+                                                                        float in_scale, GdnSpec sp,
+                                                                        uint8_t* q4 = nullptr, uint8_t* sf4 = nullptr) {
+  pdl_trigger();
+  constexpr int kWarps2 = 32 / kSplit;           // 16 (split=2) or 8 (split=4)
+  constexpr int kThreads2 = kWarps2 * 32;        // 512 or 256
+  constexpr int kCtaCols2 = kVDim / kSplit;      // 64 or 32
+  constexpr int kHalves2 = kCtaCols2 / 32;       // 2 or 1
+  int ln = 0;
+  int64_t r0 = 0, pr0 = 0, cp0 = 0;
+  if constexpr (kBatch) {
+    ln = blockIdx.y;
+    r0 = sp.lr.live().first(ln), pr0 = sp.prow0[ln], cp0 = int64_t(kLaneSlot) * ln;
+    in.q += r0 * kQ, z += r0 * ldz;
+    if (out) out += r0 * kVHeads * kVDim;
+    if (q8) q8 += r0 * kVHeads * kVDim;
+  }
+  namespace cg = cooperative_groups;
+  constexpr int kRows = (kWide && !kTree) ? kTreeMax : (kTree && kWide) ? 32 : kSpecBlock;
+  constexpr int kStage = (kWide && !kTree) ? 16 : (kRows < 32 ? kRows : 32);
+  const int h = blockIdx.x / kSplit, part = blockIdx.x % kSplit, kh = h / (kVHeads / kKHeads);
+  const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, j = lane % 8;
+  const int lcol = kRecCols * warp + lane / 8;
+  const int col = part * kCtaCols2 + lcol;
+  __shared__ union {
+    struct {
+      float sk[kStage][kKDim];
+      float sq[kStage][kKDim];
+    } s;
+    float st_tile[32][kCtaCols2 + 1];
+  } u_sm;
+  __shared__ float sv[kStage][kCtaCols2];
+  __shared__ float so[kRows][kCtaCols2], s_part[kRows][kHalves2];
+  __shared__ float s_decay[kStage], s_beta[kStage], s_kq[kStage];
+  __shared__ int s_rows[kRows];
+  int sb = 0;
+  if constexpr (kVerify) {
+    if constexpr (kBatch)
+      state = lane_sel(sp.lst, ln);
+    else
+      sb = *sp.sbuf, state = sb ? sp.st[1] : sp.st[0];
+  }
+  const float* st = state + int64_t(h) * kKDim * kVDim;
+  float S[kRecRows];
+  // State load: SMEM-coalesced float4 (kSmemCoalesce=true) OR direct zero-barrier with optional ld.global.cs
+  if constexpr (kSmemCoalesce) {
+    constexpr int kF4Cols = kCtaCols2 / 4;  // 16 (split=2) or 8 (split=4)
+    const int tr = tid / kF4Cols, tc4 = (tid % kF4Cols) * 4;
+#pragma unroll
+    for (int kt = 0; kt < 4; kt++) {
+      const float4 v4 = *reinterpret_cast<const float4*>(st + int64_t(kt * 32 + tr) * kVDim + part * kCtaCols2 + tc4);
+      u_sm.st_tile[tr][tc4 + 0] = v4.x;
+      u_sm.st_tile[tr][tc4 + 1] = v4.y;
+      u_sm.st_tile[tr][tc4 + 2] = v4.z;
+      u_sm.st_tile[tr][tc4 + 3] = v4.w;
+      __syncthreads();
+#pragma unroll
+      for (int i = 0; i < 4; i++) S[kt * 4 + i] = u_sm.st_tile[j + 8 * i][lcol];
+      __syncthreads();
+    }
+  } else if constexpr (kL2Evict) {
+#pragma unroll
+    for (int i = 0; i < kRecRows; i++) {
+      float v;
+      asm volatile("ld.global.cs.f32 %0, [%1];" : "=f"(v) : "l"(st + (j + 8 * i) * kVDim + col));
+      S[i] = v;
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < kRecRows; i++) S[i] = st[(j + 8 * i) * kVDim + col];
+  }
+  const float A = __bfloat162float(A_log[h]), dtb = __bfloat162float(dt_bias[h]);
+  auto stage = [&](RecIn src, int n, const int* rows) {
+    constexpr int kPer = kSpecBlock * kKDim / kThreads2;  // 4 (split=2) or 8 (split=4)
+    for (int r0_ = 0; r0_ < n; r0_ += kSpecBlock) {
+#pragma unroll
+      for (int u = 0; u < kPer; u++) {
+        const int i = tid + u * kThreads2;
+        const int t = r0_ + i / kKDim, jj = i % kKDim;
+        if (t >= n) break;
+        const int r = rows[t];
+        u_sm.s.sk[t][jj] = src.k[int64_t(r) * kQ + kh * kKDim + jj];
+        if (src.q) u_sm.s.sq[t][jj] = src.q[int64_t(r) * kQ + kh * kKDim + jj];
+        if (jj < kCtaCols2) sv[t][jj] = src.v[int64_t(r) * (kVHeads * kVDim) + h * kVDim + part * kCtaCols2 + jj];
+      }
+    }
+    for (int t = tid; t < n; t += kThreads2)
+      decay_beta(src.ab[rows[t] * 2 * kVHeads + h], src.ab[rows[t] * 2 * kVHeads + kVHeads + h], A, dtb, s_decay[t],
+                 s_beta[t]);
+    __syncthreads();
+    if (src.q) {
+      const int tk = tid / 8, jk = tid % 8;
+      if (tk < n) {
+        float kq = 0.f;
+#pragma unroll
+        for (int i = 0; i < kRecRows; i++) kq += u_sm.s.sk[tk][jk + 8 * i] * u_sm.s.sq[tk][jk + 8 * i];
+        kq += __shfl_xor_sync(0xffffffffu, kq, 4);
+        kq += __shfl_xor_sync(0xffffffffu, kq, 2);
+        kq += __shfl_xor_sync(0xffffffffu, kq, 1);
+        if (jk == 0) s_kq[tk] = kq;
+      }
+      __syncthreads();
+    }
+  };
+  int n = T;
+  if constexpr (kVerify) {
+    const int cur = sp.par[ln], prev = cur ^ 1, nc = sp.ncommit[ln];
+    for (int b0 = 0; b0 < nc; b0 += kStage) {
+      const int m = min(kStage, nc - b0);
+      if (tid < m) s_rows[tid] = sp.cpath[cp0 + b0 + tid];
+      __syncthreads();
+      const float* kp = (prev ? sp.k[1] : sp.k[0]) + pr0 * kQ;
+      stage({kp, nullptr, (prev ? sp.v[1] : sp.v[0]) + pr0 * kVHeads * kVDim, (prev ? sp.ab[1] : sp.ab[0]) + pr0 * 2 * kVHeads},
+            m, s_rows);
+      for (int t = 0; t < m; t++) gdn_replay_step_v2(S, u_sm.s.sk[t], sv[t][lcol], s_decay[t], s_beta[t]);
+      __syncthreads();
+    }
+    // State store: SMEM-coalesced OR direct zero-barrier with optional L2::evict_first
+    {
+      float* so_ = (kBatch ? state : sb ? sp.st[0] : sp.st[1]) + int64_t(h) * kKDim * kVDim;
+      if constexpr (kSmemCoalesce) {
+        constexpr int kF4Cols = kCtaCols2 / 4;
+        const int tr = tid / kF4Cols, tc4 = (tid % kF4Cols) * 4;
+#pragma unroll
+        for (int kt = 0; kt < 4; kt++) {
+#pragma unroll
+          for (int i = 0; i < 4; i++) u_sm.st_tile[j + 8 * i][lcol] = S[kt * 4 + i];
+          __syncthreads();
+          *reinterpret_cast<float4*>(so_ + int64_t(kt * 32 + tr) * kVDim + part * kCtaCols2 + tc4) =
+              make_float4(u_sm.st_tile[tr][tc4 + 0], u_sm.st_tile[tr][tc4 + 1], u_sm.st_tile[tr][tc4 + 2],
+                          u_sm.st_tile[tr][tc4 + 3]);
+          __syncthreads();
+        }
+      } else if constexpr (kL2Evict) {
+#pragma unroll
+        for (int i = 0; i < kRecRows; i++)
+          asm volatile("st.global.cs.f32 [%0], %1;" ::"l"(so_ + (j + 8 * i) * kVDim + col), "f"(S[i]));
+      } else {
+#pragma unroll
+        for (int i = 0; i < kRecRows; i++) so_[(j + 8 * i) * kVDim + col] = S[i];
+      }
+    }
+    in.k = (cur ? sp.k[1] : sp.k[0]) + r0 * kQ, in.v = (cur ? sp.v[1] : sp.v[0]) + r0 * kVHeads * kVDim;
+    in.ab = (cur ? sp.ab[1] : sp.ab[0]) + r0 * 2 * kVHeads;
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + tid;
+    if (nc > 0 && c < kConvDim) {
+      const float* rp = (prev ? sp.raw[1] : sp.raw[0]) + pr0 * kConvDim;
+      float* cs = (kBatch ? lane_sel(sp.lconv, ln) : sp.conv_state) + c * (kConvK - 1);
+      float x0 = cs[0], x1 = cs[1], x2 = cs[2];
+      for (int jj = 0; jj < nc; jj++) x0 = x1, x1 = x2, x2 = rp[int64_t(sp.cpath[cp0 + jj]) * kConvDim + c];
+      cs[0] = x0, cs[1] = x1, cs[2] = x2;
+    }
+    if (T == 0) return;
+    const SpecTree* tree = sp.tree + ln;
+    if constexpr (kTree) {
+      n = tree->n;
+      for (int t = tid; t < n; t += kThreads2) s_rows[t] = t;
+    } else {
+      const int leaf = tree->leaf[0];
+      n = tree->depth[leaf] + 1;
+      if (tid < n) s_rows[tid] = (kWide && !kTree) ? tid : tree->path[leaf][tid];
+    }
+  } else {
+    pdl_wait();
+    if (tid < T) s_rows[tid] = tid;
+  }
+  __syncthreads();
+  if constexpr (!(kWide && !kTree)) stage(in, n, s_rows);
+  if constexpr (kWide && !kTree) {
+    for (int b0 = 0; b0 < n; b0 += kStage) {
+      const int m = min(kStage, n - b0);
+      stage(in, m, s_rows + b0);
+      for (int t = 0; t < m; t++) {
+        const float o = gdn_step_v2(S, u_sm.s.sk[t], u_sm.s.sq[t], s_kq[t], sv[t][lcol], s_decay[t], s_beta[t]);
+        if (j == 4) so[b0 + t][lcol] = o;
+      }
+      __syncthreads();
+    }
+  } else if constexpr (kTree) {
+    const SpecTree* tree = sp.tree + ln;
+    float snap[kTreePaths - 1][kRecRows];
+    if (tree->dfs_n > 0) {
+      const int dn = tree->dfs_n;
+      for (int s = 0; s < dn; s++) {
+        const int pop = tree->dfs_pop[s];
+        if (pop == 0) {
+#pragma unroll
+          for (int i = 0; i < kRecRows; i++) S[i] = snap[0][i];
+        } else if (pop == 1) {
+#pragma unroll
+          for (int i = 0; i < kRecRows; i++) S[i] = snap[1][i];
+        } else if (pop == 2) {
+#pragma unroll
+          for (int i = 0; i < kRecRows; i++) S[i] = snap[2][i];
+        }
+        const int t = tree->dfs_order[s];
+        const float o = gdn_step_v2(S, u_sm.s.sk[t], u_sm.s.sq[t], s_kq[t], sv[t][lcol], s_decay[t], s_beta[t]);
+        if (j == 4) so[t][lcol] = o;
+        const int push = tree->dfs_push[s];
+        if (push == 0) {
+#pragma unroll
+          for (int i = 0; i < kRecRows; i++) snap[0][i] = S[i];
+        } else if (push == 1) {
+#pragma unroll
+          for (int i = 0; i < kRecRows; i++) snap[1][i] = S[i];
+        } else if (push == 2) {
+#pragma unroll
+          for (int i = 0; i < kRecRows; i++) snap[2][i] = S[i];
+        }
+      }
+    } else {
+      const int np = min(tree->npaths, kTreePaths);
+      int par[kTreePaths], beg[kTreePaths];
+#pragma unroll
+      for (int k = 0; k < kTreePaths; k++) {
+        par[k] = -1, beg[k] = 0;
+        if (k > 0 && k < np) {
+          const int leaf = tree->leaf[k], dl = tree->depth[leaf];
+          int b = dl + 1;
+          for (int d = dl; d >= 1; d--)
+            if (tree->owner[tree->path[leaf][d]] == k) b = d;
+          beg[k] = b, par[k] = b <= dl ? tree->path[leaf][b - 1] : -1;
+        }
+      }
+#pragma unroll
+      for (int k = 0; k < kTreePaths; k++) {
+        if (k >= np) break;
+        if (k > 0) {
+          if (par[k] < 0) continue;
+#pragma unroll
+          for (int i = 0; i < kRecRows; i++) S[i] = snap[k - 1][i];
+        }
+        const int leaf = tree->leaf[k], dl = tree->depth[leaf];
+        for (int d = beg[k]; d <= dl; d++) {
+          const int t = tree->path[leaf][d];
+          const float o = gdn_step_v2(S, u_sm.s.sk[t], u_sm.s.sq[t], s_kq[t], sv[t][lcol], s_decay[t], s_beta[t]);
+          if (j == 4) so[t][lcol] = o;
+#pragma unroll
+          for (int kk = 1; kk < kTreePaths; kk++)
+            if (kk > k && par[kk] == t) {
+#pragma unroll
+              for (int i = 0; i < kRecRows; i++) snap[kk - 1][i] = S[i];
+            }
+        }
+      }
+    }
+  } else {
+    for (int t = 0; t < n; t++) {
+      const float o = gdn_step_v2(S, u_sm.s.sk[t], u_sm.s.sq[t], s_kq[t], sv[t][lcol], s_decay[t], s_beta[t]);
+      if (j == 4) so[t][lcol] = o;
+    }
+  }
+  if constexpr (!kVerify) {
+    float* sw = state + int64_t(h) * kKDim * kVDim;
+    constexpr int kF4Cols = kCtaCols2 / 4;
+    const int tr = tid / kF4Cols, tc4 = (tid % kF4Cols) * 4;
+    __syncthreads();
+#pragma unroll
+    for (int kt = 0; kt < 4; kt++) {
+#pragma unroll
+      for (int i = 0; i < 4; i++) u_sm.st_tile[j + 8 * i][lcol] = S[kt * 4 + i];
+      __syncthreads();
+      *reinterpret_cast<float4*>(sw + int64_t(kt * 32 + tr) * kVDim + part * kCtaCols2 + tc4) =
+          make_float4(u_sm.st_tile[tr][tc4 + 0], u_sm.st_tile[tr][tc4 + 1], u_sm.st_tile[tr][tc4 + 2],
+                      u_sm.st_tile[tr][tc4 + 3]);
+      __syncthreads();
+    }
+  } else {
+    __syncthreads();
+  }
+  // Exact Class A gated RMSNorm: exact left-to-right 4-quarter sum (((q0+q1)+q2)+q3)
+  constexpr int kNormStep = kWarps2 / kHalves2;  // 8 rows per pass for both split=2 and split=4
+  const int h2 = kHalves2 > 1 ? (warp % kHalves2) : 0;
+  const int tw = warp / kHalves2;
+  for (int t = tw; t < (kTree ? n : max(n, kNormStep)); t += kNormStep) {
+    const float o = t < n ? so[t][h2 * 32 + lane] : 0.f;
+    float ss = o * o;
+    for (int s = 16; s > 0; s >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, s);
+    if (lane == 0) s_part[t][h2] = ss;
+  }
+  if constexpr (kSplit > 1) {
+    cg::cluster_group cluster = cg::this_cluster();
+    cluster.sync();
+    for (int t = tw; t < n; t += kNormStep) {
+      const float o = so[t][h2 * 32 + lane];
+      float ss = 0.f;
+#pragma unroll
+      for (int r = 0; r < kSplit; r++) {
+        const float* rp = &cluster.map_shared_rank(s_part, r)[t][0];
+#pragma unroll
+        for (int q = 0; q < kHalves2; q++) ss += rp[q];
+      }
+      const int c = part * kCtaCols2 + h2 * 32 + lane;
+      const int row = s_rows[t];
+      const float zz = z[int64_t(row) * ldz + h * kVDim + c];
+      const float y = o * rsqrtf(ss / kVDim + eps) * __bfloat162float(norm_w[c]) * (zz / (1.f + expf(-zz)));
+      const int64_t oi = int64_t(row) * (kVHeads * kVDim) + h * kVDim + c;
+      if (out) out[oi] = y;
+      if (q8) q8[oi] = __nv_cvt_float_to_fp8(y / in_scale, __NV_SATFINITE, __NV_E4M3);
+      if (q4) gdn_quant_block16_subwarp(y, in_scale, int(r0) + row, h * 8 + part * (2 * kHalves2) + h2 * 2 + (lane >> 4),
+                                        kVHeads * kVDim, q4, sf4);
+    }
+    cluster.sync();
+  } else {
+    __syncthreads();
+    for (int t = tw; t < n; t += kNormStep) {
+      const float o = so[t][h2 * 32 + lane];
+      float ss = 0.f;
+#pragma unroll
+      for (int q = 0; q < kHalves2; q++) ss += s_part[t][q];
+      const int c = h2 * 32 + lane;
+      const int row = s_rows[t];
+      const float zz = z[int64_t(row) * ldz + h * kVDim + c];
+      const float y = o * rsqrtf(ss / kVDim + eps) * __bfloat162float(norm_w[c]) * (zz / (1.f + expf(-zz)));
+      const int64_t oi = int64_t(row) * (kVHeads * kVDim) + h * kVDim + c;
+      if (out) out[oi] = y;
+      if (q8) q8[oi] = __nv_cvt_float_to_fp8(y / in_scale, __NV_SATFINITE, __NV_E4M3);
+      if (q4) gdn_quant_block16_subwarp(y, in_scale, int(r0) + row, h * 8 + h2 * 2 + (lane >> 4),
+                                        kVHeads * kVDim, q4, sf4);
+    }
+  }
+}
+
+
 }  // namespace
 
 void gdn_prep(const float* qkv, int ld, float* conv_state, const bf16* conv_w, const float* a, const float* b,
@@ -1503,6 +2093,29 @@ void gdn_decode(const float* q, const float* k, const float* v, const float* a, 
 void gdn_verify_prep(const float* qkv, int ld, int T, float* conv_state, const bf16* conv_w, const float* h,
                      const bf16* wa, const bf16* wb, float* q, const GdnSpec& sp, cudaStream_t s) {
   Q27_CHECK(T <= kVerifyMaxT, "gdn_verify_prep: T must be <= 32");
+  const int prep_mode = ml_env_int("Q27_ML_GDN_PREP");
+  if (prep_mode == 1 || (prep_mode == 2 && T > 8 && sp.lanes == 0 && sp.paths <= 1)) {
+    if (sp.lanes > 0) {
+      Q27_CHECK(sp.lanes <= kMaxLanes && sp.lr.n == sp.lanes && sp.prow0, "gdn_verify_prep: invalid batched spec");
+      T = T > 0 ? sp.lr.max_rows() : 0;
+      if (sp.paths > 1)
+        launch_pdl(gdn_prep_v2_kernel<true, true, true>, dim3(prep_blocks2<true>(T), sp.lanes), dim3(kPrepThreads), 0, s,
+                   qkv, ld, T, conv_state, conv_w, h, wa, wb, PrepOut{q, nullptr, nullptr, nullptr}, sp);
+      else
+        launch_pdl(gdn_prep_v2_kernel<true, false, true>, dim3(prep_blocks2<true>(T), sp.lanes), dim3(kPrepThreads), 0, s,
+                   qkv, ld, T, conv_state, conv_w, h, wa, wb, PrepOut{q, nullptr, nullptr, nullptr}, sp);
+    } else if (sp.paths > 1)
+      launch_pdl(gdn_prep_v2_kernel<true, true>, dim3(prep_blocks2<true>(T)), dim3(kPrepThreads), 0, s, qkv, ld, T,
+                 conv_state, conv_w, h, wa, wb, PrepOut{q, nullptr, nullptr, nullptr}, sp);
+    else if (T > kPrepWideTok2)
+      launch_pdl(gdn_prep_v2_kernel<true, false, false, true>, dim3(prep_blocks2<true, true>(T)), dim3(kPrepThreads), 0,
+                 s, qkv, ld, T, conv_state, conv_w, h, wa, wb, PrepOut{q, nullptr, nullptr, nullptr}, sp);
+    else
+      launch_pdl(gdn_prep_v2_kernel<true, false>, dim3(prep_blocks2<true>(T)), dim3(kPrepThreads), 0, s, qkv, ld, T,
+                 conv_state, conv_w, h, wa, wb, PrepOut{q, nullptr, nullptr, nullptr}, sp);
+    Q27_CUDA(cudaGetLastError());
+    return;
+  }
   // T = 0 (flush): one column of blocks that only replays the conv state.
   // A chain (one path) needs no tree lookups: row t is at depth t.
   if (sp.lanes > 0) {  // batched verify: T rows per lane (chains or BF-Tree)
@@ -1530,33 +2143,87 @@ void gdn_verify(const float* q, int T, const bf16* A_log, const bf16* dt_bias, f
                 const bf16* norm_w, float eps, float* out, uint8_t* q8, float in_scale, const GdnSpec& sp,
                 cudaStream_t s, uint8_t* q4, uint8_t* sf4) {
   Q27_CHECK(T <= kVerifyMaxT, "gdn_verify: T must be <= 32");
-  if (sp.lanes > 0) {
-    Q27_CHECK(sp.lanes <= kMaxLanes && sp.lr.n == sp.lanes && sp.prow0, "gdn_verify: invalid batched spec");
-    if (sp.paths > 1)
-      launch_pdl_cluster(gdn_rec_kernel<true, true, true>, dim3(kVHeads * kRecSplit, sp.lanes), dim3(kRecWarps * 32), 0,
-                         s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w,
+  const int rec_v2 = ml_env_int("Q27_ML_GDN_REC");
+  if (rec_v2 > 0) {
+    auto run_v2 = [&](auto split_tag, auto smem_tag, auto l2_tag) {
+      constexpr int kS = decltype(split_tag)::value;
+      constexpr bool kSC = decltype(smem_tag)::value;
+      constexpr bool kL2E = decltype(l2_tag)::value;
+      constexpr int kTh = (32 / kS) * 32;
+      auto go = [&](auto fn, dim3 grid) {
+        if constexpr (kS == 1)
+          launch_pdl(fn, grid, dim3(kTh), 0, s, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz,
+                     norm_w, eps, out, q8, in_scale, sp, q4, sf4);
+        else
+          launch_pdl_cluster(fn, grid, dim3(kTh), 0, s, kS, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias,
+                             state, z, ldz, norm_w, eps, out, q8, in_scale, sp, q4, sf4);
+      };
+      if (sp.lanes > 0) {
+        Q27_CHECK(sp.lanes <= kMaxLanes && sp.lr.n == sp.lanes && sp.prow0, "gdn_verify: invalid batched spec");
+        if (sp.paths > 1)
+          go(gdn_rec_v2_kernel<kS, true, true, true, false, kSC, kL2E>, dim3(kVHeads * kS, sp.lanes));
+        else
+          go(gdn_rec_v2_kernel<kS, true, false, true, false, kSC, kL2E>, dim3(kVHeads * kS, sp.lanes));
+      } else if (sp.paths > 1) {
+        if (T <= kSpecBlock)
+          go(gdn_rec_v2_kernel<kS, true, true, false, false, kSC, kL2E>, dim3(kVHeads * kS));
+        else
+          go(gdn_rec_v2_kernel<kS, true, true, false, true, kSC, kL2E>, dim3(kVHeads * kS));
+      } else if (T > kSpecBlock)
+        go(gdn_rec_v2_kernel<kS, true, false, false, true, kSC, kL2E>, dim3(kVHeads * kS));
+      else
+        go(gdn_rec_v2_kernel<kS, true, false, false, false, kSC, kL2E>, dim3(kVHeads * kS));
+    };
+    if (rec_v2 == 3)
+      run_v2(std::integral_constant<int, 4>{}, std::false_type{}, std::true_type{});
+    else if (rec_v2 == 4)
+      run_v2(std::integral_constant<int, 2>{}, std::false_type{}, std::true_type{});
+    else if (rec_v2 == 5)
+      run_v2(std::integral_constant<int, 2>{}, std::false_type{}, std::false_type{});
+    else if (rec_v2 == 6)
+      run_v2(std::integral_constant<int, 1>{}, std::false_type{}, std::true_type{});
+    else if (rec_v2 == 1)
+      run_v2(std::integral_constant<int, 2>{}, std::true_type{}, std::false_type{});
+    else
+      run_v2(std::integral_constant<int, 4>{}, std::true_type{}, std::false_type{});
+    Q27_CUDA(cudaGetLastError());
+    return;
+  }
+  const bool rec_cs = ml_env_int("Q27_ML_GDN_CS") > 0;
+  auto disp_rec = [&](auto cs_tag) {
+    constexpr bool kCs = decltype(cs_tag)::value;
+    if (sp.lanes > 0) {
+      Q27_CHECK(sp.lanes <= kMaxLanes && sp.lr.n == sp.lanes && sp.prow0, "gdn_verify: invalid batched spec");
+      if (sp.paths > 1)
+        launch_pdl_cluster(gdn_rec_kernel<true, true, true, false, kCs>, dim3(kVHeads * kRecSplit, sp.lanes),
+                           dim3(kRecWarps * 32), 0, s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias,
+                           state, z, ldz, norm_w, eps, out, q8, in_scale, sp, q4, sf4);
+      else
+        launch_pdl_cluster(gdn_rec_kernel<true, false, true, false, kCs>, dim3(kVHeads * kRecSplit, sp.lanes),
+                           dim3(kRecWarps * 32), 0, s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias,
+                           state, z, ldz, norm_w, eps, out, q8, in_scale, sp, q4, sf4);
+    } else if (sp.paths > 1) {
+      if (T <= kSpecBlock)
+        launch_pdl_cluster(gdn_rec_kernel<true, true, false, false, kCs>, dim3(kVHeads * kRecSplit),
+                           dim3(kRecWarps * 32), 0, s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias,
+                           state, z, ldz, norm_w, eps, out, q8, in_scale, sp, q4, sf4);
+      else
+        launch_pdl_cluster(gdn_rec_kernel<true, true, false, true, kCs>, dim3(kVHeads * kRecSplit),
+                           dim3(kRecWarps * 32), 0, s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias,
+                           state, z, ldz, norm_w, eps, out, q8, in_scale, sp, q4, sf4);
+    } else if (T > kSpecBlock)  // (local patch: a copy step's chain of 17..64 rows)
+      launch_pdl_cluster(gdn_rec_kernel<true, false, false, true, kCs>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32),
+                         0, s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w,
                          eps, out, q8, in_scale, sp, q4, sf4);
     else
-      launch_pdl_cluster(gdn_rec_kernel<true, false, true>, dim3(kVHeads * kRecSplit, sp.lanes), dim3(kRecWarps * 32), 0,
-                         s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w,
-                         eps, out, q8, in_scale, sp, q4, sf4);
-  } else if (sp.paths > 1) {
-    if (T <= kSpecBlock)
-      launch_pdl_cluster(gdn_rec_kernel<true, true, false, false>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s,
-                         kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w, eps,
-                         out, q8, in_scale, sp, q4, sf4);
-    else
-      launch_pdl_cluster(gdn_rec_kernel<true, true, false, true>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s,
-                         kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w, eps,
-                         out, q8, in_scale, sp, q4, sf4);
-  } else if (T > kSpecBlock)  // (local patch: a copy step's chain of 17..64 rows)
-    launch_pdl_cluster(gdn_rec_kernel<true, false, false, true>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s,
-                       kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w, eps,
-                       out, q8, in_scale, sp, q4, sf4);
+      launch_pdl_cluster(gdn_rec_kernel<true, false, false, false, kCs>, dim3(kVHeads * kRecSplit),
+                         dim3(kRecWarps * 32), 0, s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias,
+                         state, z, ldz, norm_w, eps, out, q8, in_scale, sp, q4, sf4);
+  };
+  if (rec_cs)
+    disp_rec(std::true_type{});
   else
-    launch_pdl_cluster(gdn_rec_kernel<true, false>, dim3(kVHeads * kRecSplit), dim3(kRecWarps * 32), 0, s, kRecSplit,
-                       RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w, eps, out, q8,
-                       in_scale, sp, q4, sf4);
+    disp_rec(std::false_type{});
   Q27_CUDA(cudaGetLastError());
 }
 

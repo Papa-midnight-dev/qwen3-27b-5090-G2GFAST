@@ -300,10 +300,10 @@ __device__ __forceinline__ void spec_accept_body(int32_t* ids, int32_t* block_id
                                                  int k, int ld, const DraftChoice& ch, const SpecSampling& smp,
                                                  const uint64_t* rng, int32_t* ncommit, int32_t* cpath, SpecOut* out,
                                                  int32_t* hist, const int32_t* pos, const int32_t* par,
-                                                 const int32_t* budget) {
+                                                 const int32_t* budget, int* acc, float* p) {
   if (par) out += *par;  // the step's slot (the host may read the previous step's while this one runs)
   const SpecTree* tr = ch.tree;
-  int acc[kTreeMax], a = 0, n = 0, bonus = 0;  // (local patch: kTreeMax, a copy step's chain of up to 32 rows)
+  int a = 0, n = 0, bonus = 0;  // (local patch: kTreeMax, a copy step's chain of up to 32 rows)
   acc[0] = 0;
   // An accepted end-of-sequence token ends the step like a bonus token: the sequence then holds exactly
   // the tokens before it (a prefix cache checkpoint at the end of the generation matches the next turn).
@@ -323,7 +323,6 @@ __device__ __forceinline__ void spec_accept_body(int32_t* ids, int32_t* block_id
       acc[++a] = n = next;
     }
   } else {
-    float p[kMaxK];
     for (;;) {
       const float* v = tv + n * ld;
       const int32_t* id = ti + n * ld;
@@ -394,10 +393,12 @@ __global__ void spec_accept_kernel(int32_t* ids, int32_t* block_ids, const float
                                    int ld, DraftChoice ch, SpecSampling smp, const uint64_t* rng, int32_t* ncommit,
                                    int32_t* cpath, SpecOut* out, int32_t* hist, const int32_t* pos,
                                    const int32_t* par, const int32_t* budget) {
+  __shared__ int s_acc[kTreeMax];
+  __shared__ float s_p[kMaxK];
   pdl_trigger();
   pdl_wait();
   if (threadIdx.x != 0) return;
-  spec_accept_body(ids, block_ids, tv, ti, k, ld, ch, smp, rng, ncommit, cpath, out, hist, pos, par, budget);
+  spec_accept_body(ids, block_ids, tv, ti, k, ld, ch, smp, rng, ncommit, cpath, out, hist, pos, par, budget, s_acc, s_p);
 }
 
 // Batched steps (P6-10): block z accepts lane z (its rows al.lr.first(z) .., top-k lists of ld entries, of which
@@ -407,6 +408,8 @@ __global__ void spec_accept_lanes_kernel(int32_t* ids, int32_t* anchor, const fl
                                          AcceptLanes al, const int32_t* cand, SpecTree* trees, const int32_t* src,
                                          const uint64_t* rng, int32_t* ncommit, int32_t* cpath, SpecOut* out,
                                          const int32_t* pos, const int32_t* par, const int32_t* budget) {
+  __shared__ int s_acc[kTreeMax];
+  __shared__ float s_p[kMaxK];
   pdl_trigger();
   pdl_wait();
   if (threadIdx.x != 0) return;
@@ -417,7 +420,7 @@ __global__ void spec_accept_lanes_kernel(int32_t* ids, int32_t* anchor, const fl
   ch.src = const_cast<int32_t*>(src) + z;
   spec_accept_body(ids + r0, anchor + z, tv + r0 * ld, ti + r0 * ld, lane_sel(al.k, z), ld, ch, lane_sel(al.smp, z),
                    rng + 2 * z, ncommit + z, cpath + kLaneSlot * z, out + 2 * z, nullptr, pos + z, par + z,
-                   budget + z);
+                   budget + z, s_acc, s_p);
 }
 
 __global__ void spec_advance_lanes_kernel(LaneRows lr_in, int32_t* pos, const int32_t* ncommit, int32_t* par,
