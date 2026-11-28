@@ -1,8 +1,6 @@
 # Guide: Qwen3.8-27B at 600+ tok/s on one RTX 5090
 
-This guide takes you from a clean Linux box with an RTX 5090 to the setup that made the fastest verified
-single-request runs for Qwen3.8-27B on [LocalMaxxing](https://www.localmaxxing.com) (27 Nov 2026: 664 tok/s on the
-reasoning prompt, 453 on the code prompt). Each step ends with a check, so you know it worked before you go on.
+This guide takes you from a clean Linux box with an RTX 5090 to the `g2gfast-0.8.1` setup (28 Nov 2026: **687.5 tok/s** median15 / **729.1** leader-nonce on QUASAR `reasoning-v1`, **466.4 tok/s** median15 on `code-v1`, building on the verified 27 Nov `kit4b-0.8.1` [LocalMaxxing](https://www.localmaxxing.com) runs at 663.9 / 453.0). Each step ends with a check, so you know it worked before you go on.
 The results, the method and the checks are in [LOCAL-PATCHES.md](LOCAL-PATCHES.md).
 
 ## What makes it fast

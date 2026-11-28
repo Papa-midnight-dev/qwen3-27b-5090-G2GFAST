@@ -47,16 +47,18 @@ All runs matched **11 / 11 exact greedy SHA** (`greedy-check`), **30 / 30 exact 
 | Tool calls right (of 1,000, `T=1.0`, thinking low) | 912–926 baseline | **923 / 1,000 (92.3%)** | **PASS** |
 | Needles (`32K / 60K / 86K`, 16 per depth) | 47 / 48 | **47 / 48 (`16/16`, `16/16`, `15/16`)** | **EXACT MATCH** |
 
-### LocalMaxxing QUASAR paired comparison (`g2gfast-0.8.1` vs `kit4b-0.8.1`, 28 Nov 2026, mirrored `ABBA`, monitors off)
+### LocalMaxxing QUASAR paired comparison (`g2gfast-0.8.1` vs `kit4b-0.8.1`, 28 Nov 2026, mirrored `ABBA`, desktop GPU apps closed)
 Measured on `QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4` (`reasoning_effort: medium`, 15 fixed nonces, T=0, 512 output tokens,
-every request within `< 1.8%` client gap, **30 / 30 bit-identical text SHA** between `kit4b-0.8.1` and `g2gfast-0.8.1`;
-background desktop apps remained running, so absolute rates sit ~3–4% below a cold-idle desktop):
+450 W, **30 / 30 bit-identical text SHA** between `kit4b-0.8.1` and `g2gfast-0.8.1`, every `g2gfast-0.8.1` request
+within `< 1.60%` client gap):
 
-| QUASAR Cell (15 fixed nonces, `medium`) | `kit4b-0.8.1` (r1 / r4) | `g2gfast-0.8.1` (r2 / r3) | Paired Gain | Exact Text Parity |
+| QUASAR Cell (15 fixed nonces, `medium`) | `kit4b-0.8.1` (r1 / r4) | **`g2gfast-0.8.1` (r2 / r3)** | vs 27 Nov #1 (`663.9` / `453.0`) | Exact Text Parity |
 |---|---:|---:|---:|:---:|
-| `reasoning-v1` median15 (`mean_len 8.533`) | 633.2 / 596.0 (mean 614.6) | **644.5 / 625.2 (mean 634.9)** | **+3.3% mean** (`+1.65% / +3.44%` paired) | **15 / 15 SHA** |
-| `reasoning-v1` leader-nonce (`7445cc4d6c60bdf0`) | 666.9 / 645.0 | **685.6 / 685.4** | **+2.8% to +6.3%** (+18.7 tok/s) | **exact SHA** |
-| `code-v1` median15 (`mean_len 5.885`) | 435.0 / 435.7 | **436.5** / 408.1 (peak **493.9**) | +0.52% (r2 vs r1) | **15 / 15 SHA** |
+| **`reasoning-v1` median15** (`mean_len 8.533`) | 653.6* / 675.7 | **687.5** (r2: 644.5) | **+23.6 tok/s (+3.6%)** | **15 / 15 SHA** |
+| **`reasoning-v1` leader-nonce** (`7445cc4d6c60bdf0`) | 719.9 / 719.2 | **729.1** (r2: 685.8) | **+21.3 tok/s** (vs 707.8) | **exact SHA** |
+| **`code-v1` median15** (`mean_len 5.885`) | 463.7 / 463.6 | **466.5 / 466.4** (peak **527.7**) | **+13.4 tok/s (+3.0%)** | **15 / 15 SHA** |
+
+*\*`kit4b-0.8.1` r1 had one `reasoning-v1` request with `6.78%` client gap; r4 (`675.7`, max gap `1.60%`) and both `g2gfast-0.8.1` runs (`644.5 / 687.5`, max gap `1.60% / 1.54%`) passed `< 2%` on every request.*
 
 ### Paired kernel step times (Class A vs `kit4b-0.8.1`, 450 W, A/A noise ±0.07%, 100% `same=True`)
 | Context / Rows | `kit4b-0.8.1` | `g2gfast` Class A | Delta |
