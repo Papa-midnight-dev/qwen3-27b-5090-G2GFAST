@@ -58,6 +58,8 @@ within `< 1.60%` client gap):
 | **`reasoning-v1` leader-nonce** (`7445cc4d6c60bdf0`) | 719.9 / 719.2 | **729.1** (r2: 685.8) | **+21.3 tok/s** (vs 707.8) | **exact SHA** |
 | **`code-v1` median15** (`mean_len 5.885`) | 463.7 / 463.6 | **466.5 / 466.4** (peak **527.7**) | **+13.4 tok/s (+3.0%)** | **15 / 15 SHA** |
 
+Submitted runs (verified & approved on LocalMaxxing, 28 Nov 2026): QUASAR [reasoning-v1 (`687.5 tok/s`)](https://www.localmaxxing.com/en/models/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4?run=cmwzsylam001urv01vvvinp35), [code-v1 (`466.4 tok/s`)](https://www.localmaxxing.com/en/models/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4?run=cmwzsylsg001xrv01r59wdfem).
+
 *\*`kit4b-0.8.1` r1 had one `reasoning-v1` request with `6.78%` client gap; r4 (`675.7`, max gap `1.60%`) and both `g2gfast-0.8.1` runs (`644.5 / 687.5`, max gap `1.60% / 1.54%`) passed `< 2%` on every request.*
 
 ### Paired kernel step times (Class A vs `kit4b-0.8.1`, 450 W, A/A noise ±0.07%, 100% `same=True`)
