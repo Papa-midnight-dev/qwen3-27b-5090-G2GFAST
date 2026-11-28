@@ -18,7 +18,7 @@ ap = argparse.ArgumentParser()
 for a in ("out", "prompt", "hf_id", "revision", "commit", "go"):
     ap.add_argument(a)
 ap.add_argument("--cell", default="medium")
-ap.add_argument("--repo", default="https://github.com/Papa-midnight-dev/qwen3-27b-5090-moonshot")
+ap.add_argument("--repo", default="https://github.com/Papa-midnight-dev/qwen3-27b-5090-G2GFAST")
 a = ap.parse_args()
 
 rows = [json.loads(l) for l in open(os.path.join(a.out, "lmx.jsonl"))]
@@ -35,7 +35,7 @@ eng = [r["engine_tps"] for r in cell]
 body = {
     "hfId": a.hf_id, "modelRevision": a.revision,
     "hardware": {"hwClass": "DISCRETE_GPU", "gpuName": "RTX 5090", "gpuCount": 1, "vramGb": 32, "os": "Linux"},
-    "engineName": "custom", "engineVersion": "0.8.1 + kit4b patches", "engineRepository": a.repo, "engineCommit": a.commit,
+    "engineName": "custom", "engineVersion": "0.8.1 + g2gfast patches", "engineRepository": a.repo, "engineCommit": a.commit,
     "quantization": "NVFP4", "backend": "cuda",
     "promptTokens": u["prompt_tokens"], "outputTokens": n, "contextLength": 131072, "batchSize": 1,
     "ttftMs": round(med["ttft_s"] * 1000, 1), "tokSOut": round(t["predicted_per_second"], 1),
@@ -52,7 +52,7 @@ body = {
         "specAcceptanceRate": round(acc / t["draft_n"], 4),
         "specMeanAcceptedLength": round((n - 1) / (n - 1 - acc), 3),
         "commandSnippet": "docker run --gpus all --shm-size=8g --ulimit memlock=-1 -p 127.0.0.1:8000:8000 --env-file "
-                          "bench/localmaxxing/kit4b.env -v \"$PWD/hf\":/hf:ro -v \"$PWD/weights\":/models/weights:ro q27:kit4b"},
+                          "bench/localmaxxing/g2gfast.env -v \"$PWD/hf\":/hf:ro -v \"$PWD/weights\":/models/weights:ro q27:g2gfast"},
 }
 if t.get("prompt_per_second"):
     body["tokSPrefill"] = round(t["prompt_per_second"], 1)
